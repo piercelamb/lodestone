@@ -21,30 +21,23 @@ _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 _NON_ALNUM_OR_SPACE_RE = re.compile(r"[^a-z0-9\s]+")
 
 
-def _ascii_fold(s: str) -> str:
-    """NFKD decompose and drop combining marks, yielding ASCII-clean text."""
+def _fold_lower(s: str) -> str:
     decomposed = unicodedata.normalize("NFKD", s)
-    return "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower()
 
 
 def _strip_arxiv_id(arxiv_id: str) -> str:
-    """Remove trailing vN version and the dot separator. Returns digits only."""
-    without_version = _VERSION_SUFFIX_RE.sub("", arxiv_id)
-    return without_version.replace(".", "")
+    return _VERSION_SUFFIX_RE.sub("", arxiv_id).replace(".", "")
 
 
 def _colon_branch(title: str) -> str:
-    """Take text before the first colon; ASCII-fold, lowercase, keep [a-z0-9]."""
     prefix = title.split(":", 1)[0]
-    folded = _ascii_fold(prefix).lower()
-    return _NON_ALNUM_RE.sub("", folded)
+    return _NON_ALNUM_RE.sub("", _fold_lower(prefix))
 
 
 def _stop_word_branch(title: str) -> str:
-    """Tokenize, drop stop words, take first 3 surviving tokens, join with '_'."""
-    folded = _ascii_fold(title).lower()
-    spaced = _NON_ALNUM_OR_SPACE_RE.sub(" ", folded)
-    tokens = [t for t in spaced.split() if t and t not in STOP_WORDS]
+    spaced = _NON_ALNUM_OR_SPACE_RE.sub(" ", _fold_lower(title))
+    tokens = [t for t in spaced.split() if t not in STOP_WORDS]
     return "_".join(tokens[:3])
 
 
@@ -54,39 +47,20 @@ def generate_paper_name(
     arxiv_id: str,
     existing: set[str],
 ) -> str:
-    """Generate a unique, readable paper_name slug.
+    """Generate a readable paper_name slug guaranteed to match ^[a-z0-9_]+$.
 
-    Algorithm:
-      1. If `title` has a colon -> take text before the first colon,
-         lowercase, ASCII-fold (NFKD + drop combining marks), strip every
-         char not in [a-z0-9].
-      2. Else -> tokenize on whitespace, lowercase, drop STOP_WORDS, take the
-         first 3 surviving tokens, ASCII-fold each, strip non-[a-z0-9],
-         underscore-join.
-      3. If the branch-1 or branch-2 result is empty (e.g., title is only
-         stop words or only punctuation), fall back to the stripped arxiv_id
-         itself.
-      4. Append '_YYYY' taken from the first 4 chars of `date_yyyy_mm_dd`.
-      5. If the result is in `existing`, append '_' + last 5 digits of the
-         stripped arxiv_id (strip the dot and any 'vN' version suffix first).
-         Assert the final slug matches ^[a-z0-9_]+$; raise ValueError if not.
-
-    Returns:
-        The slug. Guaranteed to match ^[a-z0-9_]+$ and not be in `existing`
-        (or, if both base and collision forms are in `existing`, raises).
+    If `title` contains ':', uses the pre-colon prefix; otherwise uses the
+    first three non-stopword tokens. Appends the YYYY year. On collision with
+    any name in `existing`, appends the last 5 digits of the arxiv_id (with
+    any 'vN' version suffix and the dot stripped first). Raises ValueError if
+    the collision form is also in `existing` or the result violates the regex.
     """
     stripped_arxiv = _strip_arxiv_id(arxiv_id)
-
-    if ":" in title:
-        base = _colon_branch(title)
-    else:
-        base = _stop_word_branch(title)
-
+    base = _colon_branch(title) if ":" in title else _stop_word_branch(title)
     if not base:
         base = stripped_arxiv
 
-    year = date_yyyy_mm_dd[:4]
-    slug = f"{base}_{year}"
+    slug = f"{base}_{date_yyyy_mm_dd[:4]}"
 
     if slug in existing:
         slug = f"{slug}_{stripped_arxiv[-5:]}"

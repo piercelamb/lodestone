@@ -1,17 +1,12 @@
 """Tests for _system.utils.slug.generate_paper_name."""
 from __future__ import annotations
 
-import re
-
 import pytest
 
-from _system.utils.slug import STOP_WORDS, generate_paper_name
-
-_SLUG_RE = re.compile(r"^[a-z0-9_]+$")
+from _system.utils.slug import _SLUG_RE, STOP_WORDS, generate_paper_name
 
 
 def _assert_valid_slug(slug: str) -> None:
-    """Every slug from generate_paper_name must match ^[a-z0-9_]+$."""
     assert _SLUG_RE.fullmatch(slug), f"slug {slug!r} violates ^[a-z0-9_]+$"
 
 
@@ -27,7 +22,6 @@ class TestGeneratePaperNameColonBranch:
         _assert_valid_slug(slug)
 
     def test_colon_prefix_strips_hyphen(self):
-        # Hyphen inside colon-prefix must be stripped to uphold ^[a-z0-9_]+$.
         slug = generate_paper_name(
             "Book-RAG: Adaptive RAG",
             "2024-06-15",
@@ -44,7 +38,6 @@ class TestGeneratePaperNameColonBranch:
             "2303.00001",
             set(),
         )
-        # Only [a-z0-9] survive from the colon-prefix.
         assert slug == "foobarbaz_2023"
         _assert_valid_slug(slug)
 
@@ -57,7 +50,6 @@ class TestGeneratePaperNameStopWordBranch:
             "1706.03762",
             set(),
         )
-        # "is" is in STOP_WORDS; first 3 survivors are attention/all/you.
         assert slug == "attention_all_you_2017"
         _assert_valid_slug(slug)
 
@@ -88,7 +80,6 @@ class TestGeneratePaperNameStopWordBranch:
             "1909.00004",
             set(),
         )
-        # Diacritics stripped, not raw bytes.
         assert slug == "etude_sur_modeles_2019"
         _assert_valid_slug(slug)
         assert slug.isascii()
@@ -102,7 +93,6 @@ class TestGeneratePaperNameFallback:
             "2407.00005",
             set(),
         )
-        # Fallback = stripped arxiv_id + year.
         assert slug == "240700005_2024"
         _assert_valid_slug(slug)
 
@@ -126,7 +116,6 @@ class TestGeneratePaperNameCollision:
             "2512.03413",
             existing,
         )
-        # Stripped arxiv_id = "251203413"; last 5 = "03413".
         assert slug == "bookrag_2024_03413"
         _assert_valid_slug(slug)
 
@@ -138,7 +127,6 @@ class TestGeneratePaperNameCollision:
             "2301.12345v2",
             existing,
         )
-        # Stripped arxiv_id = "230112345"; last 5 = "12345".
         assert slug == "bookrag_2024_12345"
         _assert_valid_slug(slug)
 
@@ -154,9 +142,7 @@ class TestGeneratePaperNameCollision:
         _assert_valid_slug(slug)
 
     def test_both_forms_in_existing_raises(self):
-        # Distinct arxiv IDs that happen to share both the base slug AND the
-        # same last-5 collision suffix is a hard-stop. We simulate it by
-        # pre-populating `existing` with both forms for the same arxiv_id.
+        # Hard-stop: both base and collision-suffix forms already taken.
         existing = {"bookrag_2024", "bookrag_2024_03413"}
         with pytest.raises(ValueError):
             generate_paper_name(
@@ -186,10 +172,6 @@ class TestGeneratePaperNameInvariants:
         assert slug not in existing
 
     def test_stop_words_constant_exported(self):
-        assert "a" in STOP_WORDS
-        assert "is" in STOP_WORDS
-        assert "with" in STOP_WORDS
-        # Exact set per spec.
         expected = frozenset({
             "a", "the", "on", "of", "for", "and", "in", "to",
             "with", "is", "are", "be",

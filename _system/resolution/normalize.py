@@ -20,33 +20,20 @@ TRAILING_SUFFIXES: tuple[str, ...] = (
     " approach",
 )
 
-_PUNCT_RE = re.compile(r"[^\w\s]+", flags=re.UNICODE)
-_WS_RE = re.compile(r"\s+")
+_CLEAN_RE = re.compile(r"[^\w]+")
+_SUFFIX_RE = re.compile(
+    r"\s(?:" + "|".join(s.lstrip() for s in TRAILING_SUFFIXES) + r")$"
+)
 
 
 def normalize_term(s: str) -> str:
     """Normalize a term for Tier 2 matching and alias deduplication.
 
-    Steps (in order):
-      1. Lowercase.
-      2. Strip all punctuation (including inner hyphens) — replace with ' '.
-      3. Collapse runs of whitespace into a single space; trim.
-      4. If the result ends with any string in TRAILING_SUFFIXES (matched
-         as a whole trailing token, i.e., preceded by a space), strip it.
-         Only ONE suffix is stripped (no iterative stripping).
-
-    Properties:
-      - Idempotent: normalize_term(normalize_term(x)) == normalize_term(x).
-      - Pure: no side effects, no IO.
-      - Whole-word suffix match: "alignment" is untouched even though it
-        ends with "ment".
+    Lowercases, replaces punctuation (including inner hyphens) with spaces,
+    collapses whitespace, and strips at most one trailing type-suffix from
+    TRAILING_SUFFIXES. Idempotent and pure.
     """
-    lowered = s.lower()
-    depuncted = _PUNCT_RE.sub(" ", lowered)
-    collapsed = _WS_RE.sub(" ", depuncted).strip()
-
-    for suffix in TRAILING_SUFFIXES:
-        if collapsed.endswith(suffix):
-            return collapsed[: -len(suffix)]
-
-    return collapsed
+    if not s:
+        return ""
+    collapsed = _CLEAN_RE.sub(" ", s.lower()).strip()
+    return _SUFFIX_RE.sub("", collapsed, count=1)

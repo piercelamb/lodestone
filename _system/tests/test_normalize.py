@@ -11,15 +11,9 @@ class TestNormalizeTermBasics:
         assert normalize_term("BookRAG") == "bookrag"
 
     def test_strips_trailing_model_suffix(self):
-        # Per the hyphen policy: strip ALL punctuation including inner hyphens.
-        # "Book-RAG Model" -> "book rag model" -> strip " model" -> "book rag"
         assert normalize_term("Book-RAG Model") == "book rag"
 
-    def test_strips_trailing_dataset_suffix(self):
-        assert normalize_term("MMLongBench Dataset") == "mmlongbench"
-
     def test_collapses_whitespace_and_strips_punctuation(self):
-        # "  BookRAG!!   (v2) " -> lower, punct->space, collapse -> "bookrag v2"
         assert normalize_term("  BookRAG!!   (v2) ") == "bookrag v2"
 
 
@@ -44,40 +38,38 @@ class TestNormalizeTermIdempotent:
 
 
 class TestNormalizeTermSuffixStripping:
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("Foo Model", "foo"),
+            ("Some Method", "some"),
+            ("Foo Framework", "foo"),
+            ("MMLongBench Dataset", "mmlongbench"),
+            ("Bar Benchmark", "bar"),
+            ("Baz System", "baz"),
+            ("X Approach", "x"),
+        ],
+    )
+    def test_strips_each_suffix(self, raw: str, expected: str):
+        assert normalize_term(raw) == expected
+
     def test_strips_only_once(self):
-        # "Model Model" -> "model model" -> strip " model" once -> "model"
+        # "Model Model" -> strip trailing " model" once -> "model", not "".
         assert normalize_term("Model Model") == "model"
 
-    def test_strips_approach(self):
-        assert normalize_term("X Approach") == "x"
-
     def test_does_not_strip_approaches(self):
-        # "Approaches" is not in TRAILING_SUFFIXES; must remain.
+        # "approaches" is not in TRAILING_SUFFIXES; whole-word match only.
         assert normalize_term("X Approaches") == "x approaches"
 
     def test_whole_word_only_suffix_match(self):
-        # "alignment" ends with "ment" but must NOT be stripped — whole-word only.
+        # Requires a preceding space; "alignment" must not be stripped.
         assert normalize_term("alignment") == "alignment"
 
     def test_whole_word_only_method(self):
-        # "benchmark" ends with neither suffix as a separate token.
         assert normalize_term("overmethod") == "overmethod"
 
     def test_single_word_suffix_not_stripped(self):
-        # No leading space means no whole-word suffix match.
         assert normalize_term("model") == "model"
-
-    def test_strips_method(self):
-        assert normalize_term("Some Method") == "some"
-
-    def test_strips_framework(self):
-        assert normalize_term("Foo Framework") == "foo"
-
-    def test_strips_benchmark(self):
-        assert normalize_term("Bar Benchmark") == "bar"
-
-    def test_strips_system(self):
-        assert normalize_term("Baz System") == "baz"
 
 
 class TestNormalizeTermEdgeCases:
@@ -91,14 +83,11 @@ class TestNormalizeTermEdgeCases:
         assert normalize_term("!@#$%") == ""
 
     def test_preserves_underscores(self):
-        # Underscores are \w, so they survive punctuation stripping.
         assert normalize_term("feed_forward") == "feed_forward"
 
     def test_unicode_preserved(self):
-        # normalize_term does NOT ASCII-fold; only slug.py does that.
-        # But diacritics should be preserved as-is (lowercased).
-        result = normalize_term("Étude")
-        assert result == "étude"
+        # normalize_term lowercases but does NOT ASCII-fold (slug.py does).
+        assert normalize_term("Étude") == "étude"
 
     def test_pure_no_side_effects(self):
         s = "Book-RAG Model"
