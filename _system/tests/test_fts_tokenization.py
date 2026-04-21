@@ -9,19 +9,6 @@ from __future__ import annotations
 
 import pytest
 
-from _system.db.connection import get_conn
-from _system.db.migrations import init_db
-
-
-@pytest.fixture
-def conn(db_path):
-    c = get_conn(db_path)
-    init_db(c)
-    try:
-        yield c
-    finally:
-        c.close()
-
 
 def _insert_section(conn, body: str, paper_id: int = 1) -> None:
     conn.execute(

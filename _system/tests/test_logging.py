@@ -1,23 +1,20 @@
 """Tests for the shared logger factory."""
 from __future__ import annotations
 
-import importlib
 import logging
 import sys
 
 import pytest
 
 
-def _reimport_logging_module(monkeypatch, level: str | None = None):
-    """Reset the module-level ``_configured`` flag and re-import the logger module.
+def _fresh_logging(monkeypatch, level: str | None = None):
+    """Return the logger module with a clean lodestone root (handlers cleared).
 
-    Necessary because :func:`get_logger` is idempotent across a process; tests
-    that exercise the configure path need a clean slate.
+    `get_logger` is idempotent across a process (handler install guarded by
+    ``if not root.handlers``), so tests that exercise the configure path must
+    reset the root between runs.
     """
     import _system.utils.logging as mod
-    # Reset module state so the next get_logger() re-runs _configure_root.
-    monkeypatch.setattr(mod, "_configured", False)
-    # Clear the lodestone root logger's handlers so we can observe re-installation.
     root = logging.getLogger("lodestone")
     for h in list(root.handlers):
         root.removeHandler(h)
@@ -29,7 +26,7 @@ def _reimport_logging_module(monkeypatch, level: str | None = None):
 
 
 def test_get_logger_returns_namespaced_child(monkeypatch):
-    mod = _reimport_logging_module(monkeypatch)
+    mod = _fresh_logging(monkeypatch)
     logger = mod.get_logger("db")
     assert logger.name == "lodestone.db"
     # Fully-qualified names are respected, not re-prefixed.
@@ -42,7 +39,7 @@ def test_get_logger_returns_namespaced_child(monkeypatch):
 
 def test_get_logger_is_idempotent(monkeypatch):
     """Calling get_logger repeatedly must not stack handlers on the root logger."""
-    mod = _reimport_logging_module(monkeypatch)
+    mod = _fresh_logging(monkeypatch)
     for _ in range(5):
         mod.get_logger(f"child_{_}")
     root = logging.getLogger("lodestone")
@@ -52,7 +49,7 @@ def test_get_logger_is_idempotent(monkeypatch):
 
 
 def test_get_logger_emits_to_stderr(monkeypatch):
-    mod = _reimport_logging_module(monkeypatch)
+    mod = _fresh_logging(monkeypatch)
     mod.get_logger("stream_check")
     root = logging.getLogger("lodestone")
     handler = root.handlers[0]
@@ -61,20 +58,23 @@ def test_get_logger_emits_to_stderr(monkeypatch):
 
 
 def test_get_logger_respects_env_level(monkeypatch):
-    mod = _reimport_logging_module(monkeypatch, level="DEBUG")
-    logger = mod.get_logger("debug_check")
-    assert logger.getEffectiveLevel() == logging.DEBUG
+    mod = _fresh_logging(monkeypatch, level="DEBUG")
+    mod.get_logger("debug_check")
+    # Assert on the lodestone root directly: a child's getEffectiveLevel()
+    # would pass even if the env var never reached _configure_root (via
+    # inheritance from the python root logger's default).
+    assert logging.getLogger("lodestone").level == logging.DEBUG
 
 
 def test_get_logger_default_level_is_info(monkeypatch):
-    mod = _reimport_logging_module(monkeypatch)
-    logger = mod.get_logger("default_level")
-    assert logger.getEffectiveLevel() == logging.INFO
+    mod = _fresh_logging(monkeypatch)
+    mod.get_logger("default_level")
+    assert logging.getLogger("lodestone").level == logging.INFO
 
 
 def test_lodestone_logger_does_not_propagate(monkeypatch):
     """Otherwise the root python logger would emit duplicate records."""
-    mod = _reimport_logging_module(monkeypatch)
+    mod = _fresh_logging(monkeypatch)
     mod.get_logger("propagation_check")
     root = logging.getLogger("lodestone")
     assert root.propagate is False

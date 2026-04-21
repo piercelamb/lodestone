@@ -7,7 +7,7 @@ script/module acquires its DB handle through :func:`get_conn`.
 from __future__ import annotations
 
 import sqlite3
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator, Union
 
@@ -16,7 +16,7 @@ import sqlite_vec
 # sqlite-vec is pinned at 0.1.9 (pre-v1, breaking changes expected between
 # minor versions). `vec_version()` returns a string like "v0.1.9"; we assert
 # the prefix at connect-time so a mismatched install fails loudly.
-_PINNED_VEC_PREFIX = "v0.1.9"
+PINNED_VEC_PREFIX = "v0.1.9"
 
 PathLike = Union[str, Path]
 
@@ -42,11 +42,10 @@ def get_conn(db_path: PathLike) -> sqlite3.Connection:
         conn.enable_load_extension(False)
 
     version = conn.execute("SELECT vec_version()").fetchone()[0]
-    if not version.startswith(_PINNED_VEC_PREFIX):
-        with suppress(Exception):
-            conn.close()
+    if not version.startswith(PINNED_VEC_PREFIX):
+        conn.close()
         raise VecVersionMismatch(
-            f"sqlite-vec version mismatch: expected prefix {_PINNED_VEC_PREFIX!r}, "
+            f"sqlite-vec version mismatch: expected prefix {PINNED_VEC_PREFIX!r}, "
             f"got {version!r}. Lodestone pins sqlite-vec==0.1.9 (pre-v1, breaking "
             f"changes between minor versions are expected). Run `uv sync` and "
             f"verify pyproject.toml."

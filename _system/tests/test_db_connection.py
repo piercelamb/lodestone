@@ -29,8 +29,8 @@ def test_vec_version_matches_pinned_prefix(db_path):
     c = get_conn(db_path)
     try:
         version = c.execute("SELECT vec_version()").fetchone()[0]
-        assert version.startswith(conn_mod._PINNED_VEC_PREFIX), (
-            f"sqlite-vec {version!r} diverged from pin {conn_mod._PINNED_VEC_PREFIX!r}"
+        assert version.startswith(conn_mod.PINNED_VEC_PREFIX), (
+            f"sqlite-vec {version!r} diverged from pin {conn_mod.PINNED_VEC_PREFIX!r}"
         )
     finally:
         c.close()
@@ -112,7 +112,7 @@ def test_get_conn_real_connection_load_extension_disabled_after_failure(db_path)
 
 def test_get_conn_vec_version_mismatch_raises(db_path, monkeypatch):
     """Wrong sqlite-vec version must raise a VecVersionMismatch with upgrade hint."""
-    monkeypatch.setattr(conn_mod, "_PINNED_VEC_PREFIX", "v9.9.9")
+    monkeypatch.setattr(conn_mod, "PINNED_VEC_PREFIX", "v9.9.9")
     with pytest.raises(VecVersionMismatch) as excinfo:
         get_conn(db_path)
     message = str(excinfo.value)

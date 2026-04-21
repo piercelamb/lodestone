@@ -11,13 +11,9 @@ import os
 import sys
 
 _ROOT_LOGGER_NAME = "lodestone"
-_configured = False
 
 
 def _configure_root() -> None:
-    global _configured
-    if _configured:
-        return
     root = logging.getLogger(_ROOT_LOGGER_NAME)
     level_name = os.environ.get("LODESTONE_LOG_LEVEL", "INFO").upper()
     root.setLevel(level_name)
@@ -31,7 +27,6 @@ def _configure_root() -> None:
         )
         root.addHandler(handler)
     root.propagate = False
-    _configured = True
 
 
 def get_logger(name: str) -> logging.Logger:
