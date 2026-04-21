@@ -55,6 +55,14 @@ def test_breadcrumb_full_ancestry_with_marker_prefixes(sample_chunks: list[Secti
     assert opt.breadcrumb == "# Method > ## Gradient-based Entity Resolution > ### Optimization"
 
 
+def test_title_path_carries_structured_ancestry(sample_chunks: list[SectionChunk]) -> None:
+    """title_path is the tuple of ancestor titles in order (no '#' prefixes), aligned with breadcrumb."""
+    opt = next(c for c in sample_chunks if c.title == "Optimization")
+    assert opt.title_path == ("Method", "Gradient-based Entity Resolution", "Optimization")
+    abstract = sample_chunks[0]
+    assert abstract.title == "Abstract" and abstract.title_path == ("Abstract",)
+
+
 def test_breadcrumb_prepended_to_body(sample_chunks: list[SectionChunk]) -> None:
     """First line of body is the breadcrumb, followed by a blank line, then original text."""
     scaling = next(c for c in sample_chunks if c.title == "Scaling")
@@ -246,6 +254,25 @@ def test_find_hierarchical_section_case_insensitive(sample_markdown: str) -> Non
     slice_ = find_hierarchical_section(sample_markdown, "method")
     assert slice_ is not None
     assert slice_.startswith("# Method")
+
+
+def test_find_hierarchical_section_end_boundary_excludes_next_top_level(sample_markdown: str) -> None:
+    """Slice boundary is exact: it must not leak the next same-or-higher header line."""
+    slice_ = find_hierarchical_section(sample_markdown, "Method")
+    assert slice_ is not None
+    # The next top-level header is Experiments — neither its '#' line nor body may appear.
+    assert "# Experiments" not in slice_
+    assert "Experiments intro." not in slice_
+
+
+# --- split_sections edge cases ---
+
+
+def test_unclosed_fence_swallows_trailing_headers() -> None:
+    """Headers after an unclosed fence at EOF are treated as inside the fence and ignored."""
+    md = "# Real\n\nbody\n\n```\n# Fake\n## Also Fake\n"
+    titles = [c.title for c in split_sections(md)]
+    assert titles == ["Real"]
 
 
 # --- Cross-cutting ---

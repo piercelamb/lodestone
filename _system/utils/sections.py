@@ -18,12 +18,10 @@ _BREADCRUMB_LEAD_RE = re.compile(r"^#{1,3}\s+\S")
 class SectionChunk(NamedTuple):
     level: int
     title: str
+    title_path: tuple[str, ...]
     breadcrumb: str
     body: str
     start_offset: int  # character offset (not bytes) of the header line in the source markdown
-
-
-_BREADCRUMB_SEG_RE = re.compile(r"^#+\s+")
 
 
 def split_sections(markdown: str) -> list[SectionChunk]:
@@ -65,6 +63,7 @@ def split_sections(markdown: str) -> list[SectionChunk]:
             SectionChunk(
                 level=1,
                 title="Abstract",
+                title_path=("Abstract",),
                 breadcrumb="# Abstract",
                 body=f"# Abstract\n\n{preamble}",
                 start_offset=0,
@@ -77,6 +76,7 @@ def split_sections(markdown: str) -> list[SectionChunk]:
             stack.pop()
         stack.append((level, title))
 
+        title_path = tuple(t for _, t in stack)
         breadcrumb = " > ".join(f"{'#' * lvl} {t}" for lvl, t in stack)
 
         end_line_idx = len(lines)
@@ -90,6 +90,7 @@ def split_sections(markdown: str) -> list[SectionChunk]:
             SectionChunk(
                 level=level,
                 title=title,
+                title_path=title_path,
                 breadcrumb=breadcrumb,
                 body=f"{breadcrumb}\n\n{raw_body}",
                 start_offset=offsets[line_idx],
@@ -171,17 +172,13 @@ def find_hierarchical_section(markdown: str, section_query: str) -> Optional[str
     if not chunks:
         return None
 
-    query_parts = [p.strip().lower() for p in section_query.split(">")]
+    query_parts = tuple(p.strip().lower() for p in section_query.split(">"))
     q_len = len(query_parts)
 
     for idx, chunk in enumerate(chunks):
-        breadcrumb_titles = [
-            _BREADCRUMB_SEG_RE.sub("", seg).strip().lower()
-            for seg in chunk.breadcrumb.split(" > ")
-        ]
-        if len(breadcrumb_titles) < q_len:
+        if len(chunk.title_path) < q_len:
             continue
-        if breadcrumb_titles[-q_len:] != query_parts:
+        if tuple(t.lower() for t in chunk.title_path[-q_len:]) != query_parts:
             continue
 
         end_offset = len(markdown)
