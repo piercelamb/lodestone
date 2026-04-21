@@ -16,6 +16,13 @@ class PaperStatus(StrEnum):
     FAILED_HTML = "failed_html"
 
 
+class HtmlSource(StrEnum):
+    """Canonical value set for ``papers.html_source``."""
+
+    ARXIV = "arxiv"
+    AR5IV = "ar5iv"
+
+
 STATUS_ORDER: dict[PaperStatus, int] = {
     PaperStatus.FETCHED: 0,
     PaperStatus.CONVERTED: 1,

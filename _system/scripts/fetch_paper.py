@@ -37,7 +37,8 @@ from tenacity import (
 
 from _system.db.connection import get_conn, transaction
 from _system.html.latexml_parser import FigureDescriptor, parse as parse_latexml
-from _system.schemas.paper_metadata import PaperMetadata, PaperStatus
+from _system.schemas.paper_metadata import HtmlSource, PaperMetadata, PaperStatus
+from _system.utils.arxiv_urls import base_url_for_source
 from _system.utils.logging import get_logger
 from _system.utils.slug import generate_paper_name
 
@@ -180,25 +181,17 @@ def _try_html(client: httpx.Client, url: str) -> str | None:
 
 def _fetch_html_body(
     client: httpx.Client, arxiv_id: str
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, HtmlSource | None]:
     """Try arxiv.org/html first, then ar5iv. Returns (body, source) or (None, None)."""
     for source, url_tmpl in (
-        ("arxiv", _ARXIV_HTML_URL),
-        ("ar5iv", _AR5IV_HTML_URL),
+        (HtmlSource.ARXIV, _ARXIV_HTML_URL),
+        (HtmlSource.AR5IV, _AR5IV_HTML_URL),
     ):
         url = url_tmpl.format(arxiv_id=arxiv_id)
         body = _try_html(client, url)
         if body is not None:
             return body, source
     return None, None
-
-
-def _base_url_for_source(source: str, arxiv_id: str) -> str:
-    # Trailing slash matters: lxml's `urljoin` drops the last path segment
-    # without it (confirmed in section 07 tests).
-    if source == "arxiv":
-        return f"https://arxiv.org/html/{arxiv_id}/"
-    return f"https://ar5iv.labs.arxiv.org/html/{arxiv_id}/"
 
 
 @_retry_http
@@ -681,7 +674,7 @@ def fetch(
 
         page_images = render_pages(pdf_bytes)
 
-        base_url = _base_url_for_source(html_source, arxiv_id)
+        base_url = base_url_for_source(html_source, arxiv_id)
         parsed = parse_latexml(html_body, base_url)
 
         processed_figures = _process_figures(client, parsed.figures)
