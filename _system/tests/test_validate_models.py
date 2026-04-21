@@ -1,10 +1,4 @@
-"""Tests for _system.scripts.validate_models.
-
-These tests must never actually load the heavy ML models. The module under
-test performs lazy imports inside ``check_models``, so we patch the public
-``SentenceTransformer`` / ``GLiNER2`` symbols on their parent modules; the
-delayed imports then pick up the fakes.
-"""
+"""Tests for _system.scripts.validate_models."""
 from __future__ import annotations
 
 import pytest
@@ -12,50 +6,24 @@ import pytest
 from _system.scripts import validate_models as vm_mod
 
 
-class _FakeSentenceTransformer:
-    """Records every constructor call made through ``sentence_transformers``."""
+@pytest.fixture
+def patch_snapshot_download(monkeypatch):
+    """Replace ``huggingface_hub.snapshot_download`` with a call recorder.
+
+    The validator lazy-imports inside ``_check_model``, so we patch the
+    public symbol on ``huggingface_hub`` and the deferred import picks
+    up the fake.
+    """
+    import huggingface_hub
 
     calls: list[str] = []
 
-    def __init__(self, name: str) -> None:
-        self.name = name
-        _FakeSentenceTransformer.calls.append(name)
+    def fake(repo_id: str, *args, **kwargs):
+        calls.append(repo_id)
+        return f"/fake/hf/cache/{repo_id}"
 
-
-class _FakeGLiNER2:
-    """Stand-in for ``gliner2.GLiNER2`` with a ``from_pretrained`` loader."""
-
-    calls: list[str] = []
-
-    @classmethod
-    def from_pretrained(cls, name: str):
-        cls.calls.append(name)
-        return cls()
-
-
-@pytest.fixture(autouse=True)
-def _reset_fakes():
-    _FakeSentenceTransformer.calls = []
-    _FakeGLiNER2.calls = []
-    yield
-
-
-@pytest.fixture
-def patch_st(monkeypatch):
-    import sentence_transformers
-
-    monkeypatch.setattr(
-        sentence_transformers, "SentenceTransformer", _FakeSentenceTransformer
-    )
-    return _FakeSentenceTransformer
-
-
-@pytest.fixture
-def patch_gliner2(monkeypatch):
-    import gliner2
-
-    monkeypatch.setattr(gliner2, "GLiNER2", _FakeGLiNER2)
-    return _FakeGLiNER2
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fake)
+    return calls
 
 
 @pytest.fixture
@@ -81,48 +49,46 @@ class TestClaudeCLIMissing:
 
 
 class TestModelLoadersInvoked:
-    def test_pinned_model_ids_are_passed_to_loaders(
-        self, patch_claude_present, patch_st, patch_gliner2
+    def test_pinned_model_ids_are_passed_to_snapshot_download(
+        self, patch_claude_present, patch_snapshot_download
     ):
-        vm_mod.check_models()
-        assert patch_st.calls == [str(vm_mod.ModelId.BGE)]
-        assert patch_gliner2.calls == [str(vm_mod.ModelId.GLINER2)]
+        returned = vm_mod.check_models()
+        assert returned == "/fake/bin/claude"
+        assert patch_snapshot_download == [
+            str(vm_mod.ModelId.BGE),
+            str(vm_mod.ModelId.GLINER2),
+        ]
 
 
 class TestModelLoadErrorContext:
-    def test_oserror_from_sentence_transformer_surfaces_cache_and_hint(
-        self, patch_claude_present, monkeypatch, patch_gliner2
+    def _patch_snapshot_raises(self, monkeypatch, exc: Exception):
+        import huggingface_hub
+
+        def boom(_repo_id, *args, **kwargs):
+            raise exc
+
+        monkeypatch.setattr(huggingface_hub, "snapshot_download", boom)
+
+    def test_oserror_surfaces_cache_and_hint_for_bge(
+        self, patch_claude_present, monkeypatch
     ):
-        import sentence_transformers
-
-        def boom(_name):
-            raise OSError("cache miss")
-
-        monkeypatch.setattr(sentence_transformers, "SentenceTransformer", boom)
+        self._patch_snapshot_raises(monkeypatch, OSError("cache miss"))
         with pytest.raises(vm_mod.ModelLoadError) as excinfo:
             vm_mod.check_models()
         msg = str(excinfo.value)
         assert str(vm_mod.ModelId.BGE) in msg
         assert "hf hub download" in msg
-        # Cache path: huggingface_hub's canonical default contains "huggingface".
         assert "huggingface" in msg.lower()
         assert isinstance(excinfo.value.__cause__, OSError)
 
-    def test_connectionerror_from_gliner2_surfaces_cache_and_hint(
-        self, patch_claude_present, patch_st, monkeypatch
+    def test_connectionerror_surfaces_cache_and_hint_for_bge(
+        self, patch_claude_present, monkeypatch
     ):
-        import gliner2
-
-        class _BoomGLiNER2:
-            @classmethod
-            def from_pretrained(cls, _name):
-                raise ConnectionError("no net")
-
-        monkeypatch.setattr(gliner2, "GLiNER2", _BoomGLiNER2)
+        self._patch_snapshot_raises(monkeypatch, ConnectionError("no net"))
         with pytest.raises(vm_mod.ModelLoadError) as excinfo:
             vm_mod.check_models()
         msg = str(excinfo.value)
-        assert str(vm_mod.ModelId.GLINER2) in msg
+        assert str(vm_mod.ModelId.BGE) in msg
         assert "hf hub download" in msg
         assert "huggingface" in msg.lower()
         assert isinstance(excinfo.value.__cause__, ConnectionError)
@@ -130,7 +96,7 @@ class TestModelLoadErrorContext:
 
 class TestMainCLI:
     def test_main_prints_three_status_lines(
-        self, patch_claude_present, patch_st, patch_gliner2, capsys
+        self, patch_claude_present, patch_snapshot_download, capsys
     ):
         vm_mod.main()
         out = capsys.readouterr().out
@@ -143,13 +109,6 @@ class TestMainCLI:
 
 
 class TestImportIsolation:
-    """Confirm `ingest.py` can safely import this module with no side effects.
-
-    Guards the Acceptance Criterion: ``ingest.py`` can
-    ``from _system.scripts.validate_models import check_models`` without any
-    DB or heavy-model dependency.
-    """
-
     def test_import_does_not_pull_db_or_heavy_deps(self):
         import importlib
         import sys
