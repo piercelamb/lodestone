@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import logging
 import re
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -17,7 +16,9 @@ from urllib.parse import urljoin
 
 import lxml.html
 
-_logger = logging.getLogger(__name__)
+from _system.utils.logging import get_logger
+
+_logger = get_logger("html.latexml_parser")
 
 
 class LtxClass(StrEnum):
@@ -57,10 +58,9 @@ _SECTION_DEPTHS: dict[str, int] = {
     LtxClass.SUBSUBSECTION: 3,
 }
 
+# Best-effort extraction of the leading figure/table label. Captions without
+# a trailing delimiter (e.g. "Overview") yield no match.
 _DISPLAY_NUMBER_RE = re.compile(
-    # Plan-specified shape. Best-effort; imperfect in the usual ways — e.g.
-    # captions without a trailing delimiter do not match, "Overview diagram"
-    # captures "Overview", and "Appendix A:" captures "Appendix".
     r"^\s*(?:Figure|Fig\.?|Table)?\s*(\w+)[:\.\s]",
     re.IGNORECASE,
 )
@@ -70,6 +70,10 @@ _BLANK_RUN_RE = re.compile(r"\n{3,}")
 
 _HEADER_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 _SKIP_TAGS = {"head", "script", "style", "noscript"}
+
+
+def _normalize_ws(s: str) -> str:
+    return _WS_RE.sub(" ", s).strip()
 
 
 def parse(html: str, base_url: str) -> ParsedPaper:
@@ -150,20 +154,19 @@ def _convert(elem, state: _State) -> str:
         return _convert_paragraph(elem, state)
 
     if tag in _HEADER_TAGS:
-        # Stray <hN> outside a recognized section — skip; the section walker
-        # handles the real ones. The plan says to trust <section> nesting over
-        # <hN> tag names.
+        # Trust <section> nesting; stray <hN> are handled by the section walker.
         return ""
 
     return _default_children(elem, state)
 
 
-def _default_children(elem, state: _State) -> str:
+def _default_children(elem, state: _State, *, skip=None) -> str:
     parts: list[str] = []
     if elem.text:
         parts.append(elem.text)
     for child in elem:
-        parts.append(_convert(child, state))
+        if child is not skip:
+            parts.append(_convert(child, state))
         if child.tail:
             parts.append(child.tail)
     return "".join(parts)
@@ -172,23 +175,12 @@ def _default_children(elem, state: _State) -> str:
 def _convert_section(elem, state: _State, depth: int) -> str:
     title_elem = _find_section_title(elem)
     title = _extract_title_text(title_elem) if title_elem is not None else ""
-
     header = f"{'#' * depth} {title}\n\n" if title else ""
 
     state.section_stack.append(title)
     try:
-        body_parts: list[str] = [header]
-        if elem.text:
-            body_parts.append(elem.text)
-        for child in elem:
-            if child is title_elem:
-                if child.tail:
-                    body_parts.append(child.tail)
-                continue
-            body_parts.append(_convert(child, state))
-            if child.tail:
-                body_parts.append(child.tail)
-        return "\n\n" + "".join(body_parts) + "\n\n"
+        body = _default_children(elem, state, skip=title_elem)
+        return "\n\n" + header + body + "\n\n"
     finally:
         state.section_stack.pop()
 
@@ -209,14 +201,11 @@ def _extract_title_text(title_elem) -> str:
     if title_elem.text:
         parts.append(title_elem.text)
     for child in title_elem:
-        if isinstance(child.tag, str) and LtxClass.TAG in _classes(child):
-            # Skip numbering content; keep tail
-            pass
-        elif isinstance(child.tag, str):
+        if isinstance(child.tag, str) and LtxClass.TAG not in _classes(child):
             parts.append(child.text_content())
         if child.tail:
             parts.append(child.tail)
-    return _WS_RE.sub(" ", "".join(parts)).strip()
+    return _normalize_ws("".join(parts))
 
 
 def _convert_figure(elem, state: _State) -> str:
@@ -265,8 +254,6 @@ def _convert_figure(elem, state: _State) -> str:
                     fig_num,
                     exc,
                 )
-                inline_data = None
-                inline_mime = None
                 markdown = placeholder
     else:
         src_url = urljoin(state.base_url, src)
@@ -327,7 +314,7 @@ def _figure_caption(elem) -> str:
     caption_elem = ltx_caption if ltx_caption is not None else any_caption
     if caption_elem is None:
         return ""
-    return _WS_RE.sub(" ", caption_elem.text_content()).strip()
+    return _normalize_ws(caption_elem.text_content())
 
 
 def _parse_display_number(caption: str) -> Optional[str]:
@@ -347,7 +334,7 @@ def _convert_table_figure(elem, state: _State) -> str:
         if not isinstance(child.tag, str):
             continue
         if child.tag == "figcaption":
-            caption_text = _WS_RE.sub(" ", child.text_content()).strip()
+            caption_text = _normalize_ws(child.text_content())
             continue
         parts.append(_convert(child, state))
     body = "".join(parts).strip()
@@ -402,7 +389,7 @@ def _is_simple(rows: list[list]) -> bool:
 
 def _render_markdown_table(rows: list[list]) -> str:
     def cell_text(c) -> str:
-        return _WS_RE.sub(" ", c.text_content()).strip().replace("|", "\\|")
+        return _normalize_ws(c.text_content()).replace("|", "\\|")
 
     lines: list[str] = []
     header = [cell_text(c) for c in rows[0]]
@@ -421,9 +408,9 @@ def _convert_math(elem) -> str:
     alttext = elem.get("alttext")
     display = elem.get("display") == "block"
     delim = "$$" if display else "$"
-    if alttext is not None and alttext != "":
+    if alttext:
         return f"{delim}{alttext}{delim}"
-    _logger.warning("math element missing alttext; falling back to visible text")
+    _logger.warning("math element missing or empty alttext; falling back to visible text")
     visible = elem.text_content() or ""
     return visible.replace("$", r"\$")
 
@@ -444,22 +431,17 @@ def _convert_pre(elem) -> str:
 
 
 def _convert_list(elem, state: _State, ordered: bool) -> str:
+    items = [c for c in elem if isinstance(c.tag, str) and c.tag == "li"]
     lines: list[str] = []
-    i = 1
-    for child in elem:
-        if not isinstance(child.tag, str) or child.tag != "li":
-            continue
-        content = _default_children(child, state)
-        content = _WS_RE.sub(" ", content).strip()
+    for i, child in enumerate(items, 1):
+        content = _normalize_ws(_default_children(child, state))
         marker = f"{i}." if ordered else "-"
         lines.append(f"{marker} {content}")
-        i += 1
     return "\n\n" + "\n".join(lines) + "\n\n"
 
 
 def _convert_paragraph(elem, state: _State) -> str:
-    content = _default_children(elem, state)
-    content = _WS_RE.sub(" ", content).strip()
+    content = _normalize_ws(_default_children(elem, state))
     if not content:
         return ""
     return "\n\n" + content + "\n\n"

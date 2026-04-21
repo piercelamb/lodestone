@@ -185,8 +185,15 @@ def test_math_without_alttext_escapes_dollars_and_warns(
 ) -> None:
     """Missing alttext -> emit visible text with $ escaped as \\$; log warning."""
     html = "<html><body><p><math>$100 total</math></p></body></html>"
-    with caplog.at_level(logging.WARNING, logger="_system.html.latexml_parser"):
-        paper = parse(html, base_url="https://example.com/")
+    # ``lodestone`` is the Lodestone logger namespace and has ``propagate=False``,
+    # so caplog's root handler never sees records unless we attach to it directly.
+    logger = logging.getLogger("lodestone.html.latexml_parser")
+    logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger="lodestone.html.latexml_parser"):
+            paper = parse(html, base_url="https://example.com/")
+    finally:
+        logger.removeHandler(caplog.handler)
     assert r"\$100 total" in paper.markdown
     assert any("alttext" in rec.getMessage() for rec in caplog.records)
 
