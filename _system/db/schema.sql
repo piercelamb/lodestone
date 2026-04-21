@@ -15,10 +15,13 @@ CREATE TABLE IF NOT EXISTS papers (
     authors TEXT NOT NULL,
     date TEXT NOT NULL,
     abstract TEXT NOT NULL,
-    domain TEXT NOT NULL REFERENCES domains(name),
+    -- domain/content_hash are filled in by later pipeline stages.
+    -- domain is set by classify_paper.py; content_hash is NULL only for
+    -- FAILED_HTML stubs (no PDF was ever downloaded).
+    domain TEXT REFERENCES domains(name),
     collection TEXT,
     code_repo TEXT,
-    content_hash TEXT NOT NULL,
+    content_hash TEXT,
     pdf_url TEXT NOT NULL,
     html_source TEXT,
     ingested_at TEXT NOT NULL,
