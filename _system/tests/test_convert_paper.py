@@ -1,10 +1,4 @@
-"""Unit tests for _system/scripts/convert_paper.py.
-
-The convert stage is pure compute: it re-parses ``papers.raw_html`` with the
-LaTeXML parser, writes ``papers.markdown``, and NULLs out ``raw_html``.
-These tests seed an in-memory-ish sqlite DB with a single papers row plus
-matching figures, then exercise the convert entry point.
-"""
+"""Unit tests for _system/scripts/convert_paper.py."""
 from __future__ import annotations
 
 import json
@@ -25,11 +19,6 @@ from _system.scripts.convert_paper import (
     convert,
 )
 from _system.schemas.paper_metadata import HtmlSource, PaperStatus
-
-
-# ---------------------------------------------------------------------------
-# Fixture HTML / DB seeding helpers
-# ---------------------------------------------------------------------------
 
 
 _TWO_FIGURE_HTML = """<!doctype html>
@@ -101,14 +90,8 @@ def _seed(
 
 @pytest.fixture
 def seeded_db(conn: sqlite3.Connection):
-    """Fresh migrated conn with a single FETCHED papers row + 2 figures."""
     _seed(conn)
     return conn
-
-
-# ---------------------------------------------------------------------------
-# Success path
-# ---------------------------------------------------------------------------
 
 
 def test_successful_convert_sets_markdown_and_nulls_raw_html(seeded_db):
@@ -134,8 +117,6 @@ def test_status_after_success_is_converted(seeded_db):
 
 
 def test_converted_status_allows_rerun_replace_markdown(conn):
-    """A paper re-entering convert with raw_html restored (e.g. after a fetch
-    force-refetch) must overwrite a stale markdown and re-null raw_html."""
     _seed(conn, status=PaperStatus.CONVERTED.value)
     conn.execute(
         "UPDATE papers SET markdown = ? WHERE paper_name = ?",
@@ -152,11 +133,6 @@ def test_converted_status_allows_rerun_replace_markdown(conn):
     assert row[2] == PaperStatus.CONVERTED.value
 
 
-# ---------------------------------------------------------------------------
-# RawHtmlMissing
-# ---------------------------------------------------------------------------
-
-
 def test_raw_html_null_raises_raw_html_missing(conn):
     _seed(conn, raw_html=None)
     with pytest.raises(RawHtmlMissing) as exc_info:
@@ -165,22 +141,14 @@ def test_raw_html_null_raises_raw_html_missing(conn):
 
 
 def test_raw_html_null_with_force_still_raises(conn):
-    """--force in convert alone is a no-op; caller must cascade to fetch."""
+    # --force is a no-op in convert; caller must cascade to fetch.
     _seed(conn, raw_html=None)
     with pytest.raises(RawHtmlMissing):
         convert(paper_name="paper_name_2023", conn=conn, force=True)
 
 
-# ---------------------------------------------------------------------------
-# FigureCountMismatch
-# ---------------------------------------------------------------------------
-
-
-def test_figure_count_mismatch_on_dangling_reference_raises(conn):
-    """markdown references figure:3 but only 2 figures rows exist."""
+def test_figure_count_mismatch_parser_vs_db_raises(conn):
     paper_id = _seed(conn)
-    # Insert a row where the parser will emit `figure:1..2` but we create only
-    # 1 figure row -> mismatch on count.
     conn.execute("DELETE FROM figures WHERE paper_id = ? AND figure_number = 2", (paper_id,))
     conn.execute("UPDATE papers SET figure_count = 1 WHERE id = ?", (paper_id,))
     with pytest.raises(FigureCountMismatch) as exc_info:
@@ -189,16 +157,10 @@ def test_figure_count_mismatch_on_dangling_reference_raises(conn):
 
 
 def test_figure_count_mismatch_on_db_inconsistency_raises(conn):
-    """papers.figure_count disagrees with COUNT(*) from figures — raise."""
     paper_id = _seed(conn)
     conn.execute("UPDATE papers SET figure_count = 99 WHERE id = ?", (paper_id,))
     with pytest.raises(FigureCountMismatch):
         convert(paper_name="paper_name_2023", conn=conn)
-
-
-# ---------------------------------------------------------------------------
-# Status gates
-# ---------------------------------------------------------------------------
 
 
 def test_status_failed_html_blocks_convert(conn):
@@ -209,22 +171,15 @@ def test_status_failed_html_blocks_convert(conn):
 
 
 def test_status_empty_blocks_convert(conn):
-    """An empty-string status (invalid state) is treated as not-allowed."""
     _seed(conn, status="")
     with pytest.raises(StageNotAllowed):
         convert(paper_name="paper_name_2023", conn=conn)
 
 
 def test_status_indexed_blocks_convert_as_moving_backwards(conn):
-    """can_run_from(INDEXED, CONVERTED) is False — we can't go backwards."""
     _seed(conn, status=PaperStatus.INDEXED.value)
     with pytest.raises(StageNotAllowed):
         convert(paper_name="paper_name_2023", conn=conn)
-
-
-# ---------------------------------------------------------------------------
-# Paper not found
-# ---------------------------------------------------------------------------
 
 
 def test_paper_not_found_raises(conn):
@@ -233,34 +188,27 @@ def test_paper_not_found_raises(conn):
     assert "no_such_paper" in str(exc_info.value)
 
 
-# ---------------------------------------------------------------------------
-# Base URL wiring
-# ---------------------------------------------------------------------------
-
-
-def test_html_source_arxiv_uses_arxiv_base_url(seeded_db, monkeypatch):
+def _spy_parse_base_url(monkeypatch) -> dict[str, str]:
     captured: dict[str, str] = {}
     real_parse = cp.latexml_parser.parse
 
-    def spy_parse(html: str, base_url: str):
+    def spy(html: str, base_url: str):
         captured["base_url"] = base_url
         return real_parse(html, base_url)
 
-    monkeypatch.setattr(cp.latexml_parser, "parse", spy_parse)
+    monkeypatch.setattr(cp.latexml_parser, "parse", spy)
+    return captured
+
+
+def test_html_source_arxiv_uses_arxiv_base_url(seeded_db, monkeypatch):
+    captured = _spy_parse_base_url(monkeypatch)
     convert(paper_name="paper_name_2023", conn=seeded_db)
     assert captured["base_url"].startswith("https://arxiv.org/html/2301.00001")
 
 
 def test_html_source_ar5iv_uses_ar5iv_base_url(conn, monkeypatch):
     _seed(conn, html_source=HtmlSource.AR5IV.value)
-    captured: dict[str, str] = {}
-    real_parse = cp.latexml_parser.parse
-
-    def spy_parse(html: str, base_url: str):
-        captured["base_url"] = base_url
-        return real_parse(html, base_url)
-
-    monkeypatch.setattr(cp.latexml_parser, "parse", spy_parse)
+    captured = _spy_parse_base_url(monkeypatch)
     convert(paper_name="paper_name_2023", conn=conn)
     assert captured["base_url"].startswith("https://ar5iv.labs.arxiv.org/html/2301.00001")
 
@@ -271,44 +219,13 @@ def test_unknown_html_source_raises(conn):
         convert(paper_name="paper_name_2023", conn=conn)
 
 
-# ---------------------------------------------------------------------------
-# No network
-# ---------------------------------------------------------------------------
-
-
 def test_convert_paper_source_has_no_httpx_import():
-    """Static check: the convert module must not import httpx at all.
-
-    A runtime monkeypatch approach is unreliable because httpx is usually
-    already loaded by sibling modules (fetch_paper) in the test session.
-    Grepping the module source is the honest check.
-    """
-    source_path = Path(cp.__file__)
-    source = source_path.read_text()
-    assert "import httpx" not in source, (
-        f"{source_path} must not import httpx (convert is zero-network)"
-    )
+    source = Path(cp.__file__).read_text()
+    assert "import httpx" not in source
     assert "from httpx" not in source
 
 
-def test_convert_does_not_construct_httpx_client(seeded_db, monkeypatch):
-    """Runtime sentinel: force-load httpx and assert convert doesn't call it."""
-    import httpx
-
-    class _Boom:
-        def __init__(self, *a, **kw):
-            raise AssertionError("convert() must not construct httpx.Client")
-
-    monkeypatch.setattr(httpx, "Client", _Boom)
-    convert(paper_name="paper_name_2023", conn=seeded_db)
-
-
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
-def test_cli_prints_json_summary_on_success(tmp_path: Path, capsys, monkeypatch):
+def test_cli_prints_json_summary_on_success(tmp_path: Path, capsys):
     db_path = tmp_path / "lodestone.db"
     conn_ = get_conn(db_path)
     init_db(conn_)

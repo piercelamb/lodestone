@@ -17,8 +17,6 @@ class PaperStatus(StrEnum):
 
 
 class HtmlSource(StrEnum):
-    """Canonical value set for ``papers.html_source``."""
-
     ARXIV = "arxiv"
     AR5IV = "ar5iv"
 
