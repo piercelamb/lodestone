@@ -114,17 +114,7 @@ def resolve(
         entity_type=entity_type,
     )
     if hit2 is not None:
-        term_id, canonical_name = hit2
-        _maybe_insert_alias(
-            conn,
-            term_id=term_id,
-            canonical_name=canonical_name,
-            alias=raw,
-            source_paper=source_paper,
-            match_tier=2,
-        )
-        _log.debug("resolve tier2 hit: raw=%r term_id=%s", raw, term_id)
-        return ResolvedTerm(term_id, canonical_name, MatchTier.TIER2, False)
+        return _hit(conn, hit2, raw=raw, source_paper=source_paper, tier=MatchTier.TIER2)
 
     hit3 = _tier3(
         conn,
@@ -135,17 +125,7 @@ def resolve(
         entity_type=entity_type,
     )
     if hit3 is not None:
-        term_id, canonical_name = hit3
-        _maybe_insert_alias(
-            conn,
-            term_id=term_id,
-            canonical_name=canonical_name,
-            alias=raw,
-            source_paper=source_paper,
-            match_tier=3,
-        )
-        _log.debug("resolve tier3 hit: raw=%r term_id=%s", raw, term_id)
-        return ResolvedTerm(term_id, canonical_name, MatchTier.TIER3, False)
+        return _hit(conn, hit3, raw=raw, source_paper=source_paper, tier=MatchTier.TIER3)
 
     if embedder is not None:
         hit4 = _tier4(
@@ -157,17 +137,7 @@ def resolve(
             embedder=embedder,
         )
         if hit4 is not None:
-            term_id, canonical_name = hit4
-            _maybe_insert_alias(
-                conn,
-                term_id=term_id,
-                canonical_name=canonical_name,
-                alias=raw,
-                source_paper=source_paper,
-                match_tier=4,
-            )
-            _log.debug("resolve tier4 hit: raw=%r term_id=%s", raw, term_id)
-            return ResolvedTerm(term_id, canonical_name, MatchTier.TIER4, False)
+            return _hit(conn, hit4, raw=raw, source_paper=source_paper, tier=MatchTier.TIER4)
 
     return _tier5(
         conn,
@@ -295,7 +265,9 @@ def _tier3(
         if score < _TIER3_MIN_RATIO:
             continue
         key = (len(canonical_name), term_id)
-        if score > best_score or (score == best_score and key < best_key):
+        if score > best_score or (
+            score == best_score and best_key is not None and key < best_key
+        ):
             best_score = score
             best = (term_id, canonical_name)
             best_key = key
@@ -314,30 +286,25 @@ def _tier4(
     embedder: Embedder,
 ) -> tuple[int, str] | None:
     qvec = sqlite_vec.serialize_float32(embedder.embed(raw))
-    rows = conn.execute(
+    row = conn.execute(
         """
-        SELECT term_id, distance FROM term_embeddings
-        WHERE embedding MATCH ?
-          AND term_type = ?
-          AND domain = ?
-          AND entity_type = ?
-          AND k = 5
-        ORDER BY distance
+        SELECT te.term_id, te.distance, ct.canonical_name
+        FROM term_embeddings te
+        JOIN canonical_terms ct ON ct.id = te.term_id
+        WHERE te.embedding MATCH ?
+          AND te.term_type = ?
+          AND te.domain = ?
+          AND te.entity_type = ?
+          AND te.k = 1
         """,
         (qvec, term_type, domain, entity_type),
-    ).fetchall()
-    if not rows:
-        return None
-    top_term_id, top_distance = rows[0]
-    if top_distance > _TIER4_MAX_DISTANCE:
-        return None
-    name_row = conn.execute(
-        "SELECT canonical_name FROM canonical_terms WHERE id = ?",
-        (top_term_id,),
     ).fetchone()
-    if name_row is None:
+    if row is None:
         return None
-    return (top_term_id, name_row[0])
+    term_id, distance, canonical_name = row
+    if distance > _TIER4_MAX_DISTANCE:
+        return None
+    return (term_id, canonical_name)
 
 
 def _tier5(
@@ -385,9 +352,11 @@ def _tier5(
             """,
             (term_id, sqlite_vec.serialize_float32(vec), term_type, entity_type, domain),
         )
-    except sqlite3.IntegrityError:
+    except Exception as exc:
         conn.execute("ROLLBACK TO tier5")
         conn.execute("RELEASE tier5")
+        if not isinstance(exc, sqlite3.IntegrityError):
+            raise
         fallback = _tier1(
             conn, raw, domain=domain, term_type=term_type, entity_type=entity_type
         )
@@ -398,10 +367,6 @@ def _tier5(
             raw, fallback.term_id,
         )
         return fallback
-    except Exception:
-        conn.execute("ROLLBACK TO tier5")
-        conn.execute("RELEASE tier5")
-        raise
 
     conn.execute("RELEASE tier5")
     _log.info(
@@ -411,6 +376,28 @@ def _tier5(
     return ResolvedTerm(term_id, raw, MatchTier.TIER5, True)
 
 
+def _hit(
+    conn: sqlite3.Connection,
+    candidate: tuple[int, str],
+    *,
+    raw: str,
+    source_paper: str,
+    tier: MatchTier,
+) -> ResolvedTerm:
+    """Common return path for tiers 2/3/4: log, insert alias row, return ResolvedTerm."""
+    term_id, canonical_name = candidate
+    _maybe_insert_alias(
+        conn,
+        term_id=term_id,
+        canonical_name=canonical_name,
+        alias=raw,
+        source_paper=source_paper,
+        tier=tier,
+    )
+    _log.debug("resolve %s hit: raw=%r term_id=%s", tier.value, raw, term_id)
+    return ResolvedTerm(term_id, canonical_name, tier, False)
+
+
 def _maybe_insert_alias(
     conn: sqlite3.Connection,
     *,
@@ -418,15 +405,17 @@ def _maybe_insert_alias(
     canonical_name: str,
     alias: str,
     source_paper: str,
-    match_tier: int,
+    tier: MatchTier,
 ) -> None:
     """Insert a ``term_aliases`` row if it passes the acceptance filter, and
     enqueue a deferred ``terms_fts`` rebuild. Idempotent per composite PK.
+    ``term_aliases.match_tier`` stores the numeric part of ``tier`` (2/3/4).
     """
     if len(alias) < _MIN_ALIAS_LEN:
         return
     if normalize_term(alias) == normalize_term(canonical_name):
         return
+    match_tier = int(tier.value.removeprefix("tier"))
     conn.execute(
         """
         INSERT OR IGNORE INTO term_aliases

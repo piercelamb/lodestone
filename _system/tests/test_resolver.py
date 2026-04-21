@@ -1,6 +1,7 @@
 """Tests for the 5-tier term resolver (_system.resolution.resolver)."""
 from __future__ import annotations
 
+import math
 import sqlite3
 
 import pytest
@@ -333,8 +334,6 @@ class TestTier4Embedding:
 
     def test_threshold_rejects_below_085_cosine(self, conn, fake_embedder):
         """Query and seed vectors at cos≈0.5 (distance≈1.0) — below 0.85 threshold."""
-        import math
-
         term_id = _seed_canonical(conn, canonical_name="hierarchical indexing")
         seed_vec = [0.0] * 384
         seed_vec[0] = 1.0
@@ -362,8 +361,6 @@ class TestTier4Embedding:
 
     def test_threshold_accepts_just_above_085_cosine(self, conn, fake_embedder):
         """Query at exactly the seed vector — cos=1.0, distance=0. Always a hit."""
-        import math
-
         term_id = _seed_canonical(conn, canonical_name="hierarchical indexing")
         seed_vec = [0.0] * 384
         seed_vec[0] = 1.0
@@ -396,7 +393,6 @@ class TestTier4Embedding:
 
 class TestTier5NewCanonical:
     def test_creates_canonical_and_embedding(self, conn, fake_embedder):
-        # Preset the embedder so the new canonical gets a stable vector.
         v = [0.0] * 384
         v[5] = 1.0
         fake_embedder.preset("NovelMethodXYZ", v)
