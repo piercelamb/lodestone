@@ -98,7 +98,7 @@ CREATE TABLE IF NOT EXISTS canonical_terms (
     id INTEGER PRIMARY KEY,
     domain TEXT NOT NULL,
     term_type TEXT NOT NULL,
-    entity_type TEXT,
+    entity_type TEXT NOT NULL DEFAULT '',
     canonical_name TEXT NOT NULL,
     first_seen_in TEXT NOT NULL,
     UNIQUE(domain, term_type, entity_type, canonical_name)

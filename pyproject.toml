@@ -35,3 +35,6 @@ packages = ["_system"]
 [tool.pytest.ini_options]
 testpaths = ["_system/tests"]
 pythonpath = ["."]
+markers = [
+    "slow: marks tests that load heavy external models (deselect with '-m \"not slow\"')",
+]
