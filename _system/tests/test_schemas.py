@@ -1,4 +1,4 @@
-"""Tests for Pydantic schemas and status helpers (section-02)."""
+"""Tests for Pydantic schemas and status helpers."""
 from __future__ import annotations
 
 import pytest
@@ -58,8 +58,6 @@ class TestCanRunFrom:
         assert can_run_from(None, PaperStatus.FETCHED) is True
 
     def test_none_current_to_any_target_is_true(self):
-        # Per spec prose: "if current is None... every stage may in principle
-        # run, callers still check preconditions." Pin that invariant down.
         for target in PaperStatus:
             assert can_run_from(None, target) is True
 
@@ -97,8 +95,7 @@ class TestPaperMetadata:
     def test_accepts_minimal_required_fields(self):
         meta = PaperMetadata(**self._minimal_kwargs())
         assert meta.arxiv_id == "2401.12345"
-        # With use_enum_values=True, status stores the string value.
-        assert meta.status == PaperStatus.FETCHED
+        # use_enum_values=True stores the raw string, not the enum member.
         assert meta.status == "fetched"
 
     def test_markdown_and_raw_html_optional(self):
@@ -251,7 +248,7 @@ class TestSectionChunkLevels:
 
 
 class TestSchemaImportsStayLight:
-    """section-02 plan: schemas must not drag in torch/sentence_transformers/gliner2.
+    """Schemas must not drag in torch/sentence_transformers/gliner2.
 
     search.py depends on schema modules and must stay under 300 ms for --help.
     """

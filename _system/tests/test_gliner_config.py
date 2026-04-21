@@ -1,4 +1,4 @@
-"""Tests for the GLiNER2 config YAML loader (section-02)."""
+"""Tests for the GLiNER2 config YAML loader."""
 from __future__ import annotations
 
 from pathlib import Path

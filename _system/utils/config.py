@@ -7,6 +7,15 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from _system.schemas.entities import EntityType
+
+# GLiNER2 expects Title-case label strings at runtime, while `EntityType`
+# stores the canonical lowercase form used everywhere else. Derive the
+# required YAML key set from the enum so the two can't drift.
+_EXPECTED_LABEL_KEYS: frozenset[str] = frozenset(
+    t.value.title() for t in EntityType
+)
+
 
 class ChunkConfig(BaseModel):
     max_tokens: int = Field(..., gt=0, le=384)
@@ -58,6 +67,14 @@ class GlinerConfig(BaseModel):
                 "per_label and label_descriptions must share the same keys "
                 f"(only in per_label: {sorted(missing_in_desc)}, "
                 f"only in label_descriptions: {sorted(missing_in_thresh)})"
+            )
+        if per_label != _EXPECTED_LABEL_KEYS:
+            extra = per_label - _EXPECTED_LABEL_KEYS
+            missing = _EXPECTED_LABEL_KEYS - per_label
+            raise ValueError(
+                "GLiNER config label keys must match EntityType "
+                f"(expected {sorted(_EXPECTED_LABEL_KEYS)}; "
+                f"extra: {sorted(extra)}, missing: {sorted(missing)})"
             )
         return self
 

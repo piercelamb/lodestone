@@ -31,13 +31,10 @@ def can_run_from(
 ) -> bool:
     """True iff running `target_stage` is meaningful given `current`.
 
-    You may rerun the current stage or advance one step past it.
-    You may not skip ahead or go backwards. FAILED_HTML is terminal.
-    Callers use --force to bypass this check.
+    You may rerun the current stage or advance one step past it. You may
+    not skip ahead or go backwards. FAILED_HTML is terminal. Callers use
+    --force to bypass this check.
     """
-    # Rule is `0 <= delta <= 1` — narrower than the single-sided check the
-    # section-02 plan sketched; the plan's own `EXTRACTED -> FETCHED == False`
-    # test forces this bounded form. Don't widen it back.
     if current is None:
         return True
     if current is PaperStatus.FAILED_HTML:
