@@ -1,0 +1,18 @@
+global_threshold: 0.45
+per_label:
+  Method: 0.55
+  Dataset: 0.40
+  Metric: 0.50
+  Model: 0.55
+  Technique: 0.50
+  Benchmark: 0.45
+chunk:
+  max_tokens: 350
+  overlap_tokens: 20
+label_descriptions:
+  Method: "A named technique, algorithm, or procedure proposed or used in the paper."
+  Dataset: "A named collection of training or evaluation data."
+  Metric: "A named quantitative evaluation measure."
+  Model: "A named trained model or architecture."
+  Technique: "A general-purpose technique or approach used as a building block."
+  Benchmark: "A named benchmark suite or standard evaluation setup."
