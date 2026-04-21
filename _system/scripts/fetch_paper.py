@@ -20,11 +20,10 @@ import hashlib
 import io
 import json
 import re
-import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable
 from urllib.parse import urlparse
 
 import httpx
@@ -75,11 +74,6 @@ _VERSION_RE = re.compile(r"v\d+$")
 _ARXIV_ID_RE = re.compile(r"(\d{4}\.\d{4,5}(?:v\d+)?)")
 
 
-# ---------------------------------------------------------------------------
-# Public types
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class _ArxivMetadata:
     """Shape returned by the arxiv library, reshaped for internal use."""
@@ -88,8 +82,8 @@ class _ArxivMetadata:
     authors: list[str]
     abstract: str
     published: str  # YYYY-MM-DD
-    comment: Optional[str]
-    summary: Optional[str]
+    comment: str | None
+    summary: str | None
     pdf_url: str
 
 
@@ -98,17 +92,12 @@ class _ProcessedFigure:
     """Figure ready for DB insert: bytes already downscaled/re-encoded."""
 
     figure_number: int
-    display_number: Optional[str]
+    display_number: str | None
     figure_id: str
     caption: str
     section_context: str
     image_bytes: bytes
     mime_type: str
-
-
-# ---------------------------------------------------------------------------
-# HTTP client + retries
-# ---------------------------------------------------------------------------
 
 
 def _make_default_client() -> httpx.Client:
@@ -131,11 +120,6 @@ _retry_http = retry(
     retry=retry_if_exception(_is_transient),
     reraise=True,
 )
-
-
-# ---------------------------------------------------------------------------
-# Arxiv metadata
-# ---------------------------------------------------------------------------
 
 
 def _default_arxiv_lookup(arxiv_id: str) -> _ArxivMetadata:
@@ -173,13 +157,8 @@ def _strip_version(arxiv_id: str) -> str:
     return _VERSION_RE.sub("", arxiv_id)
 
 
-# ---------------------------------------------------------------------------
-# Phase 1 — HTML discovery
-# ---------------------------------------------------------------------------
-
-
 @_retry_http
-def _try_html(client: httpx.Client, url: str) -> Optional[str]:
+def _try_html(client: httpx.Client, url: str) -> str | None:
     """GET `url`, return body if 2xx + text/html, else None on 404 / non-html.
 
     Raises HTTPStatusError on 5xx so tenacity can retry.
@@ -201,7 +180,7 @@ def _try_html(client: httpx.Client, url: str) -> Optional[str]:
 
 def _fetch_html_body(
     client: httpx.Client, arxiv_id: str
-) -> tuple[Optional[str], Optional[str]]:
+) -> tuple[str | None, str | None]:
     """Try arxiv.org/html first, then ar5iv. Returns (body, source) or (None, None)."""
     for source, url_tmpl in (
         ("arxiv", _ARXIV_HTML_URL),
@@ -220,11 +199,6 @@ def _base_url_for_source(source: str, arxiv_id: str) -> str:
     if source == "arxiv":
         return f"https://arxiv.org/html/{arxiv_id}/"
     return f"https://ar5iv.labs.arxiv.org/html/{arxiv_id}/"
-
-
-# ---------------------------------------------------------------------------
-# Phase 1 — PDF + page rendering
-# ---------------------------------------------------------------------------
 
 
 @_retry_http
@@ -262,14 +236,9 @@ def _render_pdf_pages(pdf_bytes: bytes) -> list[bytes]:
     return out
 
 
-# ---------------------------------------------------------------------------
-# Phase 1 — Figure downloads + processing
-# ---------------------------------------------------------------------------
-
-
 def _download_figure(
     client: httpx.Client, url: str
-) -> Optional[tuple[bytes, str]]:
+) -> tuple[bytes, str] | None:
     """Streamed GET enforcing a 20MB cap. Returns (bytes, content-type) or None
     if the server said 4xx, the content-length was too large, or body exceeded
     the cap mid-stream. Raises on 5xx after tenacity exhaustion."""
@@ -315,7 +284,7 @@ def _download_figure(
 
 def _process_figure_image(
     raw_bytes: bytes, content_type_hint: str
-) -> Optional[tuple[bytes, str]]:
+) -> tuple[bytes, str] | None:
     """Decode, optionally downscale to 1920 width (aspect preserved), re-encode
     JPEG at quality=85 or preserve PNG. Returns (bytes, mime) or None on
     decompression-bomb / decode error."""
@@ -363,28 +332,29 @@ def _process_figure_image(
         return out.getvalue(), "image/png"
 
 
+def _resolve_figure_bytes(
+    client: httpx.Client, desc: FigureDescriptor
+) -> tuple[bytes, str] | None:
+    if desc.inline_data is not None:
+        return _process_figure_image(desc.inline_data, desc.inline_mime or "")
+    if desc.src_url is None:
+        return None
+    downloaded = _download_figure(client, desc.src_url)
+    if downloaded is None:
+        return None
+    raw, ct = downloaded
+    return _process_figure_image(raw, ct)
+
+
 def _process_figures(
     client: httpx.Client, descriptors: list[FigureDescriptor]
 ) -> list[_ProcessedFigure]:
     results: list[_ProcessedFigure] = []
     for desc in descriptors:
-        if desc.inline_data is not None:
-            processed = _process_figure_image(desc.inline_data, desc.inline_mime or "")
-            if processed is None:
-                continue
-            img_bytes, mime = processed
-        elif desc.src_url is None:
+        resolved = _resolve_figure_bytes(client, desc)
+        if resolved is None:
             continue
-        else:
-            downloaded = _download_figure(client, desc.src_url)
-            if downloaded is None:
-                continue
-            raw, ct = downloaded
-            processed = _process_figure_image(raw, ct)
-            if processed is None:
-                continue
-            img_bytes, mime = processed
-
+        img_bytes, mime = resolved
         results.append(
             _ProcessedFigure(
                 figure_number=desc.figure_number,
@@ -399,12 +369,7 @@ def _process_figures(
     return results
 
 
-# ---------------------------------------------------------------------------
-# Phase 1 — Code repo discovery
-# ---------------------------------------------------------------------------
-
-
-def _normalize_repo_url(raw: str) -> Optional[str]:
+def _normalize_repo_url(raw: str) -> str | None:
     """Return a canonical ``https://host/owner/repo`` URL, or None if the
     input isn't a repo root.
 
@@ -442,7 +407,7 @@ def _extract_repo_candidates(text: str) -> list[str]:
 
 def _layer1_paperswithcode(
     client: httpx.Client, arxiv_id: str
-) -> Optional[str]:
+) -> str | None:
     """PwC: /papers/?arxiv_id={id} → slug → /papers/{slug}/repositories/ →
     pick is_official else top by stars. 1 req/sec."""
     try:
@@ -454,7 +419,8 @@ def _layer1_paperswithcode(
         return None
     try:
         data = resp.json()
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        _LOG.warning("PwC paper lookup returned non-JSON body: %s", exc)
         return None
     results = data.get("results") or []
     if not results:
@@ -474,7 +440,8 @@ def _layer1_paperswithcode(
         return None
     try:
         data2 = resp2.json()
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        _LOG.warning("PwC repos fetch returned non-JSON body: %s", exc)
         return None
     repos = data2.get("results") or []
     if not repos:
@@ -490,30 +457,20 @@ def _layer1_paperswithcode(
     return None
 
 
-def _layer2_html_scan(html_body: str) -> Optional[str]:
-    candidates = _extract_repo_candidates(html_body)
-    return candidates[0] if candidates else None
-
-
-def _layer3_arxiv_metadata(meta: _ArxivMetadata) -> Optional[str]:
-    haystack = " ".join(s for s in (meta.comment or "", meta.summary or "") if s)
-    candidates = _extract_repo_candidates(haystack)
-    return candidates[0] if candidates else None
-
-
 def _discover_code_repo(
     client: httpx.Client,
     arxiv_id: str,
     html_body: str,
     meta: _ArxivMetadata,
-) -> Optional[str]:
-    pwc = _layer1_paperswithcode(client, arxiv_id)
-    if pwc:
+) -> str | None:
+    if pwc := _layer1_paperswithcode(client, arxiv_id):
         return pwc
-    html_hit = _layer2_html_scan(html_body)
-    if html_hit:
-        return html_hit
-    return _layer3_arxiv_metadata(meta)
+    if html_hits := _extract_repo_candidates(html_body):
+        return html_hits[0]
+    haystack = " ".join(s for s in (meta.comment or "", meta.summary or "") if s)
+    if meta_hits := _extract_repo_candidates(haystack):
+        return meta_hits[0]
+    return None
 
 
 def _sleep(seconds: float) -> None:
@@ -522,12 +479,7 @@ def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
-# ---------------------------------------------------------------------------
-# DB helpers
-# ---------------------------------------------------------------------------
-
-
-def _get_existing_paper(db_path: Path, arxiv_id: str) -> Optional[PaperMetadata]:
+def _get_existing_paper(db_path: Path, arxiv_id: str) -> PaperMetadata | None:
     conn = get_conn(db_path)
     try:
         row = conn.execute(
@@ -605,11 +557,6 @@ def _persist(
     Callers that want paper_name / ingested_at preservation must set those
     on the incoming PaperMetadata — ``fetch()`` does this.
     """
-    authors_json = pm.authors
-    if not isinstance(authors_json, str):
-        authors_json = json.dumps(authors_json)
-    ingested_at = pm.ingested_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
-
     conn = get_conn(db_path)
     try:
         with transaction(conn):
@@ -650,10 +597,10 @@ def _persist(
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    pm.arxiv_id, pm.paper_name, pm.title, authors_json, pm.date,
+                    pm.arxiv_id, pm.paper_name, pm.title, pm.authors, pm.date,
                     pm.abstract, pm.domain, pm.collection, pm.code_repo,
                     pm.content_hash, pm.pdf_url, pm.html_source,
-                    ingested_at, str(pm.status), pm.markdown, pm.raw_html,
+                    pm.ingested_at, str(pm.status), pm.markdown, pm.raw_html,
                     len(figures), int(bool(pm.needs_review)),
                 ),
             )
@@ -684,20 +631,15 @@ def _persist(
         conn.close()
 
 
-# ---------------------------------------------------------------------------
-# Public entry point
-# ---------------------------------------------------------------------------
-
-
 def fetch(
     arxiv_id: str,
     db_path: Path,
     force: bool = False,
-    domain_override: Optional[str] = None,
+    domain_override: str | None = None,
     *,
-    client: Optional[httpx.Client] = None,
-    arxiv_lookup: Optional[Callable[[str], _ArxivMetadata]] = None,
-    render_pages: Optional[Callable[[bytes], list[bytes]]] = None,
+    client: httpx.Client | None = None,
+    arxiv_lookup: Callable[[str], _ArxivMetadata] | None = None,
+    render_pages: Callable[[bytes], list[bytes] | None] = None,
 ) -> PaperMetadata:
     """Two-phase fetch of an arxiv paper. See module docstring for details.
 
@@ -780,8 +722,8 @@ def _persist_failed_html(
     db_path: Path,
     arxiv_id: str,
     meta: _ArxivMetadata,
-    domain_override: Optional[str],
-    existing_row: Optional[PaperMetadata],
+    domain_override: str | None,
+    existing_row: PaperMetadata | None,
 ) -> PaperMetadata:
     paper_name, ingested_at = _resolve_slug_and_timestamp(
         db_path, meta, arxiv_id, existing_row,
@@ -813,7 +755,7 @@ def _resolve_slug_and_timestamp(
     db_path: Path,
     meta: _ArxivMetadata,
     arxiv_id: str,
-    existing_row: Optional[PaperMetadata],
+    existing_row: PaperMetadata | None,
 ) -> tuple[str, str]:
     """Preserve paper_name / ingested_at on a force re-fetch, else generate
     fresh values.
@@ -836,11 +778,6 @@ def _resolve_slug_and_timestamp(
     return paper_name, ingested_at
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
 def _parse_arxiv_id_from_url(raw: str) -> str:
     """Accept either a bare id (``2301.12345`` / ``2301.12345v2``) or a full
     arxiv URL. Version suffix is preserved — that's the identity policy."""
@@ -850,7 +787,7 @@ def _parse_arxiv_id_from_url(raw: str) -> str:
     return m.group(1)
 
 
-def main(argv: Optional[list[str]] = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Fetch an arxiv paper.")
     parser.add_argument("--url", required=True, help="arxiv URL or id")
     parser.add_argument("--db", default="lodestone.db", help="path to sqlite db")
