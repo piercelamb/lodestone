@@ -1,0 +1,37 @@
+[project]
+name = "lodestone"
+version = "0.1.0"
+description = "Lodestone: personal arxiv research knowledge base (single-file SQLite)."
+requires-python = ">=3.11"
+dependencies = [
+    "arxiv",
+    "httpx",
+    "beautifulsoup4",
+    "lxml",
+    "pypdfium2",
+    "Pillow",
+    "pydantic>=2",
+    "sentence-transformers",
+    "gliner2",
+    "sqlite-vec==0.1.9",
+    "rapidfuzz",
+    "pyyaml",
+    "tenacity",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-xdist",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["_system"]
+
+[tool.pytest.ini_options]
+testpaths = ["_system/tests"]
+pythonpath = ["."]

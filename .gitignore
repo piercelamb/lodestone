@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+dist/
+build/
+
+# Runtime DB (created on first ingest; see section-01 spec)
+lodestone.db
+lodestone.db-*
+
+# Smoke-test artifacts
+/tmp/lodestone_*.db
