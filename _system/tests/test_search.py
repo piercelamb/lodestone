@@ -749,7 +749,25 @@ class TestModeTaxonomy:
         assert r["canonical"]["name"] == "RAPTOR"
         assert r["resolved_via"] in ("alias", "fts", "exact")
 
-    def test_reports_not_found(self, seeded_db):
+    def test_reports_not_found(self, seeded_db, monkeypatch):
+        """A term that misses Tier A forces Tier B. Stub the Embedder with an
+        orthogonal vector so the KNN result's cosine falls below the 0.80
+        gate — exercises the "term not found" path without paying torch's
+        import cost (which breaks cross-test in the full suite on Py 3.14)."""
+
+        class _StubEmbedder:
+            def __init__(self) -> None:
+                pass
+
+            def embed(self, text: str) -> list[float]:
+                v = [0.0] * 384
+                v[50] = 1.0  # orthogonal to every seeded canonical vector
+                return v
+
+        import _system.resolution.embeddings as emb_mod
+
+        monkeypatch.setattr(emb_mod, "Embedder", _StubEmbedder)
+
         r = search_mod.mode_taxonomy_lookup(
             seeded_db, term="totally_made_up_thing", kind="entity", filters={}
         )
