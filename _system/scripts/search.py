@@ -33,6 +33,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -42,12 +43,9 @@ from typing import Any
 from _system.db.connection import get_conn
 from _system.utils.logging import get_logger
 from _system.utils.sections import find_hierarchical_section, split_sections
+from _system.utils.slug import _SLUG_RE
 
 _LOG = get_logger("scripts.search")
-
-_SLUG_RE = re.compile(r"^[a-z0-9_]+$")
-_HEADER_RE = re.compile(r"^(#{1,3})\s+(.+?)\s*$")
-_FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
 # Cosine threshold for Tier-B vec0 KNN fallback in taxonomy lookup.
 # Looser than the resolver's 0.85 because this is a discovery tool — the
@@ -57,6 +55,25 @@ _TAXONOMY_VEC_MIN_COSINE = 0.80
 # BM25 enrichment size cap. Keeping each follow-up query small bounds the
 # JSON payload size even on queries that return many hits.
 _ENTITY_PREVIEW_LIMIT = 5
+
+
+class BM25Scope(StrEnum):
+    ABSTRACTS = "abstracts"
+    SECTIONS = "sections"
+
+
+class TaxonomyKind(StrEnum):
+    ENTITY = "entity"
+    TOPIC = "topic"
+    COLLECTION = "collection"
+
+
+class BrowseView(StrEnum):
+    COLLECTIONS = "collections"
+    TOPICS = "topics"
+    ENTITY_TYPE = "entity_type"
+    ALIASES = "aliases"
+    NEEDS_REVIEW = "needs_review"
 
 
 # ---------------------------------------------------------------------------
@@ -74,18 +91,20 @@ def mode_bm25(
 ) -> dict[str, Any]:
     """BM25 text search against ``abstracts`` or ``sections``.
 
-    ``scope`` must be ``"abstracts"`` or ``"sections"``. Returns a dict with
+    ``scope`` must be a :class:`BM25Scope` value. Returns a dict with
     ``mode`` = scope and a ``results`` list. ``abstracts`` returns paper-level
     hits; ``sections`` groups hits by paper_name and preserves the underlying
     row count in ``hit_count``.
     """
-    if scope not in ("abstracts", "sections"):
-        raise ValueError(f"invalid BM25 scope: {scope!r}")
+    try:
+        scope_enum = BM25Scope(scope)
+    except ValueError as exc:
+        raise ValueError(f"invalid BM25 scope: {scope!r}") from exc
 
     domain = filters.get("domain")
     collection = filters.get("collection")
 
-    if scope == "abstracts":
+    if scope_enum is BM25Scope.ABSTRACTS:
         return _bm25_abstracts(conn, query=query, domain=domain,
                                collection=collection, limit=limit)
     return _bm25_sections(conn, query=query, domain=domain,
@@ -119,6 +138,10 @@ def _bm25_abstracts(
     params.append(limit)
 
     rows = conn.execute(sql, params).fetchall()
+    paper_ids = [r[0] for r in rows]
+    topics_by_pid = _topics_batch(conn, paper_ids)
+    entities_by_pid = _entities_preview_batch(conn, paper_ids)
+    figures_by_pid = _figures_preview_batch(conn, paper_ids)
     results: list[dict[str, Any]] = []
     for paper_id, dom, paper_name, coll, title, snip in rows:
         results.append({
@@ -126,12 +149,14 @@ def _bm25_abstracts(
             "domain": dom,
             "collection": coll,
             "title": title,
-            "topics": _topics_for_paper(conn, paper_id),
-            "entities_preview": _entities_preview(conn, paper_id),
-            "figures": _figures_preview(conn, paper_id),
+            "topics": topics_by_pid.get(paper_id, []),
+            "entities_preview": entities_by_pid.get(paper_id, []),
+            "figures": figures_by_pid.get(
+                paper_id, {"count": 0, "first_caption": None}
+            ),
             "snippet": snip,
         })
-    return {"mode": "abstracts", "query": query, "results": results}
+    return {"mode": BM25Scope.ABSTRACTS, "query": query, "results": results}
 
 
 def _bm25_sections(
@@ -167,20 +192,22 @@ def _bm25_sections(
 
     rows = conn.execute(sql, params).fetchall()
 
+    # One bucket walk to build groups; enrichment then batched across all
+    # distinct paper_ids in three queries regardless of result count.
     grouped: dict[str, dict[str, Any]] = {}
+    pid_order: list[int] = []
     for paper_id, dom, paper_name, section_title, section_level, snip in rows:
         group = grouped.get(paper_name)
         if group is None:
             group = {
                 "paper_name": paper_name,
                 "domain": dom,
+                "_paper_id": paper_id,
                 "hit_count": 0,
                 "sections": [],
-                "topics": _topics_for_paper(conn, paper_id),
-                "entities_preview": _entities_preview(conn, paper_id),
-                "figures": _figures_preview(conn, paper_id),
             }
             grouped[paper_name] = group
+            pid_order.append(paper_id)
         group["hit_count"] += 1
         group["sections"].append({
             "section_title": section_title,
@@ -188,44 +215,100 @@ def _bm25_sections(
             "snippet": snip,
         })
 
+    topics_by_pid = _topics_batch(conn, pid_order)
+    entities_by_pid = _entities_preview_batch(conn, pid_order)
+    figures_by_pid = _figures_preview_batch(conn, pid_order)
+    for group in grouped.values():
+        pid = group.pop("_paper_id")
+        group["topics"] = topics_by_pid.get(pid, [])
+        group["entities_preview"] = entities_by_pid.get(pid, [])
+        group["figures"] = figures_by_pid.get(
+            pid, {"count": 0, "first_caption": None}
+        )
+
     return {
-        "mode": "sections",
+        "mode": BM25Scope.SECTIONS,
         "query": query,
         "results": list(grouped.values()),
     }
 
 
-def _topics_for_paper(conn: sqlite3.Connection, paper_id: int) -> list[str]:
+def _topics_batch(
+    conn: sqlite3.Connection, paper_ids: list[int]
+) -> dict[int, list[str]]:
+    if not paper_ids:
+        return {}
+    placeholders = ",".join("?" * len(paper_ids))
     rows = conn.execute(
-        "SELECT topic FROM paper_topics WHERE paper_id = ? ORDER BY topic",
-        (paper_id,),
+        f"SELECT paper_id, topic FROM paper_topics "
+        f" WHERE paper_id IN ({placeholders}) "
+        f" ORDER BY paper_id, topic",
+        paper_ids,
     ).fetchall()
-    return [r[0] for r in rows]
+    result: dict[int, list[str]] = {pid: [] for pid in paper_ids}
+    for pid, topic in rows:
+        result[pid].append(topic)
+    return result
 
 
-def _entities_preview(conn: sqlite3.Connection, paper_id: int) -> list[dict[str, str]]:
+def _entities_preview_batch(
+    conn: sqlite3.Connection, paper_ids: list[int]
+) -> dict[int, list[dict[str, str]]]:
+    if not paper_ids:
+        return {}
+    placeholders = ",".join("?" * len(paper_ids))
+    # ROW_NUMBER() scopes the LIMIT-per-paper inside a single pass so we
+    # avoid N+1 without streaming every entity row back to Python.
     rows = conn.execute(
-        "SELECT entity_name, entity_type FROM entities "
-        " WHERE paper_id = ? "
-        " ORDER BY entity_type, entity_name "
-        " LIMIT ?",
-        (paper_id, _ENTITY_PREVIEW_LIMIT),
+        f"""
+        SELECT paper_id, entity_name, entity_type FROM (
+            SELECT paper_id, entity_name, entity_type,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY paper_id
+                       ORDER BY entity_type, entity_name
+                   ) AS rn
+              FROM entities
+             WHERE paper_id IN ({placeholders})
+        )
+         WHERE rn <= ?
+         ORDER BY paper_id, entity_type, entity_name
+        """,
+        (*paper_ids, _ENTITY_PREVIEW_LIMIT),
     ).fetchall()
-    return [{"name": name, "type": etype} for name, etype in rows]
+    result: dict[int, list[dict[str, str]]] = {pid: [] for pid in paper_ids}
+    for pid, name, etype in rows:
+        result[pid].append({"name": name, "type": etype})
+    return result
 
 
-def _figures_preview(conn: sqlite3.Connection, paper_id: int) -> dict[str, Any]:
-    row = conn.execute(
-        "SELECT COUNT(*), "
-        "       (SELECT caption FROM figures "
-        "         WHERE paper_id = ? "
-        "         ORDER BY figure_number LIMIT 1) "
-        "  FROM figures "
-        " WHERE paper_id = ?",
-        (paper_id, paper_id),
-    ).fetchone()
-    count, first_caption = row if row else (0, None)
-    return {"count": int(count or 0), "first_caption": first_caption}
+def _figures_preview_batch(
+    conn: sqlite3.Connection, paper_ids: list[int]
+) -> dict[int, dict[str, Any]]:
+    if not paper_ids:
+        return {}
+    placeholders = ",".join("?" * len(paper_ids))
+    rows = conn.execute(
+        f"""
+        SELECT paper_id, cnt, caption FROM (
+            SELECT paper_id,
+                   COUNT(*) OVER (PARTITION BY paper_id) AS cnt,
+                   caption,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY paper_id ORDER BY figure_number
+                   ) AS rn
+              FROM figures
+             WHERE paper_id IN ({placeholders})
+        )
+         WHERE rn = 1
+        """,
+        paper_ids,
+    ).fetchall()
+    result: dict[int, dict[str, Any]] = {
+        pid: {"count": 0, "first_caption": None} for pid in paper_ids
+    }
+    for pid, cnt, caption in rows:
+        result[pid] = {"count": int(cnt or 0), "first_caption": caption}
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -241,19 +324,20 @@ def mode_taxonomy_lookup(
     filters: dict[str, Any],
 ) -> dict[str, Any]:
     """Resolve ``term`` to a canonical row via ``terms_fts`` (Tier A) with
-    a ``term_embeddings`` KNN fallback (Tier B). ``kind`` ∈
-    {``entity``, ``topic``, ``collection``}.
+    a ``term_embeddings`` KNN fallback (Tier B). ``kind`` ∈ :class:`TaxonomyKind`.
 
     On miss returns ``{"mode": kind, "term": term, "error": "term not found"}``
     — does NOT raise.
     """
-    if kind not in ("entity", "topic", "collection"):
-        raise ValueError(f"invalid taxonomy kind: {kind!r}")
+    try:
+        kind_enum = TaxonomyKind(kind)
+    except ValueError as exc:
+        raise ValueError(f"invalid taxonomy kind: {kind!r}") from exc
 
     domain = filters.get("domain")
 
     # ------- Tier A: terms_fts MATCH with inline metadata predicates ------
-    hit = _taxonomy_tier_a(conn, term=term, kind=kind, domain=domain)
+    hit = _taxonomy_tier_a(conn, term=term, kind=kind_enum, domain=domain)
     resolved_via: str | None = None
     if hit is not None:
         term_id, dom, term_type, entity_type, canonical_name = hit
@@ -280,11 +364,11 @@ def mode_taxonomy_lookup(
             "   AND te.term_type = ? "
             "   AND te.k = 1"
         )
-        knn_params: list[Any] = [qvec, kind]
+        knn_params: list[Any] = [qvec, kind_enum.value]
         # Topic / collection canonicals store entity_type=''; without this
         # narrowing the KNN can return an entity-typed canonical as a
         # semantic neighbor (cross-kind pollution).
-        if kind in ("topic", "collection"):
+        if kind_enum in (TaxonomyKind.TOPIC, TaxonomyKind.COLLECTION):
             knn_sql += " AND te.entity_type = ?"
             knn_params.append("")
         if domain:
@@ -292,12 +376,12 @@ def mode_taxonomy_lookup(
             knn_params.append(domain)
         row = conn.execute(knn_sql, knn_params).fetchone()
         if row is None:
-            return {"mode": kind, "term": term, "error": "term not found"}
+            return {"mode": kind_enum, "term": term, "error": "term not found"}
         term_id, distance, dom, term_type, entity_type, canonical_name = row
         # sqlite-vec returns L2 on unit-norm vectors: cos = 1 - d^2/2.
         cosine = 1.0 - (distance * distance) / 2.0
         if cosine < _TAXONOMY_VEC_MIN_COSINE:
-            return {"mode": kind, "term": term, "error": "term not found"}
+            return {"mode": kind_enum, "term": term, "error": "term not found"}
         resolved_via = "vector"
 
     # ------- Build the result payload ------------------------------------
@@ -311,7 +395,7 @@ def mode_taxonomy_lookup(
     ]
 
     # For entities, "type" is entity_type; for topic/collection, term_type.
-    type_label = entity_type if term_type == "entity" else term_type
+    type_label = entity_type if term_type == TaxonomyKind.ENTITY else term_type
     canonical = {
         "name": canonical_name,
         "type": type_label,
@@ -319,7 +403,7 @@ def mode_taxonomy_lookup(
     }
 
     result: dict[str, Any] = {
-        "mode": kind,
+        "mode": kind_enum,
         "term": term,
         "canonical": canonical,
         "resolved_via": resolved_via,
@@ -327,26 +411,22 @@ def mode_taxonomy_lookup(
     }
 
     # Papers per kind
-    if kind == "entity":
-        prows = conn.execute(
-            "SELECT DISTINCT paper_name FROM entities "
-            " WHERE entity_name = ? AND domain = ? ORDER BY paper_name",
+    if kind_enum is TaxonomyKind.ENTITY:
+        # Single pass — rows sorted by (paper_name, source_breadcrumb) are
+        # bucketed into the papers list without per-paper follow-up queries.
+        erows = conn.execute(
+            "SELECT DISTINCT paper_name, source_breadcrumb FROM entities "
+            " WHERE entity_name = ? AND domain = ? "
+            " ORDER BY paper_name, source_breadcrumb",
             (canonical_name, dom),
         ).fetchall()
         papers: list[dict[str, Any]] = []
-        for (pn,) in prows:
-            srows = conn.execute(
-                "SELECT DISTINCT source_breadcrumb FROM entities "
-                " WHERE paper_name = ? AND entity_name = ? "
-                " ORDER BY source_breadcrumb",
-                (pn, canonical_name),
-            ).fetchall()
-            papers.append({
-                "paper_name": pn,
-                "sections": [s[0] for s in srows],
-            })
+        for pn, sb in erows:
+            if not papers or papers[-1]["paper_name"] != pn:
+                papers.append({"paper_name": pn, "sections": []})
+            papers[-1]["sections"].append(sb)
         result["papers"] = papers
-    elif kind == "topic":
+    elif kind_enum is TaxonomyKind.TOPIC:
         prows = conn.execute(
             "SELECT DISTINCT p.paper_name "
             "  FROM paper_topics pt "
@@ -355,7 +435,7 @@ def mode_taxonomy_lookup(
             (canonical_name, dom),
         ).fetchall()
         result["papers"] = [{"paper_name": r[0]} for r in prows]
-    else:  # kind == "collection"
+    else:  # TaxonomyKind.COLLECTION
         prows = conn.execute(
             "SELECT paper_name FROM papers "
             " WHERE collection = ? AND domain = ? ORDER BY paper_name",
@@ -370,7 +450,7 @@ def _taxonomy_tier_a(
     conn: sqlite3.Connection,
     *,
     term: str,
-    kind: str,
+    kind: TaxonomyKind,
     domain: str | None,
 ) -> tuple[int, str, str, str, str] | None:
     """Tier A: porter-stemmed match against ``terms_fts`` narrowed by
@@ -394,11 +474,11 @@ def _taxonomy_tier_a(
         " WHERE terms_fts MATCH ? "
         "   AND term_type = ? "
     )
-    params: list[Any] = [fts_query, kind]
+    params: list[Any] = [fts_query, kind.value]
     # Topic / collection canonicals store entity_type=''; without this
     # narrowing, porter-stemmed matches against an entity row's aliases
     # could surface as a topic/collection hit.
-    if kind in ("topic", "collection"):
+    if kind in (TaxonomyKind.TOPIC, TaxonomyKind.COLLECTION):
         sql += " AND entity_type = ? "
         params.append("")
     if domain:
@@ -454,9 +534,13 @@ def mode_browse(
     which: str,
     filters: dict[str, Any],
 ) -> dict[str, Any]:
-    """Pure-SQL list queries. ``which`` selects the view."""
+    """Pure-SQL list queries. ``which`` selects the view (a :class:`BrowseView`)."""
+    try:
+        view = BrowseView(which)
+    except ValueError as exc:
+        raise ValueError(f"unknown browse view: {which!r}") from exc
     domain = filters.get("domain")
-    if which == "collections":
+    if view is BrowseView.COLLECTIONS:
         sql = (
             "SELECT collection, COUNT(*) AS n FROM papers "
             " WHERE collection IS NOT NULL "
@@ -468,11 +552,11 @@ def mode_browse(
         sql += " GROUP BY collection ORDER BY n DESC, collection"
         rows = conn.execute(sql, params).fetchall()
         return {
-            "mode": "collections",
+            "mode": view,
             "results": [{"collection": r[0], "count": r[1]} for r in rows],
         }
 
-    if which == "topics":
+    if view is BrowseView.TOPICS:
         sql = (
             "SELECT topic, COUNT(DISTINCT paper_id) AS n FROM paper_topics "
         )
@@ -483,11 +567,11 @@ def mode_browse(
         sql += " GROUP BY topic ORDER BY n DESC, topic"
         rows = conn.execute(sql, params).fetchall()
         return {
-            "mode": "topics",
+            "mode": view,
             "results": [{"topic": r[0], "count": r[1]} for r in rows],
         }
 
-    if which == "entity_type":
+    if view is BrowseView.ENTITY_TYPE:
         entity_type = filters.get("entity_type")
         if not entity_type:
             raise ValueError("mode_browse(which='entity_type') requires "
@@ -504,14 +588,14 @@ def mode_browse(
         sql += " GROUP BY entity_name ORDER BY n DESC, entity_name"
         rows = conn.execute(sql, params).fetchall()
         return {
-            "mode": "entity_type",
+            "mode": view,
             "entity_type": entity_type,
             "results": [
                 {"entity_name": r[0], "paper_count": r[1]} for r in rows
             ],
         }
 
-    if which == "aliases":
+    if view is BrowseView.ALIASES:
         term = filters.get("aliases_term")
         if not term:
             raise ValueError("mode_browse(which='aliases') requires "
@@ -528,7 +612,7 @@ def mode_browse(
             (term,),
         ).fetchall()
         return {
-            "mode": "aliases",
+            "mode": view,
             "term": term,
             "results": [
                 {
@@ -540,25 +624,23 @@ def mode_browse(
             ],
         }
 
-    if which == "needs_review":
-        rows = conn.execute(
-            "SELECT paper_name, domain, ingested_at "
-            "  FROM papers WHERE needs_review = 1 "
-            " ORDER BY ingested_at"
-        ).fetchall()
-        return {
-            "mode": "needs_review",
-            "results": [
-                {
-                    "paper_name": r[0],
-                    "domain": r[1],
-                    "ingested_at": r[2],
-                }
-                for r in rows
-            ],
-        }
-
-    raise ValueError(f"unknown browse view: {which!r}")
+    # BrowseView.NEEDS_REVIEW
+    rows = conn.execute(
+        "SELECT paper_name, domain, ingested_at "
+        "  FROM papers WHERE needs_review = 1 "
+        " ORDER BY ingested_at"
+    ).fetchall()
+    return {
+        "mode": view,
+        "results": [
+            {
+                "paper_name": r[0],
+                "domain": r[1],
+                "ingested_at": r[2],
+            }
+            for r in rows
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -567,8 +649,10 @@ def mode_browse(
 
 
 def mode_toc(conn: sqlite3.Connection, *, paper_name: str) -> dict[str, Any]:
-    """Parse level-1..3 ATX headers from ``papers.markdown`` into a nested
-    ToC. Headers inside fenced code blocks (``` or ~~~) are skipped."""
+    """Flatten ``papers.markdown`` into level-1..3 headers via the shared
+    :func:`split_sections` walker — keeps ToC boundaries in lockstep with
+    how the indexer chunked the paper, including fenced-code suppression.
+    """
     row = conn.execute(
         "SELECT markdown FROM papers WHERE paper_name = ?", (paper_name,)
     ).fetchone()
@@ -576,18 +660,10 @@ def mode_toc(conn: sqlite3.Connection, *, paper_name: str) -> dict[str, Any]:
         raise ValueError(f"paper not found: paper_name={paper_name!r}")
     markdown = row[0] or ""
 
-    toc: list[dict[str, Any]] = []
-    in_fence = False
-    for line in markdown.splitlines():
-        if _FENCE_RE.match(line):
-            in_fence = not in_fence
-            continue
-        if in_fence:
-            continue
-        m = _HEADER_RE.match(line)
-        if m:
-            toc.append({"level": len(m.group(1)), "title": m.group(2).strip()})
-
+    toc = [
+        {"level": chunk.level, "title": chunk.title}
+        for chunk in split_sections(markdown)
+    ]
     return {"mode": "toc", "paper_name": paper_name, "toc": toc}
 
 
@@ -653,6 +729,36 @@ def _safe_n_for_filename(n: Any) -> str:
     return cleaned or "x"
 
 
+def _lookup_paper_id(conn: sqlite3.Connection, paper: str) -> int:
+    _assert_safe_paper_name(paper)
+    prow = conn.execute(
+        "SELECT id FROM papers WHERE paper_name = ?", (paper,)
+    ).fetchone()
+    if prow is None:
+        raise ValueError(f"paper not found: paper_name={paper!r}")
+    return prow[0]
+
+
+def _write_blob_tempfile(image: bytes, *, prefix: str, suffix: str = ".png") -> str:
+    """Atomically spill ``image`` bytes to a new mkstemp path and return it.
+
+    The BaseException guard covers the narrow window where ``os.fdopen``
+    raises after mkstemp handed us the fd but before the ``with`` block
+    would have closed it.
+    """
+    fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(image)
+    except BaseException:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        raise
+    return path
+
+
 def mode_figure(
     conn: sqlite3.Connection,
     *,
@@ -666,14 +772,7 @@ def mode_figure(
     (caption label like ``"Figure 3a"``). Raises :class:`ValueError` if
     neither lookup hits.
     """
-    _assert_safe_paper_name(paper)
-
-    prow = conn.execute(
-        "SELECT id FROM papers WHERE paper_name = ?", (paper,)
-    ).fetchone()
-    if prow is None:
-        raise ValueError(f"paper not found: paper_name={paper!r}")
-    paper_id = prow[0]
+    paper_id = _lookup_paper_id(conn, paper)
 
     frow = None
     try:
@@ -698,22 +797,9 @@ def mode_figure(
         )
 
     image, mime_type = frow
-    n_safe = _safe_n_for_filename(n)
-    prefix = f"lodestone_{paper}_fig{n_safe}_"
-    fd, path = tempfile.mkstemp(prefix=prefix, suffix=".png")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(image)
-    except BaseException:
-        # On any error while writing, at least close the fd — os.fdopen
-        # would have closed it already on exit, but os.fdopen itself could
-        # have raised before wrapping, leaving fd leaked.
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        raise
-
+    path = _write_blob_tempfile(
+        image, prefix=f"lodestone_{paper}_fig{_safe_n_for_filename(n)}_"
+    )
     return {
         "mode": "figure",
         "paper_name": paper,
@@ -730,14 +816,7 @@ def mode_page(
     n: int,
 ) -> dict[str, Any]:
     """Extract a page image BLOB to a ``tempfile.mkstemp`` path."""
-    _assert_safe_paper_name(paper)
-
-    prow = conn.execute(
-        "SELECT id FROM papers WHERE paper_name = ?", (paper,)
-    ).fetchone()
-    if prow is None:
-        raise ValueError(f"paper not found: paper_name={paper!r}")
-    paper_id = prow[0]
+    paper_id = _lookup_paper_id(conn, paper)
 
     row = conn.execute(
         "SELECT image FROM page_images WHERE paper_id = ? AND page_number = ?",
@@ -747,19 +826,9 @@ def mode_page(
         raise ValueError(f"page not found: paper={paper!r} page={n!r}")
     image = row[0]
 
-    n_safe = _safe_n_for_filename(n)
-    prefix = f"lodestone_{paper}_page{n_safe}_"
-    fd, path = tempfile.mkstemp(prefix=prefix, suffix=".png")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(image)
-    except BaseException:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        raise
-
+    path = _write_blob_tempfile(
+        image, prefix=f"lodestone_{paper}_page{_safe_n_for_filename(n)}_"
+    )
     return {
         "mode": "page",
         "paper_name": paper,
@@ -1039,48 +1108,46 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
         return mode_toc(conn, paper_name=args.toc)
 
     # Mode 3: browse
+    domain_filter: dict[str, Any] = {"domain": args.domain}
     if args.needs_review:
-        return mode_browse(conn, which="needs_review", filters={})
+        return mode_browse(conn, which=BrowseView.NEEDS_REVIEW, filters={})
     if args.collections:
-        return mode_browse(conn, which="collections",
-                           filters={"domain": args.domain})
+        return mode_browse(conn, which=BrowseView.COLLECTIONS, filters=domain_filter)
     if args.topics:
-        return mode_browse(conn, which="topics",
-                           filters={"domain": args.domain})
+        return mode_browse(conn, which=BrowseView.TOPICS, filters=domain_filter)
     if args.entity_type:
         return mode_browse(
             conn,
-            which="entity_type",
-            filters={"domain": args.domain, "entity_type": args.entity_type},
+            which=BrowseView.ENTITY_TYPE,
+            filters={**domain_filter, "entity_type": args.entity_type},
         )
     if args.aliases:
         return mode_browse(
             conn,
-            which="aliases",
+            which=BrowseView.ALIASES,
             filters={"aliases_term": args.aliases},
         )
 
-    # Mode 2: taxonomy lookup. --collection is DUAL-USE: it becomes a lookup
-    # term only when there is no positional query.
-    if args.entity is not None:
+    # Mode 2: taxonomy lookup. --collection is DUAL-USE — it becomes a lookup
+    # term only when there is no positional query. Table-driven so the three
+    # near-identical branches share one call site.
+    for attr, kind in (
+        ("entity", TaxonomyKind.ENTITY),
+        ("topic", TaxonomyKind.TOPIC),
+        ("collection", TaxonomyKind.COLLECTION),
+    ):
+        value = getattr(args, attr)
+        if value is None:
+            continue
+        if attr == "collection" and args.query is not None:
+            continue
         return mode_taxonomy_lookup(
-            conn, term=args.entity, kind="entity",
-            filters={"domain": args.domain},
-        )
-    if args.topic is not None:
-        return mode_taxonomy_lookup(
-            conn, term=args.topic, kind="topic",
-            filters={"domain": args.domain},
-        )
-    if args.collection is not None and args.query is None:
-        return mode_taxonomy_lookup(
-            conn, term=args.collection, kind="collection",
-            filters={"domain": args.domain},
+            conn, term=value, kind=kind, filters=domain_filter,
         )
 
     # Mode 1: BM25
     if args.query is not None:
-        scope = "sections" if args.sections else "abstracts"
+        scope = BM25Scope.SECTIONS if args.sections else BM25Scope.ABSTRACTS
         filters: dict[str, Any] = {}
         if args.domain:
             filters["domain"] = args.domain
