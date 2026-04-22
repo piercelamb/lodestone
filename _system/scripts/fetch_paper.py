@@ -20,6 +20,7 @@ import hashlib
 import io
 import json
 import re
+import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -472,21 +473,17 @@ def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
-def _get_existing_paper(db_path: Path, arxiv_id: str) -> PaperMetadata | None:
-    conn = get_conn(db_path)
-    try:
-        row = conn.execute(
-            """
-            SELECT arxiv_id, paper_name, title, authors, date, abstract,
-                   pdf_url, domain, collection, status, markdown, raw_html,
-                   html_source, content_hash, code_repo, needs_review,
-                   ingested_at
-              FROM papers WHERE arxiv_id = ?
-            """,
-            (arxiv_id,),
-        ).fetchone()
-    finally:
-        conn.close()
+def _get_existing_paper(conn: sqlite3.Connection, arxiv_id: str) -> PaperMetadata | None:
+    row = conn.execute(
+        """
+        SELECT arxiv_id, paper_name, title, authors, date, abstract,
+               pdf_url, domain, collection, status, markdown, raw_html,
+               html_source, content_hash, code_repo, needs_review,
+               ingested_at
+          FROM papers WHERE arxiv_id = ?
+        """,
+        (arxiv_id,),
+    ).fetchone()
     if row is None:
         return None
     return PaperMetadata(
@@ -510,24 +507,16 @@ def _get_existing_paper(db_path: Path, arxiv_id: str) -> PaperMetadata | None:
     )
 
 
-def _existing_paper_names(db_path: Path) -> set[str]:
-    conn = get_conn(db_path)
-    try:
-        rows = conn.execute("SELECT paper_name FROM papers").fetchall()
-    finally:
-        conn.close()
+def _existing_paper_names(conn: sqlite3.Connection) -> set[str]:
+    rows = conn.execute("SELECT paper_name FROM papers").fetchall()
     return {r[0] for r in rows}
 
 
-def _log_soft_dedup(db_path: Path, content_hash: str, arxiv_id: str) -> None:
-    conn = get_conn(db_path)
-    try:
-        row = conn.execute(
-            "SELECT arxiv_id FROM papers WHERE content_hash = ? AND arxiv_id != ? LIMIT 1",
-            (content_hash, arxiv_id),
-        ).fetchone()
-    finally:
-        conn.close()
+def _log_soft_dedup(conn: sqlite3.Connection, content_hash: str, arxiv_id: str) -> None:
+    row = conn.execute(
+        "SELECT arxiv_id FROM papers WHERE content_hash = ? AND arxiv_id != ? LIMIT 1",
+        (content_hash, arxiv_id),
+    ).fetchone()
     if row is not None:
         _LOG.warning(
             "soft-dedup: content_hash %s also found under arxiv_id %s (current: %s); continuing",
@@ -536,7 +525,7 @@ def _log_soft_dedup(db_path: Path, content_hash: str, arxiv_id: str) -> None:
 
 
 def _persist(
-    db_path: Path,
+    conn: sqlite3.Connection,
     pm: PaperMetadata,
     figures: list[_ProcessedFigure],
     page_images: list[bytes],
@@ -550,95 +539,93 @@ def _persist(
     Callers that want paper_name / ingested_at preservation must set those
     on the incoming PaperMetadata — ``fetch()`` does this.
     """
-    conn = get_conn(db_path)
-    try:
-        with transaction(conn):
-            if pm.domain:
-                # Classification hasn't run yet for a plain fetch, but a
-                # `--domain` override (or a force-refetch where the row
-                # was previously classified) can legitimately set this.
-                conn.execute(
-                    "INSERT OR IGNORE INTO domains (name) VALUES (?)",
-                    (pm.domain,),
-                )
-
-            existing = conn.execute(
-                "SELECT id FROM papers WHERE arxiv_id = ?", (pm.arxiv_id,)
-            ).fetchone()
-            if existing is not None:
-                old_id = existing[0]
-                # Clear every FK-backed child (PRAGMA foreign_keys=ON in
-                # connection.py). Missing any of these would raise
-                # FOREIGN KEY constraint failed on the paper DELETE.
-                conn.execute("DELETE FROM figures WHERE paper_id = ?", (old_id,))
-                conn.execute("DELETE FROM page_images WHERE paper_id = ?", (old_id,))
-                conn.execute("DELETE FROM entities WHERE paper_id = ?", (old_id,))
-                conn.execute("DELETE FROM paper_topics WHERE paper_id = ?", (old_id,))
-                # FTS tables: paper_id is UNINDEXED (no real FK), but the
-                # rows would otherwise linger and pollute search results.
-                conn.execute("DELETE FROM abstracts WHERE paper_id = ?", (old_id,))
-                conn.execute("DELETE FROM sections WHERE paper_id = ?", (old_id,))
-                conn.execute("DELETE FROM papers WHERE id = ?", (old_id,))
-
-            cursor = conn.execute(
-                """
-                INSERT INTO papers (
-                    arxiv_id, paper_name, title, authors, date, abstract,
-                    domain, collection, code_repo, content_hash, pdf_url,
-                    html_source, ingested_at, status, markdown, raw_html,
-                    figure_count, needs_review
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    pm.arxiv_id, pm.paper_name, pm.title, pm.authors, pm.date,
-                    pm.abstract, pm.domain, pm.collection, pm.code_repo,
-                    pm.content_hash, pm.pdf_url, pm.html_source,
-                    pm.ingested_at, str(pm.status), pm.markdown, pm.raw_html,
-                    len(figures), int(bool(pm.needs_review)),
-                ),
+    with transaction(conn):
+        if pm.domain:
+            # Classification hasn't run yet for a plain fetch, but a
+            # `--domain` override (or a force-refetch where the row
+            # was previously classified) can legitimately set this.
+            conn.execute(
+                "INSERT OR IGNORE INTO domains (name) VALUES (?)",
+                (pm.domain,),
             )
-            paper_id = cursor.lastrowid
 
-            if figures:
-                conn.executemany(
-                    """
-                    INSERT INTO figures (
-                        paper_id, figure_number, display_number, figure_id,
-                        caption, section_context, image, mime_type
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        (paper_id, f.figure_number, f.display_number,
-                         f.figure_id, f.caption, f.section_context,
-                         f.image_bytes, f.mime_type)
-                        for f in figures
-                    ],
-                )
+        existing = conn.execute(
+            "SELECT id FROM papers WHERE arxiv_id = ?", (pm.arxiv_id,)
+        ).fetchone()
+        if existing is not None:
+            old_id = existing[0]
+            # Clear every FK-backed child (PRAGMA foreign_keys=ON in
+            # connection.py). Missing any of these would raise
+            # FOREIGN KEY constraint failed on the paper DELETE.
+            conn.execute("DELETE FROM figures WHERE paper_id = ?", (old_id,))
+            conn.execute("DELETE FROM page_images WHERE paper_id = ?", (old_id,))
+            conn.execute("DELETE FROM entities WHERE paper_id = ?", (old_id,))
+            conn.execute("DELETE FROM paper_topics WHERE paper_id = ?", (old_id,))
+            # FTS tables: paper_id is UNINDEXED (no real FK), but the
+            # rows would otherwise linger and pollute search results.
+            conn.execute("DELETE FROM abstracts WHERE paper_id = ?", (old_id,))
+            conn.execute("DELETE FROM sections WHERE paper_id = ?", (old_id,))
+            conn.execute("DELETE FROM papers WHERE id = ?", (old_id,))
 
-            if page_images:
-                conn.executemany(
-                    "INSERT INTO page_images (paper_id, page_number, image) VALUES (?, ?, ?)",
-                    [(paper_id, i + 1, img) for i, img in enumerate(page_images)],
-                )
-    finally:
-        conn.close()
+        cursor = conn.execute(
+            """
+            INSERT INTO papers (
+                arxiv_id, paper_name, title, authors, date, abstract,
+                domain, collection, code_repo, content_hash, pdf_url,
+                html_source, ingested_at, status, markdown, raw_html,
+                figure_count, needs_review
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                pm.arxiv_id, pm.paper_name, pm.title, pm.authors, pm.date,
+                pm.abstract, pm.domain, pm.collection, pm.code_repo,
+                pm.content_hash, pm.pdf_url, pm.html_source,
+                pm.ingested_at, str(pm.status), pm.markdown, pm.raw_html,
+                len(figures), int(bool(pm.needs_review)),
+            ),
+        )
+        paper_id = cursor.lastrowid
+
+        if figures:
+            conn.executemany(
+                """
+                INSERT INTO figures (
+                    paper_id, figure_number, display_number, figure_id,
+                    caption, section_context, image, mime_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (paper_id, f.figure_number, f.display_number,
+                     f.figure_id, f.caption, f.section_context,
+                     f.image_bytes, f.mime_type)
+                    for f in figures
+                ],
+            )
+
+        if page_images:
+            conn.executemany(
+                "INSERT INTO page_images (paper_id, page_number, image) VALUES (?, ?, ?)",
+                [(paper_id, i + 1, img) for i, img in enumerate(page_images)],
+            )
 
 
 def fetch(
+    *,
+    conn: sqlite3.Connection,
     arxiv_id: str,
-    db_path: Path,
     force: bool = False,
     domain_override: str | None = None,
-    *,
     client: httpx.Client | None = None,
     arxiv_lookup: Callable[[str], _ArxivMetadata] | None = None,
     render_pages: Callable[[bytes], list[bytes] | None] = None,
 ) -> PaperMetadata:
     """Two-phase fetch of an arxiv paper. See module docstring for details.
 
-    Test hooks (`client`, `arxiv_lookup`, `render_pages`) let unit tests skip
-    the network and PDF rendering deterministically; production callers pass
-    nothing and the defaults kick in.
+    Keyword-only; all stage functions in the ingest pipeline share this
+    contract (see section 14). Test hooks (``client``, ``arxiv_lookup``,
+    ``render_pages``) let unit tests skip the network and PDF rendering
+    deterministically; production callers pass nothing and the defaults
+    kick in.
     """
     owns_client = client is None
     client = client or _make_default_client()
@@ -650,7 +637,7 @@ def fetch(
         # On force=True we keep the row's paper_name + ingested_at so the
         # slug stays stable across re-fetches (downstream references and
         # human-memory don't get clobbered).
-        existing_row = _get_existing_paper(db_path, arxiv_id)
+        existing_row = _get_existing_paper(conn, arxiv_id)
         if existing_row is not None and not force:
             _LOG.info(
                 "paper %s already present (status=%s), skipping fetch",
@@ -664,13 +651,13 @@ def fetch(
 
         if html_body is None:
             return _persist_failed_html(
-                db_path, arxiv_id, meta, domain_override, existing_row
+                conn, arxiv_id, meta, domain_override, existing_row
             )
 
         pdf_bytes = _download_pdf(client, arxiv_id)
         content_hash = hashlib.sha256(pdf_bytes).hexdigest()
 
-        _log_soft_dedup(db_path, content_hash, arxiv_id)
+        _log_soft_dedup(conn, content_hash, arxiv_id)
 
         page_images = render_pages(pdf_bytes)
 
@@ -682,7 +669,7 @@ def fetch(
         code_repo = _discover_code_repo(client, arxiv_id, html_body, meta)
 
         paper_name, ingested_at = _resolve_slug_and_timestamp(
-            db_path, meta, arxiv_id, existing_row,
+            conn, meta, arxiv_id, existing_row,
         )
 
         pm = PaperMetadata(
@@ -704,7 +691,7 @@ def fetch(
             needs_review=False,
             ingested_at=ingested_at,
         )
-        _persist(db_path, pm, processed_figures, page_images)
+        _persist(conn, pm, processed_figures, page_images)
         return pm
     finally:
         if owns_client:
@@ -712,14 +699,14 @@ def fetch(
 
 
 def _persist_failed_html(
-    db_path: Path,
+    conn: sqlite3.Connection,
     arxiv_id: str,
     meta: _ArxivMetadata,
     domain_override: str | None,
     existing_row: PaperMetadata | None,
 ) -> PaperMetadata:
     paper_name, ingested_at = _resolve_slug_and_timestamp(
-        db_path, meta, arxiv_id, existing_row,
+        conn, meta, arxiv_id, existing_row,
     )
     pm = PaperMetadata(
         arxiv_id=arxiv_id,
@@ -740,12 +727,12 @@ def _persist_failed_html(
         needs_review=False,
         ingested_at=ingested_at,
     )
-    _persist(db_path, pm, figures=[], page_images=[])
+    _persist(conn, pm, figures=[], page_images=[])
     return pm
 
 
 def _resolve_slug_and_timestamp(
-    db_path: Path,
+    conn: sqlite3.Connection,
     meta: _ArxivMetadata,
     arxiv_id: str,
     existing_row: PaperMetadata | None,
@@ -764,7 +751,7 @@ def _resolve_slug_and_timestamp(
         existing_row.paper_name
         if existing_row is not None
         else generate_paper_name(
-            meta.title, meta.published, arxiv_id, _existing_paper_names(db_path),
+            meta.title, meta.published, arxiv_id, _existing_paper_names(conn),
         )
     )
     ingested_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -789,12 +776,16 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     arxiv_id = _parse_arxiv_id_from_url(args.url)
-    pm = fetch(
-        arxiv_id,
-        db_path=Path(args.db),
-        force=args.force,
-        domain_override=args.domain,
-    )
+    conn = get_conn(Path(args.db))
+    try:
+        pm = fetch(
+            conn=conn,
+            arxiv_id=arxiv_id,
+            force=args.force,
+            domain_override=args.domain,
+        )
+    finally:
+        conn.close()
     print(f"{pm.arxiv_id}: {pm.status} (paper_name={pm.paper_name})")
 
 

@@ -116,6 +116,16 @@ def db_path(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def conn(db_path: Path):
+    """Open a migrated connection for each test; closed at teardown."""
+    c = get_conn(db_path)
+    try:
+        yield c
+    finally:
+        c.close()
+
+
+@pytest.fixture
 def fast_sleep(monkeypatch):
     """Silence the PwC rate-limit sleep so tests run instantly."""
     monkeypatch.setattr(fp, "_sleep", lambda s: None)
@@ -126,7 +136,7 @@ def fast_sleep(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_second_fetch_dedups_early_no_network(db_path):
+def test_second_fetch_dedups_early_no_network(conn):
     """A second fetch for the same arxiv_id must skip every HTTP call."""
     arxiv_id = "2301.12345"
     meta = _make_meta()
@@ -150,8 +160,8 @@ def test_second_fetch_dedups_early_no_network(db_path):
 
     with _client_with(first_recorder.handler) as client:
         fetch(
-            arxiv_id,
-            db_path=db_path,
+            conn=conn,
+            arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: meta,
             render_pages=lambda _b: [b"pngbytes0", b"pngbytes1"],
@@ -163,8 +173,8 @@ def test_second_fetch_dedups_early_no_network(db_path):
     second_recorder = _Recorder(lambda r: httpx.Response(500))
     with _client_with(second_recorder.handler) as client:
         returned = fetch(
-            arxiv_id,
-            db_path=db_path,
+            conn=conn,
+            arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: pytest.fail("arxiv lookup ran on dedup"),
             render_pages=lambda _b: pytest.fail("page render ran on dedup"),
@@ -178,7 +188,7 @@ def test_second_fetch_dedups_early_no_network(db_path):
 # ---------------------------------------------------------------------------
 
 
-def test_html_source_fallback_arxiv_404_ar5iv_200(db_path, fast_sleep):
+def test_html_source_fallback_arxiv_404_ar5iv_200(conn, fast_sleep):
     arxiv_id = "2301.12345"
     meta = _make_meta()
 
@@ -200,8 +210,8 @@ def test_html_source_fallback_arxiv_404_ar5iv_200(db_path, fast_sleep):
     recorder = _Recorder(handler)
     with _client_with(recorder.handler) as client:
         pm = fetch(
-            arxiv_id,
-            db_path=db_path,
+            conn=conn,
+            arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: meta,
             render_pages=lambda _b: [],
@@ -209,7 +219,7 @@ def test_html_source_fallback_arxiv_404_ar5iv_200(db_path, fast_sleep):
     assert pm.html_source == "ar5iv"
 
 
-def test_both_html_sources_fail_persists_failed_html_stub(db_path, fast_sleep):
+def test_both_html_sources_fail_persists_failed_html_stub(conn, fast_sleep):
     arxiv_id = "2301.99999"
     meta = _make_meta()
 
@@ -221,8 +231,8 @@ def test_both_html_sources_fail_persists_failed_html_stub(db_path, fast_sleep):
 
     with _client_with(_Recorder(handler).handler) as client:
         pm = fetch(
-            arxiv_id,
-            db_path=db_path,
+            conn=conn,
+            arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: meta,
             render_pages=lambda _b: pytest.fail("no PDF should be rendered on FAILED_HTML"),
@@ -231,19 +241,15 @@ def test_both_html_sources_fail_persists_failed_html_stub(db_path, fast_sleep):
     assert pm.raw_html is None
     assert pm.html_source is None
 
-    conn = get_conn(db_path)
-    try:
-        figures = conn.execute("SELECT COUNT(*) FROM figures").fetchone()[0]
-        pages = conn.execute("SELECT COUNT(*) FROM page_images").fetchone()[0]
-        papers = conn.execute("SELECT COUNT(*) FROM papers WHERE arxiv_id = ?", (arxiv_id,)).fetchone()[0]
-    finally:
-        conn.close()
+    figures = conn.execute("SELECT COUNT(*) FROM figures").fetchone()[0]
+    pages = conn.execute("SELECT COUNT(*) FROM page_images").fetchone()[0]
+    papers = conn.execute("SELECT COUNT(*) FROM papers WHERE arxiv_id = ?", (arxiv_id,)).fetchone()[0]
     assert figures == 0
     assert pages == 0
     assert papers == 1
 
 
-def test_raw_html_is_persisted_on_success(db_path, fast_sleep):
+def test_raw_html_is_persisted_on_success(conn, fast_sleep):
     arxiv_id = "2301.00001"
     body = _minimal_html_with_one_figure("data:image/png;base64,iVBORw0KGgoAAAA=")
 
@@ -259,18 +265,14 @@ def test_raw_html_is_persisted_on_success(db_path, fast_sleep):
 
     with _client_with(_Recorder(handler).handler) as client:
         fetch(
-            arxiv_id,
-            db_path=db_path,
+            conn=conn,
+            arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: _make_meta(),
             render_pages=lambda _b: [],
         )
 
-    conn = get_conn(db_path)
-    try:
-        raw = conn.execute("SELECT raw_html FROM papers WHERE arxiv_id = ?", (arxiv_id,)).fetchone()[0]
-    finally:
-        conn.close()
+    raw = conn.execute("SELECT raw_html FROM papers WHERE arxiv_id = ?", (arxiv_id,)).fetchone()[0]
     assert raw == body
 
 
@@ -279,7 +281,7 @@ def test_raw_html_is_persisted_on_success(db_path, fast_sleep):
 # ---------------------------------------------------------------------------
 
 
-def test_version_suffix_preserved(db_path, fast_sleep):
+def test_version_suffix_preserved(conn, fast_sleep):
     arxiv_id = "2301.12345v2"
     captured: list[str] = []
 
@@ -296,8 +298,8 @@ def test_version_suffix_preserved(db_path, fast_sleep):
 
     with _client_with(_Recorder(handler).handler) as client:
         pm = fetch(
-            arxiv_id,
-            db_path=db_path,
+            conn=conn,
+            arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: _make_meta(),
             render_pages=lambda _b: [],
@@ -328,7 +330,7 @@ def test_default_client_factory_sets_user_agent():
         client.close()
 
 
-def test_user_agent_header_present_on_every_request(db_path, fast_sleep):
+def test_user_agent_header_present_on_every_request(conn, fast_sleep):
     """End-to-end: the UA installed on the client rides every request the
     pipeline emits."""
     arxiv_id = "2301.00002"
@@ -353,8 +355,8 @@ def test_user_agent_header_present_on_every_request(db_path, fast_sleep):
 
     with _client_with(handler) as client:
         fetch(
-            arxiv_id,
-            db_path=db_path,
+            conn=conn,
+            arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: _make_meta(),
             render_pages=lambda _b: [],
@@ -396,7 +398,7 @@ def test_figure_png_preserved_when_not_downscaled():
     assert mime == "image/png"
 
 
-def test_data_uri_figure_persisted_without_any_network(db_path, fast_sleep):
+def test_data_uri_figure_persisted_without_any_network(conn, fast_sleep):
     arxiv_id = "2301.00010"
     tiny_png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
     body = _minimal_html_with_one_figure(f"data:image/png;base64,{tiny_png_b64}")
@@ -417,8 +419,8 @@ def test_data_uri_figure_persisted_without_any_network(db_path, fast_sleep):
 
     with _client_with(handler) as client:
         fetch(
-            arxiv_id,
-            db_path=db_path,
+            conn=conn,
+            arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: _make_meta(),
             render_pages=lambda _b: [],
@@ -426,11 +428,7 @@ def test_data_uri_figure_persisted_without_any_network(db_path, fast_sleep):
 
     assert seen_image_calls == [], f"unexpected image HTTP calls: {seen_image_calls}"
 
-    conn = get_conn(db_path)
-    try:
-        count = conn.execute("SELECT COUNT(*) FROM figures").fetchone()[0]
-    finally:
-        conn.close()
+    count = conn.execute("SELECT COUNT(*) FROM figures").fetchone()[0]
     assert count == 1
 
 
@@ -493,7 +491,7 @@ def test_normalize_strips_trailing_punctuation():
     assert _normalize_repo_url("https://github.com/foo/bar)") == "https://github.com/foo/bar"
 
 
-def test_layer_priority_pwc_wins_over_html_scan(db_path, fast_sleep):
+def test_layer_priority_pwc_wins_over_html_scan(conn, fast_sleep):
     """PwC returns an official repo → layer 2 and 3 are skipped."""
 
     def handler(req):
@@ -523,8 +521,8 @@ def test_layer_priority_pwc_wins_over_html_scan(db_path, fast_sleep):
 
     with _client_with(handler) as client:
         pm = fetch(
-            "2301.00055",
-            db_path=db_path,
+            conn=conn,
+            arxiv_id="2301.00055",
             client=client,
             arxiv_lookup=lambda _id: _make_meta(),
             render_pages=lambda _b: [],
@@ -532,7 +530,7 @@ def test_layer_priority_pwc_wins_over_html_scan(db_path, fast_sleep):
     assert pm.code_repo == "https://github.com/pwcowner/pwcrepo"
 
 
-def test_layer_3_discovers_repo_in_arxiv_comment(db_path, fast_sleep):
+def test_layer_3_discovers_repo_in_arxiv_comment(conn, fast_sleep):
     """PwC and HTML scan return nothing; arxiv .comment has the URL."""
     meta = _make_meta(comment="Code: https://github.com/commenter/fromcomment. See paper.")
 
@@ -548,8 +546,8 @@ def test_layer_3_discovers_repo_in_arxiv_comment(db_path, fast_sleep):
 
     with _client_with(handler) as client:
         pm = fetch(
-            "2301.00066",
-            db_path=db_path,
+            conn=conn,
+            arxiv_id="2301.00066",
             client=client,
             arxiv_lookup=lambda _id: meta,
             render_pages=lambda _b: [],
@@ -563,7 +561,7 @@ def test_layer_3_discovers_repo_in_arxiv_comment(db_path, fast_sleep):
 
 
 def test_soft_dedup_warning_logged_when_same_content_hash_different_id(
-    db_path, fast_sleep, caplog
+    conn, fast_sleep, caplog
 ):
     pdf_bytes = b"%PDF-1.4\nimportant content\n"
 
@@ -580,8 +578,8 @@ def test_soft_dedup_warning_logged_when_same_content_hash_different_id(
     # First paper
     with _client_with(handler) as client:
         fetch(
-            "2301.00088",
-            db_path=db_path,
+            conn=conn,
+            arxiv_id="2301.00088",
             client=client,
             arxiv_lookup=lambda _id: _make_meta(title="Paper A"),
             render_pages=lambda _b: [],
@@ -595,8 +593,8 @@ def test_soft_dedup_warning_logged_when_same_content_hash_different_id(
         with caplog.at_level(logging.WARNING, logger="lodestone.scripts.fetch_paper"):
             with _client_with(handler) as client:
                 fetch(
-                    "2301.00089",
-                    db_path=db_path,
+                    conn=conn,
+                    arxiv_id="2301.00089",
                     client=client,
                     arxiv_lookup=lambda _id: _make_meta(title="Paper B"),
                     render_pages=lambda _b: [],
@@ -613,7 +611,7 @@ def test_soft_dedup_warning_logged_when_same_content_hash_different_id(
 # ---------------------------------------------------------------------------
 
 
-def test_force_refetch_preserves_slug_and_clears_children(db_path, fast_sleep):
+def test_force_refetch_preserves_slug_and_clears_children(conn, fast_sleep):
     """force=True re-runs the pipeline but keeps paper_name + ingested_at,
     and clears dependent rows (figures, page_images, entities, paper_topics,
     FTS) so the paper DELETE doesn't trip FK constraints."""
@@ -633,8 +631,8 @@ def test_force_refetch_preserves_slug_and_clears_children(db_path, fast_sleep):
 
     with _client_with(handler) as client:
         first = fetch(
-            arxiv_id,
-            db_path=db_path,
+            conn=conn,
+            arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: _make_meta(),
             render_pages=lambda _b: [b"page1"],
@@ -642,22 +640,18 @@ def test_force_refetch_preserves_slug_and_clears_children(db_path, fast_sleep):
 
     # Simulate downstream pipeline stages populating children. A naive
     # re-fetch with FK=ON would trip FOREIGN KEY on the paper DELETE.
-    conn = get_conn(db_path)
-    try:
-        conn.execute("INSERT OR IGNORE INTO domains (name) VALUES (?)", ("rag",))
-        paper_id = conn.execute(
-            "SELECT id FROM papers WHERE arxiv_id = ?", (arxiv_id,)
-        ).fetchone()[0]
-        conn.execute(
-            "INSERT INTO entities (paper_id, domain, paper_name, entity_name, entity_type, source_breadcrumb) VALUES (?, ?, ?, ?, ?, ?)",
-            (paper_id, "rag", first.paper_name, "Some Entity", "method", "Abstract"),
-        )
-        conn.execute(
-            "INSERT INTO paper_topics (paper_id, domain, topic) VALUES (?, ?, ?)",
-            (paper_id, "rag", "tree retrieval"),
-        )
-    finally:
-        conn.close()
+    conn.execute("INSERT OR IGNORE INTO domains (name) VALUES (?)", ("rag",))
+    paper_id = conn.execute(
+        "SELECT id FROM papers WHERE arxiv_id = ?", (arxiv_id,)
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO entities (paper_id, domain, paper_name, entity_name, entity_type, source_breadcrumb) VALUES (?, ?, ?, ?, ?, ?)",
+        (paper_id, "rag", first.paper_name, "Some Entity", "method", "Abstract"),
+    )
+    conn.execute(
+        "INSERT INTO paper_topics (paper_id, domain, topic) VALUES (?, ?, ?)",
+        (paper_id, "rag", "tree retrieval"),
+    )
 
     def handler2(req):
         host = req.url.host
@@ -672,8 +666,8 @@ def test_force_refetch_preserves_slug_and_clears_children(db_path, fast_sleep):
 
     with _client_with(handler2) as client:
         refetched = fetch(
-            arxiv_id,
-            db_path=db_path,
+            conn=conn,
+            arxiv_id=arxiv_id,
             force=True,
             client=client,
             arxiv_lookup=lambda _id: _make_meta(),
@@ -685,22 +679,18 @@ def test_force_refetch_preserves_slug_and_clears_children(db_path, fast_sleep):
     assert refetched.ingested_at == first.ingested_at
 
     # Children cleared + re-seeded from phase 2.
-    conn = get_conn(db_path)
-    try:
-        paper_id = conn.execute(
-            "SELECT id FROM papers WHERE arxiv_id = ?", (arxiv_id,)
-        ).fetchone()[0]
-        ents = conn.execute(
-            "SELECT COUNT(*) FROM entities WHERE paper_id = ?", (paper_id,)
-        ).fetchone()[0]
-        topics = conn.execute(
-            "SELECT COUNT(*) FROM paper_topics WHERE paper_id = ?", (paper_id,)
-        ).fetchone()[0]
-        pages = conn.execute(
-            "SELECT COUNT(*) FROM page_images WHERE paper_id = ?", (paper_id,)
-        ).fetchone()[0]
-    finally:
-        conn.close()
+    paper_id = conn.execute(
+        "SELECT id FROM papers WHERE arxiv_id = ?", (arxiv_id,)
+    ).fetchone()[0]
+    ents = conn.execute(
+        "SELECT COUNT(*) FROM entities WHERE paper_id = ?", (paper_id,)
+    ).fetchone()[0]
+    topics = conn.execute(
+        "SELECT COUNT(*) FROM paper_topics WHERE paper_id = ?", (paper_id,)
+    ).fetchone()[0]
+    pages = conn.execute(
+        "SELECT COUNT(*) FROM page_images WHERE paper_id = ?", (paper_id,)
+    ).fetchone()[0]
     assert ents == 0
     assert topics == 0
     assert pages == 2  # new render
@@ -711,16 +701,16 @@ def test_force_refetch_preserves_slug_and_clears_children(db_path, fast_sleep):
 # ---------------------------------------------------------------------------
 
 
-def test_no_db_transaction_open_during_network(db_path, fast_sleep, monkeypatch):
+def test_no_db_transaction_open_during_network(conn, fast_sleep, monkeypatch):
     """Spy on `transaction()` and on the MockTransport so we can assert all
     HTTP calls landed before the single phase-2 BEGIN."""
     events: list[str] = []
 
     original_transaction = fp.transaction
 
-    def spy_transaction(conn):
+    def spy_transaction(c):
         events.append("TXN_ENTER")
-        return original_transaction(conn)
+        return original_transaction(c)
 
     monkeypatch.setattr(fp, "transaction", spy_transaction)
 
@@ -737,8 +727,8 @@ def test_no_db_transaction_open_during_network(db_path, fast_sleep, monkeypatch)
 
     with _client_with(handler) as client:
         fetch(
-            "2301.00100",
-            db_path=db_path,
+            conn=conn,
+            arxiv_id="2301.00100",
             client=client,
             arxiv_lookup=lambda _id: _make_meta(),
             render_pages=lambda _b: [],
