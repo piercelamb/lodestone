@@ -158,8 +158,8 @@ class _StageRecorder:
         )
         return {"status": "extracted"}
 
-    def index_one(self, **kwargs):
-        self._record("index_one", **kwargs)
+    def index(self, **kwargs):
+        self._record("index", **kwargs)
         conn = kwargs["conn"]
         conn.execute(
             "UPDATE papers SET status = ? WHERE paper_name = ?",
@@ -180,7 +180,7 @@ def patched_stages(rec):
          patch.object(ingest, "convert_stage", side_effect=rec.convert), \
          patch.object(ingest, "classify_stage", side_effect=rec.classify), \
          patch.object(ingest, "extract_stage", side_effect=rec.extract), \
-         patch.object(ingest, "index_stage", side_effect=rec.index_one):
+         patch.object(ingest, "index_stage", side_effect=rec.index):
         yield rec
 
 
@@ -192,7 +192,7 @@ def patched_stages(rec):
 def test_fresh_db_runs_all_five_stages(conn, patched_stages):
     ingest.ingest(conn=conn, arxiv_id="2301.00001", force=False, domain=None)
     stages = [c[0] for c in patched_stages.calls]
-    assert stages == ["fetch", "convert", "classify", "extract", "index_one"]
+    assert stages == ["fetch", "convert", "classify", "extract", "index"]
 
 
 def test_resume_from_fetched_skips_fetch(conn, patched_stages):
@@ -200,7 +200,7 @@ def test_resume_from_fetched_skips_fetch(conn, patched_stages):
                 status=PaperStatus.FETCHED)
     ingest.ingest(conn=conn, arxiv_id="2301.00002", force=False, domain=None)
     stages = [c[0] for c in patched_stages.calls]
-    assert stages == ["convert", "classify", "extract", "index_one"]
+    assert stages == ["convert", "classify", "extract", "index"]
 
 
 def test_resume_from_converted_skips_fetch_convert(conn, patched_stages):
@@ -208,7 +208,7 @@ def test_resume_from_converted_skips_fetch_convert(conn, patched_stages):
                 status=PaperStatus.CONVERTED)
     ingest.ingest(conn=conn, arxiv_id="2301.00003", force=False, domain=None)
     stages = [c[0] for c in patched_stages.calls]
-    assert stages == ["classify", "extract", "index_one"]
+    assert stages == ["classify", "extract", "index"]
 
 
 def test_resume_from_classified_runs_extract_index(conn, patched_stages):
@@ -216,7 +216,7 @@ def test_resume_from_classified_runs_extract_index(conn, patched_stages):
                 status=PaperStatus.CLASSIFIED)
     ingest.ingest(conn=conn, arxiv_id="2301.00004", force=False, domain=None)
     stages = [c[0] for c in patched_stages.calls]
-    assert stages == ["extract", "index_one"]
+    assert stages == ["extract", "index"]
 
 
 def test_resume_from_extracted_runs_index_only(conn, patched_stages):
@@ -224,7 +224,7 @@ def test_resume_from_extracted_runs_index_only(conn, patched_stages):
                 status=PaperStatus.EXTRACTED)
     ingest.ingest(conn=conn, arxiv_id="2301.00005", force=False, domain=None)
     stages = [c[0] for c in patched_stages.calls]
-    assert stages == ["index_one"]
+    assert stages == ["index"]
 
 
 def test_already_indexed_no_force_is_noop(conn, patched_stages):
@@ -261,7 +261,7 @@ def test_failed_html_with_force_cascades_then_fetches(conn, patched_stages):
     ingest.ingest(conn=conn, arxiv_id="2301.00008", force=True, domain=None)
     # Cascade wiped the row; fetch saw no existing arxiv_id and ran the pipeline.
     stages = [c[0] for c in patched_stages.calls]
-    assert stages == ["fetch", "convert", "classify", "extract", "index_one"]
+    assert stages == ["fetch", "convert", "classify", "extract", "index"]
 
 
 def test_force_on_indexed_cascades_then_runs_all(conn, patched_stages):
@@ -269,7 +269,7 @@ def test_force_on_indexed_cascades_then_runs_all(conn, patched_stages):
                 status=PaperStatus.INDEXED)
     ingest.ingest(conn=conn, arxiv_id="2301.00009", force=True, domain=None)
     stages = [c[0] for c in patched_stages.calls]
-    assert stages == ["fetch", "convert", "classify", "extract", "index_one"]
+    assert stages == ["fetch", "convert", "classify", "extract", "index"]
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +354,7 @@ def _seed_full_paper(conn: sqlite3.Connection, arxiv_id: str, paper_name: str,
 
 def test_force_cascade_deletes_paper_and_children(conn):
     paper_id = _seed_full_paper(conn, "2301.11111", "paper_to_wipe")
-    ingest._force_delete_paper(conn, paper_id=paper_id, paper_name="paper_to_wipe")
+    ingest._force_delete_paper(conn, paper_id=paper_id)
     assert conn.execute(
         "SELECT COUNT(*) FROM papers WHERE id = ?", (paper_id,)
     ).fetchone()[0] == 0
@@ -370,7 +370,7 @@ def test_force_cascade_deletes_paper_and_children(conn):
 
 def test_force_cascade_clears_sections_fts_for_paper(conn):
     paper_id = _seed_full_paper(conn, "2301.22222", "paper_xyz")
-    ingest._force_delete_paper(conn, paper_id=paper_id, paper_name="paper_xyz")
+    ingest._force_delete_paper(conn, paper_id=paper_id)
     rows = conn.execute(
         "SELECT COUNT(*) FROM sections WHERE sections MATCH ?",
         ("distinctive_section_marker_abc",),
@@ -380,7 +380,7 @@ def test_force_cascade_clears_sections_fts_for_paper(conn):
 
 def test_force_cascade_clears_abstracts_fts_for_paper(conn):
     paper_id = _seed_full_paper(conn, "2301.33333", "paper_abc")
-    ingest._force_delete_paper(conn, paper_id=paper_id, paper_name="paper_abc")
+    ingest._force_delete_paper(conn, paper_id=paper_id)
     rows = conn.execute(
         "SELECT COUNT(*) FROM abstracts WHERE abstracts MATCH ?",
         ("distinctive_abstract_marker_xyz",),
@@ -394,7 +394,7 @@ def test_force_cascade_preserves_canonical_taxonomy(conn):
     aliases_before = conn.execute("SELECT COUNT(*) FROM term_aliases").fetchone()[0]
     emb_before = conn.execute("SELECT COUNT(*) FROM term_embeddings").fetchone()[0]
 
-    ingest._force_delete_paper(conn, paper_id=paper_id, paper_name="paper_def")
+    ingest._force_delete_paper(conn, paper_id=paper_id)
 
     assert conn.execute(
         "SELECT COUNT(*) FROM canonical_terms"

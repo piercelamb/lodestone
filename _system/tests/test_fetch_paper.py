@@ -22,10 +22,10 @@ from _system.scripts.fetch_paper import (
     USER_AGENT,
     _ArxivMetadata,
     _normalize_repo_url,
-    _parse_arxiv_id_from_url,
     _process_figure_image,
     fetch,
 )
+from _system.utils.arxiv_urls import parse_arxiv_id
 
 
 # ---------------------------------------------------------------------------
@@ -310,8 +310,8 @@ def test_version_suffix_preserved(conn, fast_sleep):
 
 
 def test_parse_arxiv_id_from_url_preserves_version():
-    assert _parse_arxiv_id_from_url("https://arxiv.org/abs/2301.12345v3") == "2301.12345v3"
-    assert _parse_arxiv_id_from_url("2301.12345") == "2301.12345"
+    assert parse_arxiv_id("https://arxiv.org/abs/2301.12345v3") == "2301.12345v3"
+    assert parse_arxiv_id("2301.12345") == "2301.12345"
 
 
 # ---------------------------------------------------------------------------

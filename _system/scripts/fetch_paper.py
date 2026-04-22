@@ -36,10 +36,11 @@ from tenacity import (
     wait_exponential,
 )
 
+from _system.db.cascade import delete_paper_cascade
 from _system.db.connection import get_conn, transaction
 from _system.html.latexml_parser import FigureDescriptor, parse as parse_latexml
 from _system.schemas.paper_metadata import HtmlSource, PaperMetadata, PaperStatus
-from _system.utils.arxiv_urls import base_url_for_source
+from _system.utils.arxiv_urls import base_url_for_source, parse_arxiv_id
 from _system.utils.logging import get_logger
 from _system.utils.slug import generate_paper_name
 
@@ -73,7 +74,6 @@ _REPO_URL_RE = re.compile(
 _TRAILING_PUNCT = ".,);:!?]}>"
 
 _VERSION_RE = re.compile(r"v\d+$")
-_ARXIV_ID_RE = re.compile(r"(\d{4}\.\d{4,5}(?:v\d+)?)")
 
 
 @dataclass
@@ -553,19 +553,7 @@ def _persist(
             "SELECT id FROM papers WHERE arxiv_id = ?", (pm.arxiv_id,)
         ).fetchone()
         if existing is not None:
-            old_id = existing[0]
-            # Clear every FK-backed child (PRAGMA foreign_keys=ON in
-            # connection.py). Missing any of these would raise
-            # FOREIGN KEY constraint failed on the paper DELETE.
-            conn.execute("DELETE FROM figures WHERE paper_id = ?", (old_id,))
-            conn.execute("DELETE FROM page_images WHERE paper_id = ?", (old_id,))
-            conn.execute("DELETE FROM entities WHERE paper_id = ?", (old_id,))
-            conn.execute("DELETE FROM paper_topics WHERE paper_id = ?", (old_id,))
-            # FTS tables: paper_id is UNINDEXED (no real FK), but the
-            # rows would otherwise linger and pollute search results.
-            conn.execute("DELETE FROM abstracts WHERE paper_id = ?", (old_id,))
-            conn.execute("DELETE FROM sections WHERE paper_id = ?", (old_id,))
-            conn.execute("DELETE FROM papers WHERE id = ?", (old_id,))
+            delete_paper_cascade(conn, paper_id=existing[0])
 
         cursor = conn.execute(
             """
@@ -758,15 +746,6 @@ def _resolve_slug_and_timestamp(
     return paper_name, ingested_at
 
 
-def _parse_arxiv_id_from_url(raw: str) -> str:
-    """Accept either a bare id (``2301.12345`` / ``2301.12345v2``) or a full
-    arxiv URL. Version suffix is preserved — that's the identity policy."""
-    m = _ARXIV_ID_RE.search(raw)
-    if not m:
-        raise ValueError(f"could not locate arxiv id in {raw!r}")
-    return m.group(1)
-
-
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Fetch an arxiv paper.")
     parser.add_argument("--url", required=True, help="arxiv URL or id")
@@ -775,7 +754,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--domain", default=None, help="domain override")
     args = parser.parse_args(argv)
 
-    arxiv_id = _parse_arxiv_id_from_url(args.url)
+    arxiv_id = parse_arxiv_id(args.url)
     conn = get_conn(Path(args.db))
     try:
         pm = fetch(

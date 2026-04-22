@@ -17,12 +17,14 @@ from pathlib import Path
 
 from _system.db.connection import get_conn
 from _system.db.migrations import init_db
+from _system.scripts.classify_paper import _DOMAIN_MAX_LEN
 from _system.utils.logging import get_logger
 
 _LOG = get_logger("scripts.create_domain")
 
-# Mirrors classify_paper._DOMAIN_ALLOWED_RE + _DOMAIN_MAX_LEN.
-_NAME_RE = re.compile(r"^[a-z0-9_-]{1,32}$")
+# Positive anchored-match variant of classify_paper._DOMAIN_ALLOWED_RE
+# (which strips forbidden chars); both encode the same charset.
+_NAME_RE = re.compile(rf"^[a-z0-9_-]{{1,{_DOMAIN_MAX_LEN}}}$")
 
 
 def create_domain(
@@ -40,7 +42,7 @@ def create_domain(
     """
     if not _NAME_RE.match(name):
         raise ValueError(
-            f"--name {name!r} must match [a-z0-9_-]+ and be 1–32 chars"
+            f"--name {name!r} must match [a-z0-9_-]+ and be 1–{_DOMAIN_MAX_LEN} chars"
         )
     cur = conn.execute(
         "INSERT OR IGNORE INTO domains (name, description) VALUES (?, ?)",
