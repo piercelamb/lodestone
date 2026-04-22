@@ -34,7 +34,6 @@ from _system.utils.sections import split_sections
 class _FakeEmbedder:
     def __init__(self) -> None:
         self.embed_batch_calls: list[int] = []
-        self.embed_batch_texts: list[list[str]] = []
 
     def embed(self, text: str) -> list[float]:
         v = [0.0] * 384
@@ -43,7 +42,6 @@ class _FakeEmbedder:
 
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         self.embed_batch_calls.append(len(texts))
-        self.embed_batch_texts.append(list(texts))
         return [self.embed(t) for t in texts]
 
 
@@ -402,7 +400,6 @@ class TestTermsFtsScoping:
         _seed_domain(conn)
         paper_id = _seed_paper(conn)
         term_id = _seed_canonical(conn, canonical_name="BookRAG")
-        # Three distinct aliases, one is a duplicate from a different paper.
         _seed_alias(conn, term_id, "book-rag", source_paper="p1")
         _seed_alias(conn, term_id, "book-rag", source_paper="p2")
         _seed_alias(conn, term_id, "bookragv2", source_paper="p1")

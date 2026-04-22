@@ -20,7 +20,7 @@ _SCHEMA_FILE = Path(__file__).parent / "schema.sql"
 # Matches a full `CREATE VIRTUAL TABLE <name> USING <module>(...);` block.
 # `[^)]*` is safe here: our virtual-table arg lists contain no nested
 # parentheses (FTS5 quoted options, vec0 `float[384]`).
-_VIRTUAL_TABLE_BLOCK_RE = re.compile(
+VIRTUAL_TABLE_BLOCK_RE = re.compile(
     r"CREATE\s+VIRTUAL\s+TABLE\s+(\w+)\s+USING\s+\w+\s*\([^)]*\)\s*;",
     re.IGNORECASE | re.DOTALL,
 )
@@ -36,7 +36,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         virtual_blocks.append((m.group(1), m.group(0)))
         return ""
 
-    plain_sql = _VIRTUAL_TABLE_BLOCK_RE.sub(_collect, schema_sql)
+    plain_sql = VIRTUAL_TABLE_BLOCK_RE.sub(_collect, schema_sql)
 
     # Plain DDL is all `IF NOT EXISTS` — executescript is safe on repeat runs.
     conn.executescript(plain_sql)

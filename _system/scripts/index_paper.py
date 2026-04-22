@@ -38,14 +38,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sqlite3
 from pathlib import Path
-from typing import Iterable, NamedTuple
+from typing import NamedTuple
 
 import sqlite_vec
 
 from _system.db.connection import get_conn, transaction
+from _system.db.migrations import VIRTUAL_TABLE_BLOCK_RE
 from _system.resolution.embeddings import Embedder
 from _system.schemas.paper_metadata import PaperStatus, can_run_from
 from _system.utils.logging import get_logger
@@ -58,14 +58,6 @@ _PAPERS_BATCH_SIZE = 500
 _TERMS_BATCH_SIZE = 500
 
 _SCHEMA_FILE = Path(__file__).resolve().parent.parent / "db" / "schema.sql"
-
-# Match a full ``CREATE VIRTUAL TABLE <name> USING <module>(...);`` block.
-# Matches migrations._VIRTUAL_TABLE_BLOCK_RE; duplicated locally so this
-# module doesn't reach into migrations' private names.
-_VIRTUAL_TABLE_BLOCK_RE = re.compile(
-    r"CREATE\s+VIRTUAL\s+TABLE\s+(\w+)\s+USING\s+\w+\s*\([^)]*\)\s*;",
-    re.IGNORECASE | re.DOTALL,
-)
 
 _DERIVED_VIRTUAL_TABLES: tuple[str, ...] = (
     "abstracts",
@@ -165,8 +157,9 @@ def index_one(
             (paper_id, domain, paper_name, collection, title, abstract or ""),
         )
 
+        new_section_count = 0
         if markdown:
-            _insert_sections_for_paper(
+            new_section_count = _insert_sections_for_paper(
                 conn,
                 paper_id=paper_id,
                 domain=domain,
@@ -183,12 +176,7 @@ def index_one(
                 "(no entities, topics, or collection canonical)",
                 paper_id, paper_name,
             )
-        _rebuild_terms_fts(conn, touched)
-
-        new_section_count = conn.execute(
-            "SELECT COUNT(*) FROM sections WHERE paper_name = ?",
-            (paper_name,),
-        ).fetchone()[0]
+        _rebuild_terms_fts(conn, _fetch_canonical_rows(conn, touched))
 
         conn.execute(
             """
@@ -218,30 +206,30 @@ def _insert_sections_for_paper(
     domain: str | None,
     paper_name: str,
     markdown: str,
-) -> None:
+) -> int:
     """Split markdown and insert one ``sections`` FTS5 row per chunk.
 
     ``SectionChunk.body`` already has the breadcrumb prepended
     (``{breadcrumb}\\n\\n{raw_body}``), so we use it verbatim — prepending it
     again would duplicate the breadcrumb line and dilute BM25 scoring.
+
+    Returns the number of section rows inserted.
     """
-    for chunk in split_sections(markdown):
-        conn.execute(
+    rows = [
+        (paper_id, domain, paper_name, chunk.title, str(chunk.level), chunk.body)
+        for chunk in split_sections(markdown)
+    ]
+    if rows:
+        conn.executemany(
             """
             INSERT INTO sections
                 (paper_id, domain, paper_name, section_title,
                  section_level, body)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (
-                paper_id,
-                domain,
-                paper_name,
-                chunk.title,
-                str(chunk.level),
-                chunk.body,
-            ),
+            rows,
         )
+    return len(rows)
 
 
 def _touched_term_ids(
@@ -268,15 +256,14 @@ def _touched_term_ids(
     """
     term_ids: set[int] = set()
 
-    entity_names_on_paper = conn.execute(
-        "SELECT COUNT(DISTINCT entity_name) FROM entities WHERE paper_id = ?",
-        (paper_id,),
-    ).fetchone()[0]
+    # LEFT JOIN so orphan entity_names (no matching canonical_terms row) show
+    # up as NULL ct.id. We count them to surface a WARN if extract_entities'
+    # contract of writing canonical names into entities.entity_name breaks.
     rows = conn.execute(
         """
-        SELECT DISTINCT ct.id
+        SELECT DISTINCT e.entity_name, ct.id
           FROM entities e
-          JOIN canonical_terms ct
+          LEFT JOIN canonical_terms ct
             ON ct.domain = e.domain
            AND ct.term_type = 'entity'
            AND ct.entity_type = e.entity_type
@@ -285,18 +272,14 @@ def _touched_term_ids(
         """,
         (paper_id,),
     ).fetchall()
-    term_ids.update(r[0] for r in rows)
-
-    # Defensive: extract_entities writes resolved canonical_names into
-    # entities.entity_name. If that contract ever breaks, the JOIN above
-    # silently drops rows. Log a WARN when round-trip counts don't agree so
-    # the regression surfaces in logs rather than in bogus search results.
-    if entity_names_on_paper > len(rows):
+    matched_ids = {r[1] for r in rows if r[1] is not None}
+    term_ids.update(matched_ids)
+    orphan_names = {r[0] for r in rows if r[1] is None}
+    if orphan_names:
         _LOG.warning(
-            "paper_id=%s: %d distinct entity_names in entities but only %d "
-            "matched canonical_terms rows. entities.entity_name may not be "
-            "canonical — check extract_entities invariants.",
-            paper_id, entity_names_on_paper, len(rows),
+            "paper_id=%s: %d distinct entity_names in entities have no "
+            "matching canonical_terms row — check extract_entities invariants.",
+            paper_id, len(orphan_names),
         )
 
     rows = conn.execute(
@@ -314,14 +297,10 @@ def _touched_term_ids(
     ).fetchall()
     term_ids.update(r[0] for r in rows)
 
-    # ``domain`` / ``collection`` can be ``None`` (pre-classify) or ``""``
-    # (sentinel from extract_entities when classify didn't run). Both must
-    # skip the collection lookup — plain truthy checks would suffice today,
-    # but ``is not None and != ""`` makes the intent explicit.
-    if (
-        domain is not None and domain != ""
-        and collection is not None and collection != ""
-    ):
+    # domain / collection can be None (pre-classify) or "" (sentinel from
+    # extract_entities when classify didn't run). Both are falsy; skip the
+    # collection lookup in either case.
+    if domain and collection:
         row = conn.execute(
             """
             SELECT id FROM canonical_terms
@@ -336,50 +315,68 @@ def _touched_term_ids(
     return term_ids
 
 
+def _fetch_canonical_rows(
+    conn: sqlite3.Connection, term_ids: set[int],
+) -> list[tuple[int, str, str, str, str]]:
+    """Fetch ``(id, domain, term_type, entity_type, canonical_name)`` rows
+    for ``term_ids`` in a single query. An id whose row was concurrently
+    deleted is silently dropped from the result."""
+    if not term_ids:
+        return []
+    placeholders = ",".join("?" * len(term_ids))
+    return conn.execute(
+        f"""
+        SELECT id, domain, term_type, entity_type, canonical_name
+          FROM canonical_terms WHERE id IN ({placeholders})
+        """,
+        list(term_ids),
+    ).fetchall()
+
+
 def _rebuild_terms_fts(
     conn: sqlite3.Connection,
-    term_ids: Iterable[int],
+    canonical_rows: list[tuple[int, str, str, str, str]],
 ) -> None:
-    """DELETE + INSERT each ``terms_fts`` row from scratch for ``term_ids``.
+    """DELETE + INSERT ``terms_fts`` rows for the given canonical rows.
 
-    For each id we pull the canonical row and the distinct alias surface
-    forms from ``term_aliases``, then replace the ``terms_fts`` row with a
-    single space-joined alias string.
+    Each row is ``(term_id, domain, term_type, entity_type, canonical_name)``.
+    Aliases are fetched with a single ``IN`` query, space-joined per term,
+    then written via ``executemany``.
 
-    ``term_id`` is UNINDEXED in the virtual table, so the DELETE is a linear
-    scan — acceptable at the scoped-per-paper scale (a few to a few hundred
-    terms). ``rebuild_all`` bypasses this with a DROP+CREATE.
+    ``term_id`` is UNINDEXED in the virtual table, so DELETE is a linear
+    scan — acceptable at scoped-per-paper scale. ``rebuild_all`` runs this
+    after DROP+CREATE, so the DELETE is a no-op there.
     """
-    for term_id in term_ids:
-        row = conn.execute(
-            """
-            SELECT domain, term_type, entity_type, canonical_name
-              FROM canonical_terms WHERE id = ?
-            """,
-            (term_id,),
-        ).fetchone()
-        if row is None:
-            # Touched set can contain an id whose canonical row was deleted
-            # between query and rebuild. Not our problem to repair here.
-            continue
-        dom, t_type, ent_type, can_name = row
+    if not canonical_rows:
+        return
+    term_ids = [r[0] for r in canonical_rows]
+    placeholders = ",".join("?" * len(term_ids))
 
-        alias_rows = conn.execute(
-            "SELECT DISTINCT alias FROM term_aliases WHERE term_id = ?",
-            (term_id,),
-        ).fetchall()
-        aliases = " ".join(a[0] for a in alias_rows)
+    aliases_by_term: dict[int, list[str]] = {}
+    for tid, alias in conn.execute(
+        f"SELECT DISTINCT term_id, alias FROM term_aliases "
+        f"WHERE term_id IN ({placeholders})",
+        term_ids,
+    ):
+        aliases_by_term.setdefault(tid, []).append(alias)
 
-        conn.execute("DELETE FROM terms_fts WHERE term_id = ?", (term_id,))
-        conn.execute(
-            """
-            INSERT INTO terms_fts
-                (term_id, domain, term_type, entity_type,
-                 canonical_name, aliases)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (term_id, dom, t_type, ent_type, can_name, aliases),
-        )
+    conn.execute(
+        f"DELETE FROM terms_fts WHERE term_id IN ({placeholders})",
+        term_ids,
+    )
+    conn.executemany(
+        """
+        INSERT INTO terms_fts
+            (term_id, domain, term_type, entity_type,
+             canonical_name, aliases)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (tid, dom, t_type, ent_type, can_name,
+             " ".join(aliases_by_term.get(tid, [])))
+            for (tid, dom, t_type, ent_type, can_name) in canonical_rows
+        ],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -400,29 +397,18 @@ def rebuild_all(
     """
     _drop_and_recreate_derived_virtual_tables(conn)
 
-    paper_ids = [r[0] for r in conn.execute(
-        "SELECT id FROM papers ORDER BY id"
-    ).fetchall()]
-    for i in range(0, len(paper_ids), _PAPERS_BATCH_SIZE):
-        batch_ids = paper_ids[i : i + _PAPERS_BATCH_SIZE]
+    paper_rows = conn.execute(
+        """
+        SELECT id, domain, paper_name, collection, title, abstract, markdown
+          FROM papers ORDER BY id
+        """
+    ).fetchall()
+    paper_count = len(paper_rows)
+    for i in range(0, paper_count, _PAPERS_BATCH_SIZE):
+        batch = paper_rows[i : i + _PAPERS_BATCH_SIZE]
         with transaction(conn):
-            for paper_id in batch_ids:
-                _index_abstract_and_sections_rebuild(conn, paper_id)
-
-    term_ids_all = [r[0] for r in conn.execute(
-        "SELECT id FROM canonical_terms ORDER BY id"
-    ).fetchall()]
-    for i in range(0, len(term_ids_all), _TERMS_BATCH_SIZE):
-        batch = term_ids_all[i : i + _TERMS_BATCH_SIZE]
-        with transaction(conn):
-            _rebuild_terms_fts(conn, batch)
-
-    if not term_ids_all:
-        _LOG.info("rebuild_all: no canonical_terms rows; skipping embedding pass")
-        return
-
-    if embedder is None:
-        embedder = Embedder()
+            for row in batch:
+                _insert_abstract_and_sections_for_row(conn, row)
 
     canonical_rows = conn.execute(
         """
@@ -431,6 +417,17 @@ def rebuild_all(
          ORDER BY id
         """
     ).fetchall()
+    for i in range(0, len(canonical_rows), _TERMS_BATCH_SIZE):
+        batch = canonical_rows[i : i + _TERMS_BATCH_SIZE]
+        with transaction(conn):
+            _rebuild_terms_fts(conn, batch)
+
+    if not canonical_rows:
+        _LOG.info("rebuild_all: no canonical_terms rows; skipping embedding pass")
+        return
+
+    if embedder is None:
+        embedder = Embedder()
 
     total_embedded = 0
     for i in range(0, len(canonical_rows), _EMBED_BATCH_SIZE):
@@ -438,47 +435,42 @@ def rebuild_all(
         texts = [r[4] for r in batch]
         vectors = embedder.embed_batch(texts)
         with transaction(conn):
-            for (term_id, dom, t_type, ent_type, _name), vec in zip(batch, vectors):
-                conn.execute(
-                    """
-                    INSERT INTO term_embeddings
-                        (term_id, embedding, term_type, entity_type, domain)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
+            conn.executemany(
+                """
+                INSERT INTO term_embeddings
+                    (term_id, embedding, term_type, entity_type, domain)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                [
                     (
                         term_id,
                         sqlite_vec.serialize_float32(vec),
                         t_type,
                         ent_type,
                         dom,
-                    ),
-                )
+                    )
+                    for (term_id, dom, t_type, ent_type, _name), vec
+                    in zip(batch, vectors)
+                ],
+            )
         total_embedded += len(batch)
 
     _LOG.info(
         "rebuild_all: papers=%d canonicals=%d embedded=%d",
-        len(paper_ids), len(canonical_rows), total_embedded,
+        paper_count, len(canonical_rows), total_embedded,
     )
 
 
-def _index_abstract_and_sections_rebuild(
-    conn: sqlite3.Connection, paper_id: int
+def _insert_abstract_and_sections_for_row(
+    conn: sqlite3.Connection,
+    paper_row: tuple[int, str | None, str, str | None, str | None, str | None, str | None],
 ) -> None:
     """Per-paper insert helper used by ``rebuild_all``.
 
     Skips the DELETE step (we already DROP+CREATE'd the parent virtual
     tables) and the status flip (not a status-changing operation).
     """
-    row = conn.execute(
-        """
-        SELECT domain, paper_name, collection, title, abstract, markdown
-          FROM papers WHERE id = ?
-        """,
-        (paper_id,),
-    ).fetchone()
-    if row is None:
-        return
-    domain, paper_name, collection, title, abstract, markdown = row
+    paper_id, domain, paper_name, collection, title, abstract, markdown = paper_row
     conn.execute(
         """
         INSERT INTO abstracts
@@ -510,7 +502,7 @@ def _drop_and_recreate_derived_virtual_tables(conn: sqlite3.Connection) -> None:
     """
     schema_sql = _SCHEMA_FILE.read_text(encoding="utf-8")
     found: dict[str, str] = {}
-    for match in _VIRTUAL_TABLE_BLOCK_RE.finditer(schema_sql):
+    for match in VIRTUAL_TABLE_BLOCK_RE.finditer(schema_sql):
         name = match.group(1)
         found[name] = match.group(0)
 
