@@ -1,0 +1,10 @@
+{
+  "structured_output": {
+    "domain": "multi-agent_systems",
+    "domain_is_new": true,
+    "collection": "orchestration patterns",
+    "topics": ["planner-executor split", "tool routing"]
+  },
+  "cost_usd": 0.0,
+  "duration_ms": 0
+}
