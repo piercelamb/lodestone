@@ -23,7 +23,7 @@ import json
 import re
 import sqlite3
 from pathlib import Path
-from typing import Any, Callable, Iterable, NamedTuple
+from typing import Any, Callable, NamedTuple, TypedDict
 
 from _system.db.connection import get_conn, transaction
 from _system.resolution.embeddings import Embedder
@@ -43,12 +43,11 @@ _ACRONYM_MIN_LEN = 3
 _REJECT_RATE_WARN = 0.5
 _REJECT_RATE_WARN_MIN_SAMPLES = 10
 
-ACRONYM_ALLOWLIST: frozenset[str] = frozenset({"LM", "QA", "NN", "AI", "ML", "NLP"})
-ENTITY_STOPLIST: frozenset[str] = frozenset(
+_ACRONYM_ALLOWLIST: frozenset[str] = frozenset({"LM", "QA", "NN", "AI", "ML", "NLP"})
+_ENTITY_STOPLIST: frozenset[str] = frozenset(
     {"table", "figure", "we", "using", "our", "this", "these", "that", "it", "however"}
 )
-# Label words the extractor must reject so "Method"/"Dataset" spans never reach
-# the resolver. Derived from EntityType so the two can't drift.
+# Derived from EntityType so the two can't drift.
 _LABEL_WORDS: frozenset[str] = frozenset(t.value for t in EntityType)
 
 _NUMERIC_RE = re.compile(r"\d+")
@@ -86,13 +85,14 @@ class ExtractResult(NamedTuple):
     status: str
 
 
-# ---------------------------------------------------------------------------
-# Span shape: flat dict with keys text/label/score/start/end.
-# Signature for the test seam:
-#   (text, label_descriptions, threshold) -> list[span_dict]
-# ---------------------------------------------------------------------------
+class Span(TypedDict):
+    text: str
+    label: str
+    score: float
+    start: int
+    end: int
 
-Span = dict
+
 InferenceFn = Callable[[str, dict[str, str], float], list[Span]]
 TokenizeFn = Callable[[str], list[str]]
 
@@ -113,7 +113,7 @@ def _get_model() -> Any:
     """
     global _MODEL
     if _MODEL is None:
-        from gliner2 import GLiNER2  # heavy import — deferred
+        from gliner2 import GLiNER2
         _MODEL = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
     return _MODEL
 
@@ -177,13 +177,13 @@ def _flatten_gliner_output(raw: Any) -> list[Span]:
                     f"got {type(item).__name__}: {item!r}"
                 )
             spans.append(
-                {
-                    "text": item.get("text", ""),
-                    "label": label,
-                    "score": float(item.get("confidence", item.get("score", 0.0))),
-                    "start": int(item.get("start", 0)),
-                    "end": int(item.get("end", 0)),
-                }
+                Span(
+                    text=item["text"],
+                    label=label,
+                    score=float(item.get("confidence", item.get("score", 0.0))),
+                    start=int(item["start"]),
+                    end=int(item["end"]),
+                )
             )
     return spans
 
@@ -251,26 +251,29 @@ def extract(
         else load_gliner_config()
     )
 
-    label_to_type = _build_label_map(cfg.label_descriptions.keys())
+    # GlinerConfig._label_keys_agree guarantees every key round-trips.
+    label_to_type = {
+        label: EntityType(label.lower()) for label in cfg.label_descriptions
+    }
+    label_descriptions = dict(cfg.label_descriptions)
 
     inference = run_inference or _default_inference
-    # Default to GLiNER2's subword tokenizer so sub-chunks honour the
-    # 384-token ceiling. Tests that pass a canned `run_inference` typically
-    # leave `tokenize=None` and their sections are short enough to fit in
-    # one sub-chunk, so tokenize() is never invoked.
-    tokenize_fn = tokenize if tokenize is not None else (
-        _default_tokenize if run_inference is None else None
-    )
+    # Only pair the real GLiNER2 tokenizer with the real inference path so
+    # tests running canned inference don't trigger a model load via sub_chunk.
+    if tokenize is not None:
+        tokenize_fn = tokenize
+    elif run_inference is None:
+        tokenize_fn = _default_tokenize
+    else:
+        tokenize_fn = None
 
-    # Fresh spans hit tier 5 (INSERT into canonical_terms) which needs an
-    # embedder. Defer construction until the first resolver call that actually
-    # needs one — all-tier-1 papers never load sentence-transformers.
-    _lazy_embedder_slot: list[Embedder | None] = [embedder]
-
+    # Defer Embedder construction until the first tier-5 insert; all-tier-1
+    # papers never need to load sentence-transformers.
     def _get_embedder() -> Embedder:
-        if _lazy_embedder_slot[0] is None:
-            _lazy_embedder_slot[0] = Embedder()
-        return _lazy_embedder_slot[0]
+        nonlocal embedder
+        if embedder is None:
+            embedder = Embedder()
+        return embedder
 
     # Inference-time floor: use the smallest per-label threshold so GLiNER2
     # returns candidates for every label; per-label filtering below applies
@@ -295,11 +298,11 @@ def extract(
                 tokenizer_cb=tokenize_fn,
             )
             # Per-section first-seen dedup on (entity_type, normalize_term(name)).
-            # Value carries the sub-chunk text + in-chunk offset so we can build
-            # a description in the same slice the span was found.
-            seen: dict[tuple[EntityType, str], tuple[str, str, int]] = {}
+            # Description is computed at first-seen time so we can drop the
+            # full sub-chunk reference once the span is recorded.
+            seen: dict[tuple[EntityType, str], tuple[str, str]] = {}
             for sub in sub_chunks_list:
-                spans = inference(sub, dict(cfg.label_descriptions), min_threshold)
+                spans = inference(sub, label_descriptions, min_threshold)
                 for span in spans:
                     label = span.get("label", "")
                     name = (span.get("text") or "").strip()
@@ -321,9 +324,9 @@ def extract(
                     key = (etype, normalize_term(name))
                     if key in seen:
                         continue
-                    seen[key] = (name, sub, start)
+                    seen[key] = (name, _description_for(sub, start))
 
-            for (etype, _norm), (raw_name, sub_text, offset) in seen.items():
+            for (etype, _norm), (raw_name, description) in seen.items():
                 n_total += 1
                 if _is_garbage(raw_name):
                     n_rejected += 1
@@ -342,7 +345,6 @@ def extract(
                     source_paper=paper_name,
                     embedder=_get_embedder(),
                 )
-                description = _description_for(sub_text, offset)
 
                 conn.execute(
                     """
@@ -408,25 +410,6 @@ def extract(
     )
 
 
-def _build_label_map(labels: Iterable[str]) -> dict[str, EntityType]:
-    """Map GLiNER label keys (e.g. 'Method') to EntityType members.
-
-    Keys whose lowercased form doesn't correspond to an EntityType value are
-    logged as WARNING and omitted from the map — at runtime such spans are
-    dropped without writing to the DB.
-    """
-    out: dict[str, EntityType] = {}
-    for label in labels:
-        try:
-            out[label] = EntityType(label.lower())
-        except ValueError:
-            _LOG.warning(
-                "GLiNER config label %r does not map to any EntityType; ignoring",
-                label,
-            )
-    return out
-
-
 # ---------------------------------------------------------------------------
 # Garbage gate
 # ---------------------------------------------------------------------------
@@ -444,11 +427,11 @@ def _is_garbage(name: str) -> bool:
         return True
     if _NUMERIC_RE.fullmatch(s):
         return True
-    if s.lower() in ENTITY_STOPLIST:
+    if s.lower() in _ENTITY_STOPLIST:
         return True
     if normalize_term(s) in _LABEL_WORDS:
         return True
-    if len(s) < _ACRONYM_MIN_LEN and s.upper() not in ACRONYM_ALLOWLIST:
+    if len(s) < _ACRONYM_MIN_LEN and s.upper() not in _ACRONYM_ALLOWLIST:
         return True
     return False
 
@@ -459,11 +442,11 @@ def _is_garbage(name: str) -> bool:
 
 
 def _description_for(sub_chunk_text: str, offset: int) -> str:
-    """Return a ≤240-char description centered on ``offset`` within ``sub_chunk_text``.
+    """Return a ≤240-char description of the sentence fragment covering ``offset``.
 
     Strategy: take a ±200-char window around ``offset``, then pick the
     sentence fragment covering ``offset`` using ``[.!?]\\s+`` as the sentence
-    boundary. Falls back to the raw window when no boundary falls inside it.
+    boundary. Falls back to the raw window when no boundary brackets the offset.
     Hard-truncates at 240 chars (no ellipsis).
     """
     n = len(sub_chunk_text)
@@ -479,23 +462,14 @@ def _description_for(sub_chunk_text: str, offset: int) -> str:
 
     frag_start = 0
     frag_end = len(window)
-    boundary_seen = False
     for m in _SENTENCE_SPLIT_RE.finditer(window):
-        boundary_seen = True
         if local_offset < m.start():
             frag_end = m.start()
             break
         frag_start = m.end()
-    else:
-        if boundary_seen:
-            frag_end = len(window)
 
-    picked = window[frag_start:frag_end].strip() if boundary_seen else window.strip()
-    if not picked:
-        picked = window.strip()
-    if len(picked) > _DESCRIPTION_MAX_CHARS:
-        picked = picked[:_DESCRIPTION_MAX_CHARS]
-    return picked
+    picked = window[frag_start:frag_end].strip()
+    return picked[:_DESCRIPTION_MAX_CHARS]
 
 
 # ---------------------------------------------------------------------------

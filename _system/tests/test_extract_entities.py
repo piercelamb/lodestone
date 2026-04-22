@@ -22,9 +22,7 @@ from _system.db.migrations import init_db
 from _system.schemas.paper_metadata import PaperStatus
 from _system.scripts import extract_entities as ee
 from _system.scripts.extract_entities import (
-    ACRONYM_ALLOWLIST,
-    ENTITY_STOPLIST,
-    ExtractResult,
+    _ACRONYM_ALLOWLIST,
     MarkdownMissing,
     PaperNotFound,
     StatusTooLow,
@@ -362,7 +360,7 @@ class TestGarbageGate:
         assert _is_garbage("1")
         assert _is_garbage("2024")
 
-    @pytest.mark.parametrize("acronym", sorted(ACRONYM_ALLOWLIST))
+    @pytest.mark.parametrize("acronym", sorted(_ACRONYM_ALLOWLIST))
     def test_acronym_allowlist_kept(self, acronym):
         assert not _is_garbage(acronym)
         assert not _is_garbage(acronym.lower())
@@ -793,11 +791,6 @@ class TestEntityCountUpdate:
 
 
 # ===========================================================================
-# CLI
-# ===========================================================================
-
-
-# ===========================================================================
 # Reject-rate WARNING and unknown status
 # ===========================================================================
 
@@ -919,16 +912,11 @@ def test_real_gliner_extracts_method_entity(tmp_db_with_paper, fake_embedder):
     Skipped unless ``-m slow`` is passed. Requires the HF cache to contain
     ``fastino/gliner2-base-v1`` (``validate_models.py`` primes it).
     """
-    try:
-        # Force real inference — run_inference=None triggers _default_inference.
-        extract(
-            paper_name="paper_name_2024",
-            conn=tmp_db_with_paper,
-            embedder=fake_embedder,
-        )
-    except Exception as exc:  # pragma: no cover
-        pytest.skip(f"real GLiNER2 unavailable: {exc!r}")
-
+    extract(
+        paper_name="paper_name_2024",
+        conn=tmp_db_with_paper,
+        embedder=fake_embedder,
+    )
     count = tmp_db_with_paper.execute(
         "SELECT COUNT(*) FROM entities WHERE paper_name = 'paper_name_2024' "
         "AND entity_type = 'method'"
