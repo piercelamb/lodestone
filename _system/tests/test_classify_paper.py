@@ -361,8 +361,6 @@ def test_subprocess_nonzero_exit_retries_three_times_then_raises(seeded, monkeyp
             argv, 7, stdout=b"", stderr=b"boom"
         )
 
-    # Kill tenacity sleeps so the test stays fast.
-    monkeypatch.setattr(cp, "subprocess", cp.subprocess)
     monkeypatch.setattr(cp.subprocess, "run", fake_run)
     _neuter_tenacity_sleep(monkeypatch)
 

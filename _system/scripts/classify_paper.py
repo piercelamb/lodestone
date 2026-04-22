@@ -35,7 +35,6 @@ import subprocess
 from pathlib import Path
 from typing import Iterable, NamedTuple
 
-from pydantic import ValidationError
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -53,22 +52,16 @@ from _system.utils.sections import split_sections, strip_breadcrumb
 
 _LOG = get_logger("scripts.classify_paper")
 
-# Argv for the one and only LLM subprocess in this pipeline. Kept as a
-# module-level tuple so tests can assert against it without duplicating
-# the literal.
 CLAUDE_ARGV: tuple[str, ...] = ("claude", "-p", "--bare", "--output-format", "json")
 
 _SUBPROCESS_TIMEOUT_S = 180
 _INTRO_MAX_CHARS = 8000
 _COLLECTIONS_PER_DOMAIN_LIMIT = 30
-_STDERR_HEAD_BYTES = 2048
-_STDOUT_HEAD_BYTES = 2048
+_HEAD_BYTES_CAP = 2048
 _DOMAIN_MAX_LEN = 32
 
 _INTRO_TITLES: tuple[str, ...] = ("introduction", "overview", "background")
 
-# Sanitization: lowercase, replace any run of whitespace or `/` with `_`,
-# then drop anything outside `[a-z0-9_-]`.
 _WS_OR_SLASH_RE = re.compile(r"[\s/]+")
 _DOMAIN_ALLOWED_RE = re.compile(r"[^a-z0-9_-]")
 
@@ -178,8 +171,10 @@ def classify(
         )
 
     intro_text = _extract_intro(markdown or "", paper_name=paper_name)
+    del markdown
 
     existing_domains = _load_domains(conn)
+    existing_domain_names = {d[0] for d in existing_domains}
     collections_by_domain = _load_collections_by_domain(conn)
 
     prompt = _build_prompt(
@@ -189,35 +184,30 @@ def classify(
         collections_by_domain=collections_by_domain,
     )
 
-    # Fresh collections/topics from the LLM will miss tiers 1-4 and land in
-    # tier 5, which needs an Embedder to populate term_embeddings. Default to
-    # the real bge-small model; tests inject a fake to avoid the ~1s load.
+    # Fresh terms miss tiers 1-4 and need an Embedder for tier 5.
     if embedder is None:
         embedder = Embedder()
 
     runner = run_subprocess or _run_claude_cli
     envelope = runner(prompt)
 
-    structured = envelope.get("structured_output") if isinstance(envelope, dict) else None
+    structured = envelope.get("structured_output")
     if structured is None:
         raise ClassifyEnvelopeError(
             f"paper_name={paper_name!r}: envelope missing 'structured_output'; "
-            f"envelope head={str(envelope)[:_STDOUT_HEAD_BYTES]!r}"
+            f"envelope head={str(envelope)[:_HEAD_BYTES_CAP]!r}"
         )
-    # ValidationError is deterministic — not retried, propagates unchanged.
     output = ClassificationOutput.model_validate(structured)
 
     decision = _choose_domain(
         proposed=output.domain,
         domain_is_new=output.domain_is_new,
         override=domain_override,
-        existing_domains={d[0] for d in existing_domains},
+        existing_domains=existing_domain_names,
     )
 
     with transaction(conn):
         if decision.insert_new:
-            # Inside the transaction so a later failure rolls this back
-            # together with paper_topics / papers writes.
             conn.execute(
                 """
                 INSERT OR IGNORE INTO domains (name, description)
@@ -336,10 +326,10 @@ def _extract_intro(markdown: str, *, paper_name: str) -> str:
     for title in _INTRO_TITLES:
         body = by_title.get(title)
         if body is not None:
-            return _clip_intro(strip_breadcrumb(body))
+            return strip_breadcrumb(body)[:_INTRO_MAX_CHARS]
 
     if first_level_one_body is not None:
-        return _clip_intro(strip_breadcrumb(first_level_one_body))
+        return strip_breadcrumb(first_level_one_body)[:_INTRO_MAX_CHARS]
 
     _LOG.warning(
         "paper_name=%s markdown has headers but no level-1 or intro-like "
@@ -347,18 +337,6 @@ def _extract_intro(markdown: str, *, paper_name: str) -> str:
         paper_name,
     )
     return ""
-
-
-def _clip_intro(text: str) -> str:
-    """Cap intro length to keep the prompt well under stdin-practical size.
-
-    The cap is a character count, not a token count, because we intentionally
-    do not import a tokenizer here — classify is a hot path and the cap is
-    already conservative.
-    """
-    if len(text) <= _INTRO_MAX_CHARS:
-        return text
-    return text[:_INTRO_MAX_CHARS]
 
 
 # ---------------------------------------------------------------------------
@@ -516,11 +494,9 @@ def _run_claude_cli(prompt: str) -> dict:
     if result.returncode != 0:
         raise ClassifySubprocessError(
             f"claude CLI exited {result.returncode}; "
-            f"stderr head={result.stderr[:_STDERR_HEAD_BYTES]!r}"
+            f"stderr head={result.stderr[:_HEAD_BYTES_CAP]!r}"
         )
 
-    # Parse stdout here so tenacity retries on flaky JSON. Envelope-shape
-    # validation happens at the call site (and doesn't retry).
     return json.loads(result.stdout.decode("utf-8", errors="replace"))
 
 
@@ -583,11 +559,7 @@ def _main(argv: Iterable[str] | None = None) -> None:
         description="Classify one paper via the `claude` CLI."
     )
     parser.add_argument("--paper", required=True, help="papers.paper_name")
-    parser.add_argument(
-        "--db",
-        default="/Users/pierce/Personal/Code/lodestone/lodestone.db",
-        help="sqlite db path (default: repo-root lodestone.db)",
-    )
+    parser.add_argument("--db", default="lodestone.db", help="sqlite db path")
     parser.add_argument(
         "--force",
         action="store_true",
@@ -610,18 +582,7 @@ def _main(argv: Iterable[str] | None = None) -> None:
         )
     finally:
         conn.close()
-    print(
-        json.dumps(
-            {
-                "paper_name": result.paper_name,
-                "domain": result.domain,
-                "collection": result.collection,
-                "topics": list(result.topics),
-                "needs_review": result.needs_review,
-                "status": result.status,
-            }
-        )
-    )
+    print(json.dumps(result._asdict()))
 
 
 if __name__ == "__main__":
