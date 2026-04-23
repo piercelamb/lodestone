@@ -455,6 +455,53 @@ def test_outer_figure_without_caption_does_not_steal_sub_panel_caption() -> None
 # --- module import hygiene ---
 
 
+# --- article scope ---
+
+
+def test_parser_scopes_to_article_ltx_document_when_present() -> None:
+    """arxiv.org/html wraps the LaTeXML article in a modal / nav / TOC /
+    infobox; all of that sits inside <body> but outside
+    <article class="ltx_document">. Parser must drop it."""
+    html = (
+        "<html><body>"
+        '<dialog><button>×</button><label>Title:</label></dialog>'
+        '<header><nav><a>Back to arXiv</a><a>Report Issue</a></nav></header>'
+        '<nav class="ltx_TOC"><ol><li>1 Introduction</li></ol></nav>'
+        '<div class="infobox">License: CC BY 4.0</div>'
+        '<article class="ltx_document">'
+        '<section class="ltx_section"><h2 class="ltx_title ltx_title_section">Paper</h2>'
+        '<p>real paper body.</p>'
+        "</section></article>"
+        '<footer>arXiv:2604.15484v1</footer>'
+        "</body></html>"
+    )
+    paper = parse(html, base_url="https://arxiv.org/html/2604.15484/")
+    assert "real paper body" in paper.markdown
+    assert "Back to arXiv" not in paper.markdown
+    assert "Report Issue" not in paper.markdown
+    assert "Title:" not in paper.markdown
+    assert "License: CC BY 4.0" not in paper.markdown
+    assert "arXiv:2604.15484v1" not in paper.markdown
+
+
+def test_parser_falls_back_to_body_when_no_ltx_document_article() -> None:
+    """ar5iv and minimal fixtures don't wrap content in
+    <article class="ltx_document">. Falling back to <body> preserves
+    compatibility."""
+    html = (
+        "<html><body>"
+        '<section class="ltx_section"><h2 class="ltx_title ltx_title_section">'
+        "Only</h2><p>body text.</p></section>"
+        "</body></html>"
+    )
+    paper = parse(html, base_url="https://example.com/")
+    assert "# Only" in paper.markdown
+    assert "body text" in paper.markdown
+
+
+# --- module import hygiene ---
+
+
 def test_module_does_not_import_heavy_deps() -> None:
     """Parser is pure: no ML, no DB, no HTTP clients.
 

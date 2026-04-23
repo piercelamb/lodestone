@@ -85,12 +85,24 @@ def parse(html: str, base_url: str) -> ParsedPaper:
     ``resolve_entities`` kwarg (that's for the XML parser), and it does not
     resolve external entities in HTML mode anyway — so these two flags are the
     full XXE/DoS hardening surface for this module.
+
+    Scope: prefer ``<article class="ltx_document">`` when present (the
+    arxiv.org/html wrapper page adds modal dialogs, nav chrome, a flattened
+    TOC, and a license infobox *around* the article — none of that belongs in
+    the paper markdown). Fall back to ``<body>`` for ar5iv / test fixtures
+    that don't wrap in an article.
     """
     parser = lxml.html.HTMLParser(no_network=True, huge_tree=False)
     root = lxml.html.fromstring(html, parser=parser)
     state = _State(base_url=base_url)
-    bodies = root.xpath(".//body")
-    target = bodies[0] if bodies else root
+    target = None
+    for art in root.iter("article"):
+        if "ltx_document" in _classes(art):
+            target = art
+            break
+    if target is None:
+        bodies = root.xpath(".//body")
+        target = bodies[0] if bodies else root
     markdown = _convert(target, state)
     markdown = _postprocess(markdown)
     return ParsedPaper(markdown=markdown, figures=state.figures)
