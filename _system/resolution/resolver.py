@@ -369,7 +369,7 @@ def _tier5(
         return fallback
 
     conn.execute("RELEASE tier5")
-    _log.info(
+    _log.debug(
         "tier5 new canonical: raw=%r scope=(%s,%s,%s) term_id=%s",
         raw, domain, term_type, entity_type, term_id,
     )
