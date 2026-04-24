@@ -1,12 +1,13 @@
-"""Pre-flight check: ``claude`` CLI + HF-cached ML models.
+"""Pre-flight check: LLM provider + HF-cached ML models.
 
-Invoked by ``ingest.py`` before any pipeline work. Confirms that the
-``claude`` CLI is on PATH and that the two ML models used downstream
-(``BAAI/bge-small-en-v1.5`` for the resolver, ``fastino/gliner2-base-v1``
-for entity extraction) are present in the HuggingFace cache. First
-runs transparently populate the cache; download failures surface with
-enough context (cache path + ``hf hub download`` hint) that the user
-can recover manually.
+Invoked by ``ingest.py`` before any pipeline work. Confirms that an LLM
+provider (Anthropic / OpenAI / Gemini) is configured via
+``~/.config/lodestone/config.toml`` and matching env var, and that the
+two ML models used downstream (``BAAI/bge-small-en-v1.5`` for the
+resolver, ``fastino/gliner2-base-v1`` for entity extraction) are present
+in the HuggingFace cache. First runs transparently populate the cache;
+download failures surface with enough context (cache path + ``hf hub
+download`` hint) that the user can recover manually.
 
 Uses ``huggingface_hub.snapshot_download`` rather than instantiating the
 models themselves: confirming cache presence does not require importing
@@ -16,9 +17,9 @@ discarded.
 """
 from __future__ import annotations
 
-import shutil
 from enum import StrEnum
 
+from _system.llm import resolve_provider
 from _system.utils.logging import get_logger
 
 _LOG = get_logger("scripts.validate_models")
@@ -29,16 +30,6 @@ class ModelId(StrEnum):
 
     BGE = "BAAI/bge-small-en-v1.5"
     GLINER2 = "fastino/gliner2-base-v1"
-
-
-_CLAUDE_INSTALL_HINT = (
-    "claude CLI not found on PATH — install via `brew install claude-code` "
-    "or see https://docs.claude.com/en/docs/claude-code/setup"
-)
-
-
-class ClaudeCLIMissing(RuntimeError):
-    """Raised when the ``claude`` CLI is not on PATH."""
 
 
 class ModelLoadError(RuntimeError):
@@ -61,25 +52,29 @@ def _check_model(model_id: ModelId) -> None:
 
 
 def check_models() -> str:
-    """Assert ``claude`` CLI present and both ML models cached.
+    """Assert provider configured and both ML models cached.
 
-    Returns the resolved path to the ``claude`` CLI. Raises
-    :class:`ClaudeCLIMissing` if the CLI is not on PATH, or
-    :class:`ModelLoadError` if either ML model is uncached and cannot
-    be downloaded.
+    Returns the resolved provider name (string). Raises
+    :class:`_system.llm.ProviderConfigError` subclasses if no provider can
+    be selected, or :class:`ModelLoadError` if either ML model is
+    uncached and cannot be downloaded.
     """
-    claude_path = shutil.which("claude")
-    if claude_path is None:
-        raise ClaudeCLIMissing(_CLAUDE_INSTALL_HINT)
-    _LOG.info("claude CLI present: %s", claude_path)
+    resolved = resolve_provider()
+    _LOG.info(
+        "provider configured: %s (model=%s)",
+        resolved.provider.value, resolved.model,
+    )
     _check_model(ModelId.BGE)
     _check_model(ModelId.GLINER2)
-    return claude_path
+    return resolved.provider.value
 
 
 def main() -> None:
-    claude_path = check_models()
-    print(f"claude CLI: {claude_path}")
+    provider_name = check_models()
+    # Reload to surface the resolved model alongside the provider name.
+    resolved = resolve_provider()
+    print(f"provider: {provider_name}")
+    print(f"model: {resolved.model}")
     print(f"{ModelId.BGE}: present")
     print(f"{ModelId.GLINER2}: present")
 

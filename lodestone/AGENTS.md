@@ -59,8 +59,34 @@ uv run _system/scripts/ingest.py --url <arxiv_url_or_id> [--force] [--domain <sl
 
 Pipeline stages, in order: `fetch → convert → classify → extract →
 index`. Pre-flight (`validate_models.check_models`) runs first —
-missing `claude` CLI or uncached HF models fail fast before any DB
+unresolved LLM provider or uncached HF models fail fast before any DB
 write.
+
+### Provider configuration
+
+Classify calls one of three LLM providers directly via its SDK:
+Anthropic, OpenAI, or Gemini. Structured output is enforced
+provider-side (tool_use / `response_format=json_schema` /
+`responseSchema`), so the model cannot return malformed JSON.
+
+Provider selection is resolved by `_system.llm.resolve_provider()` in
+this order:
+
+1. `~/.config/lodestone/config.toml` (XDG user config dir):
+   ```toml
+   [llm]
+   provider = "anthropic"       # one of: anthropic | openai | gemini
+   model = "claude-opus-4-7"    # optional; per-provider default applies
+   ```
+   If the config selects a provider whose env var is not set, pre-flight
+   raises `ProviderKeyMissing` naming the var.
+2. No config — inspect env vars:
+   - Exactly one of `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
+     `GEMINI_API_KEY` set → use it and persist the choice.
+   - Multiple set in a TTY → interactive numbered-menu prompt, persist
+     the pick.
+   - Multiple set in non-TTY → raise `ProviderAmbiguous`.
+   - None set → raise `ProviderUnconfigured`.
 
 ## Key semantics
 
@@ -101,3 +127,7 @@ uv run _system/scripts/create_domain.py --name <slug> --description "..."
 - Do not bypass `ingest.py`'s `--force` and manually DELETE rows — the
   cascade order matters (FTS5 has no FK cascade; getting the order
   wrong trips `FOREIGN KEY constraint failed`).
+- Do not hand-edit `~/.config/lodestone/config.toml` to a provider
+  whose API key is not exported — pre-flight raises rather than
+  silently falling back. Either export the key or delete the file to
+  re-trigger env-based selection.

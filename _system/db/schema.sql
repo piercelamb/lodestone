@@ -7,6 +7,13 @@ CREATE TABLE IF NOT EXISTS domains (
     description TEXT
 );
 
+CREATE TABLE IF NOT EXISTS collections (
+    domain TEXT NOT NULL REFERENCES domains(name),
+    name TEXT NOT NULL,
+    description TEXT,
+    PRIMARY KEY(domain, name)
+);
+
 CREATE TABLE IF NOT EXISTS papers (
     id INTEGER PRIMARY KEY,
     arxiv_id TEXT UNIQUE NOT NULL,
@@ -152,3 +159,16 @@ CREATE TABLE IF NOT EXISTS paper_topics (
     topic TEXT NOT NULL,
     PRIMARY KEY(paper_id, topic)
 );
+
+-- ============================================================
+-- GROUP 5: ONE-SHOT BACKFILL
+-- ============================================================
+-- Register collections already implied by classified papers so the
+-- first-class `collections` table matches reality on any database that
+-- predates it. Idempotent: INSERT OR IGNORE is a no-op once each
+-- (domain, collection) pair exists. Descriptions land NULL for these
+-- legacy rows — classify_paper fills them in when the LLM proposes new.
+INSERT OR IGNORE INTO collections (domain, name, description)
+SELECT DISTINCT domain, collection, NULL
+  FROM papers
+ WHERE domain IS NOT NULL AND collection IS NOT NULL;

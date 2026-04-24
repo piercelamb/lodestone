@@ -203,30 +203,44 @@ class TestClassificationOutput:
         payload = {
             "domain": "nlp",
             "domain_is_new": False,
+            "domain_description": None,
             "collection": "transformers",
+            "collection_description": None,
             "topics": ["attention", "pretraining"],
         }
         co = ClassificationOutput.model_validate(payload)
         assert co.domain == "nlp"
         assert co.domain_is_new is False
+        assert co.domain_description is None
         assert co.collection == "transformers"
+        assert co.collection_description is None
         assert co.topics == ["attention", "pretraining"]
 
-    def test_accepts_domain_is_new_true_with_empty_topics(self):
+    def test_accepts_domain_is_new_true_with_description_and_empty_topics(self):
         payload = {
             "domain": "new-field",
             "domain_is_new": True,
+            "domain_description": "A new research area.",
             "collection": "c",
+            "collection_description": "A new cluster of work.",
             "topics": [],
         }
         co = ClassificationOutput.model_validate(payload)
         assert co.domain_is_new is True
+        assert co.domain_description == "A new research area."
+        assert co.collection_description == "A new cluster of work."
         assert co.topics == []
 
     def test_rejects_missing_domain(self):
         with pytest.raises(ValidationError):
             ClassificationOutput.model_validate(
-                {"domain_is_new": False, "collection": "c", "topics": []}
+                {
+                    "domain_is_new": False,
+                    "domain_description": None,
+                    "collection": "c",
+                    "collection_description": None,
+                    "topics": [],
+                }
             )
 
     def test_forbids_extras(self):
@@ -235,7 +249,9 @@ class TestClassificationOutput:
                 {
                     "domain": "nlp",
                     "domain_is_new": False,
+                    "domain_description": None,
                     "collection": "c",
+                    "collection_description": None,
                     "topics": [],
                     "confidence": 0.9,
                 }

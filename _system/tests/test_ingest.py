@@ -540,7 +540,7 @@ def test_cli_requires_url():
 
 
 def test_cli_db_override_is_used(tmp_path, monkeypatch, patched_stages):
-    monkeypatch.setattr(ingest, "check_models", lambda: "claude")
+    monkeypatch.setattr(ingest, "check_models", lambda: "anthropic")
     db_path = tmp_path / "custom.db"
 
     # Capture stdout to avoid polluting test output.
@@ -558,7 +558,7 @@ def test_cli_db_override_is_used(tmp_path, monkeypatch, patched_stages):
 def test_cli_domain_override_threaded_to_fetch_and_classify(
     tmp_path, monkeypatch, patched_stages
 ):
-    monkeypatch.setattr(ingest, "check_models", lambda: "claude")
+    monkeypatch.setattr(ingest, "check_models", lambda: "anthropic")
     db_path = tmp_path / "domain.db"
     ingest.main([
         "--url", "2301.99998",
