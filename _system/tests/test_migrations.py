@@ -10,6 +10,7 @@ from _system.db.migrations import init_db
 
 EXPECTED_TABLES = {
     "domains",
+    "collections",
     "papers",
     "figures",
     "page_images",
@@ -40,7 +41,7 @@ def _user_tables(conn: sqlite3.Connection) -> set[str]:
 
 # Plain (non-virtual) tables — support row-count queries directly.
 _PLAIN_TABLES = {
-    "domains", "papers", "figures", "page_images",
+    "domains", "collections", "papers", "figures", "page_images",
     "canonical_terms", "term_aliases", "entities", "paper_topics",
 }
 
@@ -139,6 +140,40 @@ def test_entities_uniqueness(conn):
         "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (1, "ml", "paper_1", "Transformer", "method", "# Method", "d2"),
     )
+
+
+def test_init_db_backfills_collections_from_legacy_papers(conn):
+    """Papers predating the `collections` table must be registered by `init_db`.
+
+    Simulates an old database: a paper already has a (domain, collection)
+    pair but no row in `collections`. `init_db` runs its one-shot backfill
+    (``INSERT OR IGNORE INTO collections SELECT DISTINCT ...``) and the
+    pair should appear.
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO domains (name) VALUES (?)", ("rag",)
+    )
+    conn.execute(
+        "INSERT INTO papers (arxiv_id, paper_name, title, authors, date, abstract, "
+        "domain, collection, content_hash, pdf_url, ingested_at, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("2401.00001", "legacy_paper", "t", "[]", "2026-04-20", "a",
+         "rag", "hierarchical indexing", "h", "http://x",
+         "2026-04-20T00:00:00", "classified"),
+    )
+    # Drop the backfilled row the fixture already created (if any) to prove
+    # init_db is what puts it back.
+    conn.execute("DELETE FROM collections")
+
+    init_db(conn)
+
+    row = conn.execute(
+        "SELECT domain, name, description FROM collections "
+        " WHERE domain = ? AND name = ?",
+        ("rag", "hierarchical indexing"),
+    ).fetchone()
+    assert row is not None
+    assert row[2] is None  # legacy rows land with NULL description
 
 
 def test_papers_raw_html_accepts_large_payload(conn):

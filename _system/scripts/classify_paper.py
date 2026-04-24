@@ -1,29 +1,32 @@
 """Single-LLM classification pass for one paper.
 
-This is the **only** subprocess/LLM call in the ingest pipeline. Every other
-stage is deterministic code or local inference.
+This is the **only** LLM call in the ingest pipeline. Every other stage is
+deterministic code or local inference.
 
-Shape of the call:
+The call goes through :mod:`_system.llm` which dispatches to one of three
+provider SDKs (Anthropic, OpenAI, Gemini) based on the user's
+``~/.config/lodestone/config.toml`` and environment. Structured output is
+enforced provider-side (tool_use, response_format=json_schema,
+responseSchema) so the LLM cannot return malformed JSON.
 
-    subprocess.run(
-        ["claude", "-p", "--bare", "--output-format", "json"],
-        input=prompt_bytes,
-        shell=False,
-        timeout=180,
-        check=False,
-    )
+Prompt assets live at ``_system/llm/prompts/classify_paper/``:
+``system.md``, ``user.md`` (with ``{EXISTING_TAXONOMY}`` /
+``{PAPER_CONTENT}`` placeholders), and ``response.json`` (schema with
+a ``DOMAIN_INDEX_ENUM`` runtime-replaced sentinel for the index-replace
+pattern).
 
-The prompt is built from the arxiv-supplied abstract plus the paper's
-introduction (located via the shared section splitter). Existing domains and
-per-domain collection usage are included as context so the LLM prefers
-reusing a canonical label over inventing a new one.
+Domain selection uses *index-replace*: the LLM picks an integer index
+into the runtime-supplied ``existing_domains`` list (or ``-1`` to
+propose a new one). This is cheaper than regenerating a free-form
+string, eliminates typos, and stays strict-mode compatible with all
+three providers' structured-output modes. Collection and topics remain
+free strings — they depend on the chosen domain / are unbounded, so the
+5-tier term resolver still canonicalizes them.
 
-On success we resolve ``collection`` and every ``topic`` through the shared
-5-tier term resolver (Section 4) and write the canonical names. On a proposed
-new domain we sanitize the name and auto-insert it with ``needs_review=1`` on
-the *paper* row (the ``domains`` table has no per-row review flag — only
-``papers.needs_review`` exists in the schema, so that's where the signal
-lives until a human reviews via ``search.py --needs-review``).
+On success we resolve ``collection`` and every ``topic`` through the
+shared 5-tier term resolver (Section 4) and write the canonical names.
+On a proposed new domain we sanitize the name and auto-insert it with
+``needs_review=1`` on the *paper* row.
 """
 from __future__ import annotations
 
@@ -31,53 +34,41 @@ import argparse
 import json
 import re
 import sqlite3
-import subprocess
 from pathlib import Path
 from typing import Iterable, NamedTuple
 
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
-
 from _system.db.connection import get_conn, transaction
-from _system.schemas.paper_metadata import PaperStatus, can_run_from
-from _system.schemas.taxonomy import ClassificationOutput
-from _system.resolution.resolver import resolve
+from _system.llm import call_structured, load_prompt
 from _system.resolution.embeddings import Embedder
+from _system.resolution.resolver import resolve
+from _system.schemas.paper_metadata import PaperStatus, can_run_from
+from _system.schemas.taxonomy import ClassificationLLMOutput, ClassificationOutput
 from _system.utils.logging import get_logger
-from _system.utils.sections import split_sections, strip_breadcrumb
 
 _LOG = get_logger("scripts.classify_paper")
 
-CLAUDE_ARGV: tuple[str, ...] = ("claude", "-p", "--bare", "--output-format", "json")
-
-_SUBPROCESS_TIMEOUT_S = 180
-_INTRO_MAX_CHARS = 8000
+_PAPER_CONTENT_MAX_CHARS = 8000
+# Display cap on collections per domain. Purely a prompt-size budget —
+# overflow surfaces as a sibling leaf that nudges the LLM to propose new
+# rather than guess at hidden entries.
 _COLLECTIONS_PER_DOMAIN_LIMIT = 30
-_HEAD_BYTES_CAP = 2048
 _DOMAIN_MAX_LEN = 32
-
-_INTRO_TITLES: tuple[str, ...] = ("introduction", "overview", "background")
 
 _WS_OR_SLASH_RE = re.compile(r"[\s/]+")
 _DOMAIN_ALLOWED_RE = re.compile(r"[^a-z0-9_-]")
-
-_AUTO_DOMAIN_DESCRIPTION = "(auto-created by classify_paper; review and edit)"
 
 
 class ClassifyError(Exception):
     """Base class for classify_paper failures."""
 
 
-class ClassifySubprocessError(ClassifyError):
-    """`claude` CLI exited non-zero or timed out."""
+class ClassifyLLMError(ClassifyError):
+    """The LLM call failed (transport, auth, schema, or bad index).
 
-
-class ClassifyEnvelopeError(ClassifyError):
-    """stdout JSON is missing the `structured_output` key."""
+    Wraps :class:`_system.llm.errors.LLMError` subclasses raised from
+    inside the dispatch layer, plus index-range validation we perform
+    after the call.
+    """
 
 
 class ClassifyStateError(ClassifyError):
@@ -102,12 +93,7 @@ class ClassifyResult(NamedTuple):
 
 
 class _DomainDecision(NamedTuple):
-    """Pure-function output of `_choose_domain`; no DB side effects.
-
-    ``insert_new`` is True when the decision requires inserting a new row
-    into ``domains`` — caller writes it inside the transaction so a later
-    failure rolls it back together with the paper_topics / papers writes.
-    """
+    """Pure-function output of `_choose_domain`; no DB side effects."""
 
     name: str
     insert_new: bool
@@ -120,24 +106,19 @@ def classify(
     conn: sqlite3.Connection,
     force: bool = False,
     domain_override: str | None = None,
-    run_subprocess=None,
+    call_llm=None,
     embedder: Embedder | None = None,
 ) -> ClassifyResult:
     """Run the single-LLM classification pass for one paper.
 
-    Pre-conditions: papers row exists with status >= CONVERTED (and not
-    FAILED_HTML). Post-conditions: papers.{domain, collection, needs_review,
-    status=CLASSIFIED} updated; paper_topics rebuilt; new domain inserted if
-    needed. Raises on all failure modes.
+    ``call_llm`` is a test seam. Production leaves it ``None`` and the
+    module-level :func:`_call_llm_default` dispatches through
+    :func:`_system.llm.call_structured`. Its signature is::
 
-    ``force`` is accepted for orchestrator parity but does not bypass the
-    ``can_run_from`` guard — the orchestrator handles force by cascading back
-    to earlier stages, which lowers the status before classify ever runs.
-
-    ``run_subprocess`` is a test seam. Production callers leave it as None,
-    and the module-level retrying subprocess runner is used.
+        call_llm(system: str, user: str, schema: dict,
+                 response_model: type[T]) -> T
     """
-    del force  # see docstring
+    del force  # see docstring on orchestrator parity
 
     row = conn.execute(
         """
@@ -170,34 +151,42 @@ def classify(
             f"{status_str!r}{extra}"
         )
 
-    intro_text = _extract_intro(markdown or "", paper_name=paper_name)
+    paper_content = _head_slice_paper_content(
+        markdown=markdown or "", abstract=abstract or ""
+    )
     del markdown
 
     existing_domains = _load_domains(conn)
     existing_domain_names = {d[0] for d in existing_domains}
-    collections_by_domain = _load_collections_by_domain(conn)
+    collections_by_domain, overflow = _truncate_collections(
+        _load_collections_by_domain(conn)
+    )
+    max_collections = max(
+        (len(colls) for colls in collections_by_domain.values()), default=0
+    )
 
-    prompt = _build_prompt(
-        abstract=abstract or "",
-        intro_text=intro_text,
-        domains=existing_domains,
-        collections_by_domain=collections_by_domain,
+    loaded = load_prompt(
+        "classify_paper",
+        md_context={
+            "EXISTING_TAXONOMY": _render_taxonomy_tree(
+                existing_domains, collections_by_domain, overflow
+            ),
+            "PAPER_CONTENT": paper_content,
+        },
+        schema_replacements={
+            "DOMAIN_INDEX_ENUM": [-1, *range(len(existing_domains))],
+            "COLLECTION_INDEX_ENUM": [-1, *range(max_collections)],
+        },
     )
 
     # Fresh terms miss tiers 1-4 and need an Embedder for tier 5.
     if embedder is None:
         embedder = Embedder()
 
-    runner = run_subprocess or _run_claude_cli
-    envelope = runner(prompt)
+    runner = call_llm or _call_llm_default
+    raw = runner(loaded.system, loaded.user, loaded.schema, ClassificationLLMOutput)
 
-    structured = envelope.get("structured_output")
-    if structured is None:
-        raise ClassifyEnvelopeError(
-            f"paper_name={paper_name!r}: envelope missing 'structured_output'; "
-            f"envelope head={str(envelope)[:_HEAD_BYTES_CAP]!r}"
-        )
-    output = ClassificationOutput.model_validate(structured)
+    output = _resolve_raw(raw, existing_domains, collections_by_domain)
 
     decision = _choose_domain(
         proposed=output.domain,
@@ -208,12 +197,21 @@ def classify(
 
     with transaction(conn):
         if decision.insert_new:
+            # LLM description applies only when the LLM actually proposed
+            # this domain. With --domain-override the operator picked a
+            # different name, so any LLM description is about a different
+            # research area — store NULL and let the operator fill it in.
+            new_description = (
+                output.domain_description
+                if output.domain_is_new and domain_override is None
+                else None
+            )
             conn.execute(
                 """
                 INSERT OR IGNORE INTO domains (name, description)
                 VALUES (?, ?)
                 """,
-                (decision.name, _AUTO_DOMAIN_DESCRIPTION),
+                (decision.name, new_description),
             )
 
         conn.execute("DELETE FROM paper_topics WHERE paper_id = ?", (paper_id,))
@@ -225,6 +223,24 @@ def classify(
             term_type="collection",
             source_paper=paper_name,
             embedder=embedder,
+        )
+
+        # Register the (domain, collection) pair in the first-class table.
+        # INSERT OR IGNORE is a no-op when the resolver canonicalized to an
+        # already-registered collection; in that case we keep the existing
+        # description rather than overwriting with whatever the LLM wrote
+        # for a name it thought was novel. A genuinely new collection
+        # lands with the LLM's description attached.
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO collections (domain, name, description)
+            VALUES (?, ?, ?)
+            """,
+            (
+                decision.name,
+                collection_hit.canonical_name,
+                output.collection_description,
+            ),
         )
 
         seen_term_ids: set[int] = set()
@@ -286,57 +302,156 @@ def classify(
 
 
 # ---------------------------------------------------------------------------
-# Intro extraction
+# LLM call
 # ---------------------------------------------------------------------------
 
 
-def _extract_intro(markdown: str, *, paper_name: str) -> str:
-    """Pick the best introduction-ish section from ``markdown``.
+def _call_llm_default(
+    system: str, user: str, schema: dict, response_model
+):
+    """Production runner: delegate to the dispatch layer.
 
-    Preference order: "Introduction" > "Overview" > "Background" > first
-    level-1 section. When the markdown has no headers at all, returns an
-    empty string and logs a warning — the caller still builds a prompt from
-    the abstract alone.
+    Separating this from ``call_structured`` keeps the test seam narrow
+    (tests inject any callable with this signature) while leaving the
+    dispatch layer free to handle retry + provider resolution.
     """
-    if not markdown.strip():
-        _LOG.warning(
-            "paper_name=%s has empty markdown; falling back to abstract-only prompt",
-            paper_name,
-        )
-        return ""
-
-    chunks = split_sections(markdown)
-    if not chunks:
-        _LOG.warning(
-            "paper_name=%s markdown has no '#' headers; falling back to "
-            "abstract-only prompt",
-            paper_name,
-        )
-        return ""
-
-    by_title: dict[str, str] = {}
-    first_level_one_body: str | None = None
-    for chunk in chunks:
-        title_key = chunk.title.strip().lower()
-        if title_key in _INTRO_TITLES and title_key not in by_title:
-            by_title[title_key] = chunk.body
-        if first_level_one_body is None and chunk.level == 1:
-            first_level_one_body = chunk.body
-
-    for title in _INTRO_TITLES:
-        body = by_title.get(title)
-        if body is not None:
-            return strip_breadcrumb(body)[:_INTRO_MAX_CHARS]
-
-    if first_level_one_body is not None:
-        return strip_breadcrumb(first_level_one_body)[:_INTRO_MAX_CHARS]
-
-    _LOG.warning(
-        "paper_name=%s markdown has headers but no level-1 or intro-like "
-        "section; falling back to abstract-only prompt",
-        paper_name,
+    return call_structured(
+        system=system,
+        user=user,
+        schema=schema,
+        response_model=response_model,
     )
-    return ""
+
+
+# ---------------------------------------------------------------------------
+# Resolve raw → output
+# ---------------------------------------------------------------------------
+
+
+def _resolve_raw(
+    raw: ClassificationLLMOutput,
+    existing_domains: list[tuple[str, str | None]],
+    collections_by_domain: dict[str, list[tuple[str, str | None]]],
+) -> ClassificationOutput:
+    """Translate the index-based LLM output to a name-based pipeline shape.
+
+    Domain: ``-1`` → propose new; ``0..N-1`` → existing.
+    Collection: ``-1`` → propose new; ``0..M-1`` → lookup in the truncated
+    collection list for the chosen domain.
+
+    Cross-field rules the schema enum cannot express are enforced here:
+
+    - domain_index out of ``[-1, N-1]`` → :class:`ClassifyLLMError`
+    - domain_index == -1 but proposed_new_domain_description empty → raise
+    - domain_index >= 0 but proposed_new_domain_description non-empty → raise
+      (LLM is writing a description for a domain it didn't propose)
+    - collection_index >= 0 while domain_index == -1 (new domain has no
+      existing collections) → raise
+    - collection_index >= 0 but out of range for the chosen domain's
+      collections → raise
+    - collection_index == -1 but proposed_new_collection empty → raise
+    """
+    if raw.domain_index == -1:
+        domain_name = raw.proposed_new_domain
+        domain_is_new = True
+        domain_description: str | None = raw.proposed_new_domain_description.strip()
+        if not domain_description:
+            raise ClassifyLLMError(
+                "LLM returned domain_index=-1 but "
+                "proposed_new_domain_description is empty; new domains "
+                "must include a one-sentence description of the research area"
+            )
+    elif 0 <= raw.domain_index < len(existing_domains):
+        domain_name = existing_domains[raw.domain_index][0]
+        domain_is_new = False
+        if raw.proposed_new_domain_description.strip():
+            raise ClassifyLLMError(
+                f"LLM picked existing domain_index={raw.domain_index} but "
+                f"also set proposed_new_domain_description="
+                f"{raw.proposed_new_domain_description!r}; description "
+                f"must be empty unless domain_index == -1"
+            )
+        domain_description = None
+    else:
+        raise ClassifyLLMError(
+            f"LLM returned domain_index={raw.domain_index} outside "
+            f"[-1, {len(existing_domains) - 1}]; schema enum was supposed "
+            f"to make this impossible"
+        )
+
+    if raw.collection_index == -1:
+        proposed = raw.proposed_new_collection.strip()
+        if not proposed:
+            raise ClassifyLLMError(
+                "LLM returned collection_index=-1 but "
+                "proposed_new_collection is empty"
+            )
+        collection_name = proposed
+        collection_description: str | None = (
+            raw.proposed_new_collection_description.strip()
+        )
+        if not collection_description:
+            raise ClassifyLLMError(
+                "LLM returned collection_index=-1 but "
+                "proposed_new_collection_description is empty; new "
+                "collections must include a one-sentence description"
+            )
+    elif raw.collection_index >= 0:
+        if domain_is_new:
+            raise ClassifyLLMError(
+                f"LLM proposed new domain={domain_name!r} but set "
+                f"collection_index={raw.collection_index}; new domains have "
+                f"no existing collections — collection_index must be -1"
+            )
+        domain_colls = collections_by_domain.get(domain_name, [])
+        if raw.collection_index >= len(domain_colls):
+            raise ClassifyLLMError(
+                f"LLM returned collection_index={raw.collection_index} "
+                f"for domain={domain_name!r}, which has "
+                f"{len(domain_colls)} collection(s) — index out of range"
+            )
+        collection_name = domain_colls[raw.collection_index][0]
+        if raw.proposed_new_collection_description.strip():
+            raise ClassifyLLMError(
+                f"LLM picked existing collection_index={raw.collection_index} "
+                f"but also set proposed_new_collection_description="
+                f"{raw.proposed_new_collection_description!r}; description "
+                f"must be empty unless collection_index == -1"
+            )
+        collection_description = None
+    else:
+        raise ClassifyLLMError(
+            f"LLM returned collection_index={raw.collection_index} outside "
+            f"[-1, max); schema enum was supposed to make this impossible"
+        )
+
+    return ClassificationOutput(
+        domain=domain_name,
+        domain_is_new=domain_is_new,
+        domain_description=domain_description,
+        collection=collection_name,
+        collection_description=collection_description,
+        topics=raw.topics,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Paper content head-slice
+# ---------------------------------------------------------------------------
+
+
+def _head_slice_paper_content(*, markdown: str, abstract: str) -> str:
+    """Return up to ~8K chars of paper content for classification.
+
+    The head of the markdown naturally contains title + abstract + start of
+    introduction — everything the LLM needs to pick a domain/collection/topics.
+    If markdown is missing (stale row, upstream conversion skipped), fall back
+    to the abstract column alone.
+    """
+    stripped = markdown.strip()
+    if stripped:
+        return stripped[:_PAPER_CONTENT_MAX_CHARS]
+    return abstract.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -353,151 +468,118 @@ def _load_domains(conn: sqlite3.Connection) -> list[tuple[str, str | None]]:
 
 def _load_collections_by_domain(
     conn: sqlite3.Connection,
-) -> dict[str, list[str]]:
-    """Per-domain collections ordered by descending usage count.
+) -> dict[str, list[tuple[str, str | None]]]:
+    """Return ``{domain: [(name, description), ...]}`` ordered by popularity.
 
-    Only collections with at least one paper appear. Domains with *no* used
-    collections are simply absent from the dict — the prompt builder handles
-    that gracefully.
+    Source of truth is the first-class ``collections`` table; paper count
+    is computed via LEFT JOIN so empty collections (registered but with
+    no papers yet) still appear — that's the whole point of first-classing
+    collections. Most-used collections rank first so the LLM sees the
+    heavy hitters at the top of each domain.
     """
     rows = conn.execute(
         """
-        SELECT domain, collection, COUNT(*) AS c
-          FROM papers
-         WHERE collection IS NOT NULL AND domain IS NOT NULL
-         GROUP BY domain, collection
-         ORDER BY domain, c DESC, collection
+        SELECT c.domain, c.name, c.description, COUNT(p.id) AS paper_count
+          FROM collections c
+          LEFT JOIN papers p
+            ON p.domain = c.domain AND p.collection = c.name
+         GROUP BY c.domain, c.name, c.description
+         ORDER BY c.domain, paper_count DESC, c.name
         """
     ).fetchall()
-    result: dict[str, list[str]] = {}
-    for domain, collection, _count in rows:
-        result.setdefault(domain, []).append(collection)
+    result: dict[str, list[tuple[str, str | None]]] = {}
+    for domain, name, description, _count in rows:
+        result.setdefault(domain, []).append((name, description))
     return result
 
 
 # ---------------------------------------------------------------------------
-# Prompt
+# Prompt rendering
 # ---------------------------------------------------------------------------
 
 
-def _build_prompt(
-    *,
-    abstract: str,
-    intro_text: str,
-    domains: list[tuple[str, str | None]],
-    collections_by_domain: dict[str, list[str]],
-) -> str:
-    """Assemble the classification prompt.
+def _truncate_collections(
+    raw: dict[str, list[tuple[str, str | None]]],
+) -> tuple[dict[str, list[tuple[str, str | None]]], dict[str, int]]:
+    """Cap each domain's collections at ``_COLLECTIONS_PER_DOMAIN_LIMIT``.
 
-    The JSON schema stub mirrors ``ClassificationOutput`` exactly — any drift
-    here risks validation errors that a retry cannot fix.
+    Returns ``(truncated, overflow)`` where ``overflow[domain]`` is the
+    count of hidden collections for that domain (``0`` when nothing was
+    truncated; absent when the domain had no collections at all). The
+    truncated view is what both the tree renderer and ``_resolve_raw``
+    should use, so index labels and index→name lookup stay consistent.
     """
-    schema_block = (
-        "Return JSON matching this schema:\n"
-        "{\n"
-        '  "domain": "...",\n'
-        '  "domain_is_new": true|false,\n'
-        '  "collection": "...",\n'
-        '  "topics": ["...", "..."]\n'
-        "}"
-    )
-
-    domain_lines: list[str] = []
-    if domains:
-        for name, description in domains:
-            if description:
-                domain_lines.append(f"- {name}: {description}")
-            else:
-                domain_lines.append(f"- {name}")
-    else:
-        domain_lines.append("(none yet — propose a new domain)")
-    domain_block = "Existing domains:\n" + "\n".join(domain_lines)
-
-    collection_lines: list[str] = []
-    for name, _desc in domains:
-        colls = collections_by_domain.get(name, [])
-        if not colls:
-            collection_lines.append(f"{name}: []")
-            continue
+    truncated: dict[str, list[tuple[str, str | None]]] = {}
+    overflow: dict[str, int] = {}
+    for domain, colls in raw.items():
         if len(colls) > _COLLECTIONS_PER_DOMAIN_LIMIT:
-            shown = colls[:_COLLECTIONS_PER_DOMAIN_LIMIT]
-            more = len(colls) - _COLLECTIONS_PER_DOMAIN_LIMIT
-            collection_lines.append(
-                f"{name}: [{', '.join(shown)}] "
-                f"(+ {more} more; feel free to propose new)"
-            )
+            truncated[domain] = list(colls[:_COLLECTIONS_PER_DOMAIN_LIMIT])
+            overflow[domain] = len(colls) - _COLLECTIONS_PER_DOMAIN_LIMIT
         else:
-            collection_lines.append(f"{name}: [{', '.join(colls)}]")
-    collection_block = "Existing collections within each domain:\n" + "\n".join(
-        collection_lines
-    )
-
-    intro_section = (
-        f"Paper introduction:\n{intro_text}"
-        if intro_text
-        else "Paper introduction:\n(not available; classify from the abstract alone)"
-    )
-
-    return (
-        "You are a research librarian classifying an arxiv paper. "
-        f"{schema_block}\n\n"
-        f"{domain_block}\n\n"
-        f"{collection_block}\n\n"
-        f"Paper abstract:\n{abstract}\n\n"
-        f"{intro_section}\n\n"
-        "Classify this paper. If no existing domain fits well, propose a "
-        "new domain and set domain_is_new=true."
-    )
+            truncated[domain] = list(colls)
+    return truncated, overflow
 
 
-# ---------------------------------------------------------------------------
-# Subprocess
-# ---------------------------------------------------------------------------
+def _render_taxonomy_tree(
+    domains: list[tuple[str, str | None]],
+    collections_by_domain: dict[str, list[tuple[str, str | None]]],
+    overflow: dict[str, int] | None = None,
+) -> str:
+    """Render domains + their integer-indexed collections as a tree.
 
+    Shape::
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=8),
-    retry=retry_if_exception_type(
-        (
-            ClassifySubprocessError,
-            json.JSONDecodeError,
-            subprocess.TimeoutExpired,
-        )
-    ),
-    reraise=True,
-)
-def _run_claude_cli(prompt: str) -> dict:
-    """Run the `claude` CLI once; return the parsed JSON envelope.
+        0. rag — retrieval augmented generation
+           ├── 0: hybrid_search — dense+sparse retrieval fusion
+           └── 1: rag_systems — end-to-end retrieval + generation pipelines
+        1. agents — multi-agent systems   (no existing collections)
+        2. theorem_proving
+           ├── 0: saturation_methods
+           ├── 1: superposition
+           └── (+ 4 more exist; feel free to propose new)
 
-    Tenacity retries on subprocess errors (non-zero exit / process-level
-    failures) and JSON parse errors (genuinely flaky CLI output).
-    ``ClassifyEnvelopeError`` and ``ValidationError`` are *not* retried —
-    a structurally broken envelope is deterministic, and retrying burns
-    real LLM cost for a response that will fail identically next call.
+    Collection indices reset per domain. Domain uses ``N.`` suffix;
+    collection uses ``N:`` suffix — different punctuation plus the
+    indent + tree chars keeps the two levels unambiguous. Truncation
+    past ``_COLLECTIONS_PER_DOMAIN_LIMIT`` surfaces as a label-free
+    sibling leaf so the LLM sees more exist but can't "pick" them.
+    Descriptions for both levels are shown inline when present; NULL
+    descriptions (legacy collections backfilled from papers, or manually
+    created without one) render as just ``N: name``.
     """
-    try:
-        result = subprocess.run(
-            list(CLAUDE_ARGV),
-            input=prompt.encode("utf-8"),
-            capture_output=True,
-            shell=False,
-            timeout=_SUBPROCESS_TIMEOUT_S,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise ClassifySubprocessError(
-            "`claude` CLI not found on PATH. validate_models.check_models() "
-            "should have caught this — is ingest.py invoking it first?"
-        ) from exc
-
-    if result.returncode != 0:
-        raise ClassifySubprocessError(
-            f"claude CLI exited {result.returncode}; "
-            f"stderr head={result.stderr[:_HEAD_BYTES_CAP]!r}"
+    overflow = overflow or {}
+    if not domains:
+        return (
+            "(taxonomy is empty — propose a new domain by setting "
+            "domain_index to -1, and a new collection under it by "
+            "setting collection_index to -1)"
         )
 
-    return json.loads(result.stdout.decode("utf-8", errors="replace"))
+    lines: list[str] = []
+    for i, (name, description) in enumerate(domains):
+        colls = collections_by_domain.get(name, [])
+        head = f"{i}. {name} — {description}" if description else f"{i}. {name}"
+        if not colls:
+            lines.append(f"{head}   (no existing collections)")
+            continue
+
+        lines.append(head)
+        has_overflow = overflow.get(name, 0) > 0
+        n_leaves = len(colls) + (1 if has_overflow else 0)
+        for j, (coll_name, coll_description) in enumerate(colls):
+            connector = "└──" if j == n_leaves - 1 else "├──"
+            leaf = (
+                f"{j}: {coll_name} — {coll_description}"
+                if coll_description
+                else f"{j}: {coll_name}"
+            )
+            lines.append(f"   {connector} {leaf}")
+        if has_overflow:
+            more = overflow[name]
+            lines.append(
+                f"   └── (+ {more} more exist; feel free to propose new)"
+            )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -520,12 +602,6 @@ def _choose_domain(
     override: str | None,
     existing_domains: set[str],
 ) -> _DomainDecision:
-    """Decide the final domain name; side-effect-free.
-
-    The caller writes any ``INSERT INTO domains`` inside its transaction so
-    that a downstream failure rolls back the domain row together with the
-    paper writes.
-    """
     if override is not None:
         return _DomainDecision(
             name=override,
@@ -541,8 +617,6 @@ def _choose_domain(
                 f"proposed domain {proposed!r} sanitizes to empty string"
             )
         if sanitized in existing_domains:
-            # Already present — LLM was wrong to call it new, but it's a
-            # legit reuse. Don't flag the paper for review.
             return _DomainDecision(sanitized, insert_new=False, paper_needs_review=False)
         return _DomainDecision(sanitized, insert_new=True, paper_needs_review=True)
 
@@ -556,7 +630,7 @@ def _choose_domain(
 
 def _main(argv: Iterable[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Classify one paper via the `claude` CLI."
+        description="Classify one paper via the configured LLM provider."
     )
     parser.add_argument("--paper", required=True, help="papers.paper_name")
     parser.add_argument("--db", default="lodestone.db", help="sqlite db path")

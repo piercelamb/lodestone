@@ -1,0 +1,9 @@
+{
+  "domain_index": 0,
+  "proposed_new_domain": "",
+  "proposed_new_domain_description": "",
+  "collection_index": -1,
+  "proposed_new_collection": "hierarchical indexing",
+  "proposed_new_collection_description": "Retrieval methods that build tree- or hierarchy-shaped indices to summarize long documents.",
+  "topics": ["tree retrieval", "long-context qa"]
+}

@@ -17,6 +17,10 @@ dependencies = [
     "rapidfuzz",
     "pyyaml",
     "tenacity",
+    "anthropic",
+    "openai",
+    "google-genai",
+    "tomli-w",
 ]
 
 [dependency-groups]
