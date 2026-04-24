@@ -9,12 +9,12 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from _system.schemas.entities import EntityType
 
-# GLiNER2 expects Title-case label strings at runtime, while `EntityType`
-# stores the canonical lowercase form used everywhere else. Derive the
-# required YAML key set from the enum so the two can't drift.
-_EXPECTED_LABEL_KEYS: frozenset[str] = frozenset(
-    t.value.title() for t in EntityType
-)
+# GLiNER's training data is known to have label-case sensitivity (see the
+# model author's note on urchade/GLiNER#157). For ``fastino/gliner2-large-v1``
+# the tutorials and examples use lowercase labels (``"person"``, ``"company"``,
+# ``"medication"``), so we pass labels lowercase to match that distribution.
+# Derive the required YAML key set from the enum so the two can't drift.
+_EXPECTED_LABEL_KEYS: frozenset[str] = frozenset(t.value for t in EntityType)
 
 
 class ChunkConfig(BaseModel):

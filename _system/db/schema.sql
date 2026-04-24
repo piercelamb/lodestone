@@ -108,10 +108,24 @@ CREATE TABLE IF NOT EXISTS canonical_terms (
     id INTEGER PRIMARY KEY,
     domain TEXT NOT NULL,
     term_type TEXT NOT NULL,
+    -- For term_type='entity', entity_type (dataset/model/metric/...) is
+    -- metadata on the canonical — NOT part of its identity. GLiNER2's label
+    -- output is noisy within a paper (the same string gets labelled as
+    -- method/software/benchmark across mentions), so keying by entity_type
+    -- fragments every popular entity into 3-5 rows. entity_type holds the
+    -- currently-stored label; entity_type_score holds the GLiNER2 confidence
+    -- that established it. A later paper resolving the same canonical with
+    -- a DIFFERENT label AND a strictly higher score overturns both fields
+    -- (see resolver._maybe_flip_entity_type). This turns entity_type from
+    -- frozen-on-first-insert into mutable-under-evidence so early-paper
+    -- mislabels can be corrected by more confident later extractions.
+    -- Non-entity rows (collections/topics) carry entity_type='' and
+    -- entity_type_score=0.0; the flip path is gated on non-empty new type.
     entity_type TEXT NOT NULL DEFAULT '',
+    entity_type_score REAL NOT NULL DEFAULT 0.0,
     canonical_name TEXT NOT NULL,
     first_seen_in TEXT NOT NULL,
-    UNIQUE(domain, term_type, entity_type, canonical_name)
+    UNIQUE(domain, term_type, canonical_name)
 );
 
 CREATE INDEX IF NOT EXISTS idx_terms_domain_type ON canonical_terms(domain, term_type);

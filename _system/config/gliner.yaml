@@ -1,18 +1,24 @@
 global_threshold: 0.45
 per_label:
-  Method: 0.55
-  Dataset: 0.40
-  Metric: 0.50
-  Model: 0.55
-  Technique: 0.50
-  Benchmark: 0.45
+  method: 0.60
+  dataset: 0.40
+  metric: 0.55
+  model: 0.55
+  benchmark: 0.45
+  software: 0.50
+  system: 0.50
+  organization: 0.50
+  venue: 0.50
 chunk:
   max_tokens: 350
   overlap_tokens: 20
 label_descriptions:
-  Method: "A named technique, algorithm, or procedure proposed or used in the paper."
-  Dataset: "A named collection of training or evaluation data."
-  Metric: "A named quantitative evaluation measure."
-  Model: "A named trained model or architecture."
-  Technique: "A general-purpose technique or approach used as a building block."
-  Benchmark: "A named benchmark suite or standard evaluation setup."
+  method: "Named technique, algorithm, procedure, task, or architectural pattern. Examples: BM25, dense retrieval, reranking, fine-tuning, reciprocal rank fusion, cross-encoder."
+  dataset: "Named collection of training or evaluation data. Examples: MS MARCO, SciFact, NFCorpus, ArguAna. Exclude file formats, document references, and generic nouns like 'documents' or 'corpus'."
+  metric: "Named quantitative measure of quality or performance. Examples: NDCG@10, MRR, Recall@k, accuracy, F1, latency. Exclude hyperparameters, thresholds, and configuration values."
+  model: "Named trained model with specific weights. Examples: BGE-small, ColBERTv2, BERT, Claude Opus 4, Llama 3, ANCE. Exclude algorithms, data structures, and software libraries."
+  benchmark: "Named benchmark suite or standardized evaluation. Examples: BEIR, MTEB, GLUE, TREC-DL, CQADupStack."
+  software: "Named library, package, framework, CLI tool, or runtime. Examples: sentence-transformers, PyTorch, ONNX Runtime, tree-sitter, LangChain, FastEmbed. Exclude abstract concepts like 'pipeline' or 'agents'."
+  system: "Named database, storage engine, search service, vector store, or runtime infrastructure. Examples: SQLite, PostgreSQL, Elasticsearch, FAISS, Qdrant, Redis. Exclude database tables and file formats."
+  organization: "Named company, research lab, university, institution, or individual researcher. Examples: Google, Anthropic, BAAI, Hugging Face, Santhanam, Thakur."
+  venue: "Named academic conference, workshop, or journal. Examples: NeurIPS, SIGIR, EMNLP, ICLR, NAACL, EACL. Exclude models, metrics, and datasets."

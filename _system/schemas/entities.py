@@ -12,8 +12,11 @@ class EntityType(StrEnum):
     DATASET = "dataset"
     METRIC = "metric"
     MODEL = "model"
-    TECHNIQUE = "technique"
     BENCHMARK = "benchmark"
+    SOFTWARE = "software"
+    SYSTEM = "system"
+    ORGANIZATION = "organization"
+    VENUE = "venue"
 
 
 class Entity(BaseModel):
