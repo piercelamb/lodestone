@@ -144,10 +144,12 @@ class TestPaperMetadata:
 
 
 class TestEntityType:
-    def test_has_six_members(self):
+    def test_has_expected_members(self):
         members = list(EntityType)
-        assert len(members) == 6
-        expected = {"method", "dataset", "metric", "model", "technique", "benchmark"}
+        expected = {
+            "method", "dataset", "metric", "model", "benchmark",
+            "software", "system", "organization", "venue",
+        }
         assert {m.value for m in members} == expected
 
 

@@ -123,7 +123,7 @@ uv run _system/scripts/create_domain.py --name <slug> --description "..."
   pragmas (FK on, WAL, busy_timeout).
 - Do not `rm -rf ~/.cache/huggingface/hub` without realizing that
   `validate_models.py` will re-download `BAAI/bge-small-en-v1.5` and
-  `fastino/gliner2-base-v1` on the next ingest run. Expect latency.
+  `fastino/gliner2-large-v1` on the next ingest run. Expect latency.
 - Do not bypass `ingest.py`'s `--force` and manually DELETE rows — the
   cascade order matters (FTS5 has no FK cascade; getting the order
   wrong trips `FOREIGN KEY constraint failed`).

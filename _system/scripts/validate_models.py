@@ -4,7 +4,7 @@ Invoked by ``ingest.py`` before any pipeline work. Confirms that an LLM
 provider (Anthropic / OpenAI / Gemini) is configured via
 ``~/.config/lodestone/config.toml`` and matching env var, and that the
 two ML models used downstream (``BAAI/bge-small-en-v1.5`` for the
-resolver, ``fastino/gliner2-base-v1`` for entity extraction) are present
+resolver, ``fastino/gliner2-large-v1`` for entity extraction) are present
 in the HuggingFace cache. First runs transparently populate the cache;
 download failures surface with enough context (cache path + ``hf hub
 download`` hint) that the user can recover manually.
@@ -29,7 +29,7 @@ class ModelId(StrEnum):
     """HuggingFace repo IDs for every ML model this project depends on."""
 
     BGE = "BAAI/bge-small-en-v1.5"
-    GLINER2 = "fastino/gliner2-base-v1"
+    GLINER2 = "fastino/gliner2-large-v1"
 
 
 class ModelLoadError(RuntimeError):

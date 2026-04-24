@@ -22,13 +22,15 @@ import argparse
 import json
 import re
 import sqlite3
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, TypedDict
 
 from _system.db.connection import get_conn, transaction
+from _system.resolution.acronyms import extract_acronym_pairs
 from _system.resolution.embeddings import Embedder
 from _system.resolution.normalize import normalize_term
-from _system.resolution.resolver import resolve
+from _system.resolution.resolver import insert_acronym_alias, resolve
 from _system.schemas.entities import EntityType
 from _system.schemas.paper_metadata import PaperStatus, can_run_from
 from _system.utils.config import load_gliner_config
@@ -42,16 +44,35 @@ _DESCRIPTION_MAX_CHARS = 240
 _ACRONYM_MIN_LEN = 3
 _REJECT_RATE_WARN = 0.5
 _REJECT_RATE_WARN_MIN_SAMPLES = 10
+_ENTITY_MAX_LEN = 60
 
 _ACRONYM_ALLOWLIST: frozenset[str] = frozenset({"LM", "QA", "NN", "AI", "ML", "NLP"})
 _ENTITY_STOPLIST: frozenset[str] = frozenset(
-    {"table", "figure", "we", "using", "our", "this", "these", "that", "it", "however"}
+    {
+        "table", "figure", "we", "using", "our", "this", "these", "that", "it", "however",
+        # Generic concept nouns bleeding in as standalone entities
+        "vector", "hybrid", "scoring", "scale", "mean", "median", "distance",
+        # File formats the extractor keeps labelling as dataset/system
+        "json", "pdf", "html", "docx", "xml", "yaml", "csv",
+    }
 )
 # Derived from EntityType so the two can't drift.
 _LABEL_WORDS: frozenset[str] = frozenset(t.value for t in EntityType)
 
 _NUMERIC_RE = re.compile(r"\d+")
 _SENTENCE_SPLIT_RE = re.compile(r"[.!?]\s+")
+# Document-structure references: "Table 2", "Figure 3a", "Appendix C",
+# "Section 4.1", "Eq. 7". These are pointers, not entities.
+_STRUCTURAL_REF_RE = re.compile(
+    r"^(Table|Figure|Fig\.?|Appendix|Section|Chapter|Eq\.?|Equation)\s+\S+$"
+)
+# Value-delta or raw-quantity spans: "+5.6%", "-10ms", "10K", "10.9 ms",
+# "209 docs", "700 chunks per second". Any leading sign or digit followed
+# only by more digits, punctuation, and lowercase unit words.
+_QUANTITY_RE = re.compile(r"^[+\-]?\d[\d.,]*(\s*[a-zA-Z%]+)*$")
+# Dangling punctuation at the end = GLiNER2 span-boundary truncation
+# (e.g. "NV-", "foo/", "bar:").
+_TRAILING_JUNK = "-/:,@#"
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +115,7 @@ class Span(TypedDict):
 
 
 InferenceFn = Callable[[str, dict[str, str], float], list[Span]]
-TokenizeFn = Callable[[str], list[str]]
+TokenizeFn = Callable[[str], list[tuple[int, int]]]
 
 
 # ---------------------------------------------------------------------------
@@ -114,7 +135,7 @@ def _get_model() -> Any:
     global _MODEL
     if _MODEL is None:
         from gliner2 import GLiNER2
-        _MODEL = GLiNER2.from_pretrained("fastino/gliner2-base-v1")
+        _MODEL = GLiNER2.from_pretrained("fastino/gliner2-large-v1")
     return _MODEL
 
 
@@ -133,12 +154,27 @@ def _default_inference(
     return _flatten_gliner_output(raw)
 
 
-def _default_tokenize(text: str) -> list[str]:
-    """Production tokenizer; GLiNER2's subword tokenizer so sub-chunks respect
-    the model's 384-token ceiling (a word-count approximation would exceed
-    the ceiling on dense prose).
+def _default_tokenize(text: str) -> list[tuple[int, int]]:
+    """Production tokenizer for :func:`sub_chunk` — returns ``(start, end)``
+    character offsets for each subword token GLiNER2 will produce.
+
+    Uses the HF fast tokenizer's ``return_offsets_mapping=True`` so sub-chunks
+    respect the model's 384-token ceiling (a word-count approximation would
+    exceed the ceiling on dense prose) *and* are reconstructed by slicing the
+    source string rather than rejoining subword pieces. The latter matters:
+    SentencePiece / WordPiece split ``FiQA`` → ``[▁Fi, QA]`` and ``BGE-small``
+    → ``[▁B, GE, -, small]``, and ``" ".join(...)`` would feed GLiNER2 a
+    mangled input whose span slices become ``"Fi QA"`` / ``"B GE - small"`` —
+    corrupting every entity name, the resolver's canonical_terms, and the
+    FTS index. Offsets map back to the original text, keeping entity names
+    verbatim.
     """
-    return _get_model().processor.tokenizer.tokenize(text)
+    enc = _get_model().processor.tokenizer(
+        text,
+        return_offsets_mapping=True,
+        add_special_tokens=False,
+    )
+    return [tuple(pair) for pair in enc["offset_mapping"]]
 
 
 def _flatten_gliner_output(raw: Any) -> list[Span]:
@@ -208,9 +244,11 @@ def extract(
     Replace-all semantics: deletes any prior ``entities`` rows for the paper
     before inserting. Commits in a single transaction.
 
-    ``run_inference`` is the test seam for GLiNER2. ``tokenize`` defaults to
-    the word-split used by :func:`sub_chunk`; production callers typically
-    leave it None (see note in :func:`sub_chunk`). ``embedder`` is forwarded
+    ``run_inference`` is the test seam for GLiNER2. ``tokenize`` returns
+    ``(start, end)`` char offsets per token and defaults to :func:`sub_chunk`'s
+    whitespace offsets; production leaves it None so GLiNER2's fast tokenizer
+    is used with ``return_offsets_mapping=True`` (see :func:`_default_tokenize`
+    for why offsets — not token strings — are required). ``embedder`` is forwarded
     to the resolver for tier 5 inserts. Fresh entity names miss tiers 1-4 and
     need an Embedder; absent one we lazily construct the real BGE embedder.
     """
@@ -286,47 +324,165 @@ def extract(
     n_total = 0
     paper_domain = domain or ""
 
+    # ------------------------------------------------------------------
+    # Schwartz-Hearst pre-pass: find paper-native ``Long Form (SHORT)``
+    # definitions and build a rewrite map so acronym spans funnel into
+    # the long-form canonical. Every mention of ``RRF`` in a paper that
+    # defines ``Reciprocal Rank Fusion (RRF)`` votes and resolves under
+    # the long form. Short forms observed as spans are remembered so we
+    # can persist them to ``term_aliases`` after the long-form canonical
+    # has a term_id.
+    # ------------------------------------------------------------------
+    acronym_rewrite: dict[str, str] = {
+        normalize_term(short): long
+        for short, long in extract_acronym_pairs(markdown)
+    }
+    # normalized long-form name -> set of raw short forms observed as spans
+    observed_short_forms: dict[str, set[str]] = defaultdict(set)
+
+    def _canonicalize(name: str) -> str:
+        """Rewrite ``name`` to its paper-native long form if it's a known
+        Schwartz-Hearst acronym; otherwise return unchanged.
+        """
+        return acronym_rewrite.get(normalize_term(name), name)
+
+    # ------------------------------------------------------------------
+    # Pass 1 (outside transaction): inference + paper-wide label vote.
+    #
+    # Two-stage vote:
+    #
+    # Stage A — argmax-per-span (bug fix). GLiNER2 emits one row per
+    # label that clears the threshold, so a single physical span can
+    # appear 3x with different labels/scores ("BGE-small embeddings"
+    # at one position: model=0.67, dataset=0.41, method=0.31). Without
+    # this dedup, one mention would cast three equal votes, which stacks
+    # up across sections and dilutes the entity's clear per-mention
+    # winner. Grouping by ``(start, end)`` within each sub_chunk and
+    # keeping the top-scoring label collapses multi-label rows back to
+    # one vote per span. Strict ``>`` on score preserves first-seen
+    # tiebreak.
+    #
+    # Stage B — count-based majority vote across the paper. The argmax
+    # winner per span casts a ``+= 1`` vote for its label; the etype
+    # with the most votes wins. ``Counter.most_common`` preserves
+    # insertion order on ties, so the first-observed winner wins a tie.
+    # Majority voting is robust to single high-confidence outliers
+    # (one 0.90 mislabel can't outvote 19 0.65 correct mentions).
+    #
+    # Stage C — ``entity_type_score`` = max score observed for the
+    # *winning* label's mentions only. This is what the resolver's
+    # cross-paper flip check compares against: a later paper that wins
+    # majority on a different label with a strictly-higher peak for
+    # THAT label overturns the stored one. Peaks on losing labels are
+    # discarded.
+    # ------------------------------------------------------------------
+    type_votes: dict[str, Counter[EntityType]] = defaultdict(Counter)
+    # norm -> {etype -> max score observed for that etype}. Populated
+    # for every label seen; only the winning label's score is kept
+    # after the paper-wide tally.
+    type_scores: dict[str, dict[EntityType, float]] = defaultdict(dict)
+    per_chunk: list[tuple[Any, list[str], list[list[Span]]]] = []
+
+    for chunk in chunks:
+        stripped = strip_breadcrumb(chunk.body)
+        sub_chunks_list = sub_chunk(
+            stripped,
+            max_tokens=cfg.chunk.max_tokens,
+            overlap_tokens=cfg.chunk.overlap_tokens,
+            tokenizer_cb=tokenize_fn,
+        )
+        chunk_valid_spans: list[list[Span]] = []
+        for sub in sub_chunks_list:
+            raw_spans = inference(sub, label_descriptions, min_threshold)
+
+            # Stage A — argmax-per-span dedup.
+            best_by_pos: dict[tuple[int, int], Span] = {}
+            for span in raw_spans:
+                start = int(span.get("start", 0))
+                end = int(span.get("end", 0))
+                score = float(span.get("score", 0.0))
+                prev = best_by_pos.get((start, end))
+                if prev is None or score > float(prev.get("score", 0.0)):
+                    best_by_pos[(start, end)] = span
+            # Iterate in first-seen order across positions so pass-2
+            # dedup and log output stay deterministic.
+            deduped_spans: list[Span] = list(best_by_pos.values())
+
+            valid: list[Span] = []
+            for span in deduped_spans:
+                label = span.get("label", "")
+                name = (span.get("text") or "").strip()
+                if not name:
+                    continue
+                score = float(span.get("score", 0.0))
+                threshold = cfg.per_label.get(label, cfg.global_threshold)
+                if score < threshold:
+                    continue
+                etype = label_to_type.get(label)
+                if etype is None:
+                    _LOG.warning(
+                        "unknown GLiNER label %r not in EntityType; skipping "
+                        "span text=%r in paper_name=%s",
+                        label, name, paper_name,
+                    )
+                    continue
+                # Rewrite acronym spans to their long form so votes and
+                # dedup collapse both acronym and expanded mentions onto
+                # a single canonical.
+                canonical_text = _canonicalize(name)
+                if canonical_text != name:
+                    observed_short_forms[
+                        normalize_term(canonical_text)
+                    ].add(name)
+                norm = normalize_term(canonical_text)
+                type_votes[norm][etype] += 1
+                prev_score = type_scores[norm].get(etype, 0.0)
+                if score > prev_score:
+                    type_scores[norm][etype] = score
+                valid.append(span)
+            chunk_valid_spans.append(valid)
+        per_chunk.append((chunk, sub_chunks_list, chunk_valid_spans))
+
+    # Stage B + C — majority winner per name, max-score for winning label.
+    winning_type: dict[str, tuple[EntityType, float]] = {}
+    for norm, counter in type_votes.items():
+        winner = counter.most_common(1)[0][0]
+        winner_score = type_scores[norm].get(winner, 0.0)
+        winning_type[norm] = (winner, winner_score)
+
+    # ------------------------------------------------------------------
+    # Pass 2 (transactional): dedup per section, resolve, insert.
+    # ------------------------------------------------------------------
     with transaction(conn):
         conn.execute("DELETE FROM entities WHERE paper_id = ?", (paper_id,))
 
-        for chunk in chunks:
-            stripped = strip_breadcrumb(chunk.body)
-            sub_chunks_list = sub_chunk(
-                stripped,
-                max_tokens=cfg.chunk.max_tokens,
-                overlap_tokens=cfg.chunk.overlap_tokens,
-                tokenizer_cb=tokenize_fn,
-            )
-            # Per-section first-seen dedup on (entity_type, normalize_term(name)).
-            # Description is computed at first-seen time so we can drop the
-            # full sub-chunk reference once the span is recorded.
-            seen: dict[tuple[EntityType, str], tuple[str, str]] = {}
-            for sub in sub_chunks_list:
-                spans = inference(sub, label_descriptions, min_threshold)
+        # Track canonicals already created in this paper so we only
+        # insert the Schwartz-Hearst short form as an alias once.
+        aliased_term_ids: set[int] = set()
+
+        for chunk, sub_chunks_list, chunk_valid_spans in per_chunk:
+            # Per-section first-seen dedup keyed on normalized name only
+            # (one concept per section, regardless of label variation).
+            seen: dict[str, tuple[EntityType, float, str, str]] = {}
+            for sub, spans in zip(sub_chunks_list, chunk_valid_spans):
                 for span in spans:
-                    label = span.get("label", "")
                     name = (span.get("text") or "").strip()
                     if not name:
                         continue
-                    score = float(span.get("score", 0.0))
+                    canonical_text = _canonicalize(name)
+                    norm = normalize_term(canonical_text)
+                    if norm in seen:
+                        continue
+                    etype, etype_score = winning_type[norm]
                     start = int(span.get("start", 0))
-                    threshold = cfg.per_label.get(label, cfg.global_threshold)
-                    if score < threshold:
-                        continue
-                    etype = label_to_type.get(label)
-                    if etype is None:
-                        _LOG.warning(
-                            "unknown GLiNER label %r not in EntityType; skipping "
-                            "span text=%r in paper_name=%s",
-                            label, name, paper_name,
-                        )
-                        continue
-                    key = (etype, normalize_term(name))
-                    if key in seen:
-                        continue
-                    seen[key] = (name, _description_for(sub, start))
+                    seen[norm] = (
+                        etype,
+                        etype_score,
+                        canonical_text,
+                        _description_for(sub, start),
+                    )
 
-            for (etype, _norm), (raw_name, description) in seen.items():
+            for norm, (etype, etype_score, raw_name, description) in seen.items():
                 n_total += 1
                 if _is_garbage(raw_name):
                     n_rejected += 1
@@ -342,9 +498,28 @@ def extract(
                     domain=paper_domain,
                     term_type="entity",
                     entity_type=etype.value,
+                    entity_type_score=etype_score,
                     source_paper=paper_name,
                     embedder=_get_embedder(),
                 )
+
+                # Persist the Schwartz-Hearst short form(s) as aliases.
+                # Alias insertion is idempotent per (term_id, alias,
+                # source_paper); guarding on ``aliased_term_ids`` is
+                # purely to avoid redundant INSERT OR IGNOREs per paper.
+                if (
+                    resolved.term_id not in aliased_term_ids
+                    and norm in observed_short_forms
+                ):
+                    for short in observed_short_forms[norm]:
+                        insert_acronym_alias(
+                            conn,
+                            term_id=resolved.term_id,
+                            canonical_name=resolved.canonical_name,
+                            alias=short,
+                            source_paper=paper_name,
+                        )
+                    aliased_term_ids.add(resolved.term_id)
 
                 conn.execute(
                     """
@@ -358,7 +533,7 @@ def extract(
                         paper_domain,
                         paper_name,
                         resolved.canonical_name,
-                        etype.value,
+                        resolved.entity_type,
                         chunk.breadcrumb,
                         description,
                     ),
@@ -418,14 +593,44 @@ def extract(
 def _is_garbage(name: str) -> bool:
     """True if ``name`` should be rejected before the resolver call.
 
-    Rejects: empty, pure-numeric, stoplist hit (case-insensitive), label-word
-    hit after ``normalize_term``, and shorter-than-3 names that aren't in the
-    acronym allowlist.
+    Rejects, in order of cheapest check first:
+
+    - empty / whitespace-only
+    - contains control whitespace (``\\n``, ``\\r``, ``\\t``): the span
+      crossed a paragraph, table row, or list-item boundary, so it's two
+      unrelated concepts glued together.
+    - pure-numeric
+    - ends with dangling punctuation (``-/:,@#``): GLiNER2 span-boundary
+      truncation (e.g. ``NV-``, ``foo/``).
+    - longer than ``_ENTITY_MAX_LEN``: no legitimate entity name is 60+
+      chars; long spans are phrase captures that escaped the structural
+      boundary check.
+    - document-structure reference (``Table 2``, ``Appendix C``, ``Eq. 7``):
+      these are pointers into the paper, not entities.
+    - quantity / value-delta (``+5.6%``, ``10K``, ``10.9 ms``, ``209 docs``):
+      raw measurements the reader sees in result tables, not entity names.
+    - stoplist hit (case-insensitive): generic concept nouns (``vector``,
+      ``hybrid``), file formats (``json``, ``pdf``), or banned function words.
+    - label-word hit after ``normalize_term``: extractor picked up one of
+      its own labels as an entity (``Method``, ``Dataset``, ...).
+    - shorter than 3 chars and not in the acronym allowlist.
     """
     s = name.strip()
     if not s:
         return True
+    if any(c in s for c in "\n\r\t"):
+        return True
     if _NUMERIC_RE.fullmatch(s):
+        return True
+    if s[-1] in _TRAILING_JUNK:
+        return True
+    if s[0] in "+-":
+        return True
+    if len(s) > _ENTITY_MAX_LEN:
+        return True
+    if _STRUCTURAL_REF_RE.match(s):
+        return True
+    if _QUANTITY_RE.match(s):
         return True
     if s.lower() in _ENTITY_STOPLIST:
         return True

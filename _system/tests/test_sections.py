@@ -1,6 +1,7 @@
 """Tests for _system/utils/sections.py."""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -188,18 +189,89 @@ def test_sub_chunk_short_text_returned_unchanged() -> None:
 
 
 def test_sub_chunk_uses_custom_tokenizer_cb() -> None:
-    """A caller-supplied tokenizer is preferred over the default."""
+    """A caller-supplied offsets callback is used to determine token boundaries."""
     calls: list[str] = []
 
-    def my_tok(s: str) -> list[str]:
+    def my_tok(s: str) -> list[tuple[int, int]]:
         calls.append(s)
-        return list(s)  # one-char tokens
+        return [(i, i + 1) for i in range(len(s))]  # one-char tokens
 
     text = "x" * 50
     chunks = sub_chunk(text, max_tokens=10, overlap_tokens=2, tokenizer_cb=my_tok)
     assert calls, "tokenizer_cb was not called"
     for c in chunks:
-        assert len(c.split()) <= 10
+        assert len(c) <= 10
+
+
+def test_sub_chunk_preserves_original_whitespace_with_subword_offsets() -> None:
+    """Regression: subword-style offsets must not mangle reconstructed chunks.
+
+    Simulates SentencePiece / WordPiece tokenization by fragmenting every
+    word into 3-char token spans. sub_chunk must slice the *original* source
+    (not rejoin tokens with spaces), so words like ``ColBERTv2`` appear
+    verbatim in chunks — never as ``Col BER Tv2``. This guards against the
+    extract_entities.py bug where ``" ".join(subword_tokens)`` produced
+    entity names like ``"Fi QA"`` / ``"B GE - small"``.
+    """
+    sentence = (
+        "We compare against ColBERTv2 and BGE-small on FiQA benchmark. "
+    )
+    text = (sentence * 40).strip()
+
+    def fragmenting_offsets(s: str) -> list[tuple[int, int]]:
+        out: list[tuple[int, int]] = []
+        for m in re.finditer(r"\S+", s):
+            start, end = m.start(), m.end()
+            for i in range(start, end, 3):
+                out.append((i, min(i + 3, end)))
+        return out
+
+    chunks = sub_chunk(
+        text, max_tokens=40, overlap_tokens=5, tokenizer_cb=fragmenting_offsets
+    )
+    assert len(chunks) > 1, "fixture should require sub-chunking"
+    # No chunk may contain the subword-joined corruption patterns.
+    for c in chunks:
+        assert "Col BERT" not in c
+        assert "B GE" not in c
+        assert "Fi QA" not in c
+    # And the original tokens survive verbatim in at least one chunk.
+    joined = " || ".join(chunks)
+    assert "ColBERTv2" in joined
+    assert "BGE-small" in joined
+    assert "FiQA" in joined
+
+
+def test_sub_chunk_preserves_sentencepiece_marker_boundaries() -> None:
+    """Regression: SentencePiece ``▁`` word-boundary markers must not leak.
+
+    GLiNER2's DeBERTa-v3 tokenizer emits tokens whose first subword carries
+    a leading ``▁`` marker internally. HF fast tokenizers return offsets
+    pointing to the actual source characters (excluding the marker), so
+    slicing ``text[start:end]`` yields clean text with no ``▁`` in it.
+    This test simulates that behavior: the callback's offsets skip over the
+    imaginary marker position in its internal token list and map to real
+    source positions only.
+    """
+    text = "The ColBERTv2 model beats BGE-small on the FiQA benchmark. " * 30
+    text = text.strip()
+
+    def sp_style_offsets(s: str) -> list[tuple[int, int]]:
+        # One "token" per character run of length 2, mapped to source offsets.
+        # No "▁" character ever enters the offset list — that's the invariant
+        # real HF fast tokenizers maintain.
+        out: list[tuple[int, int]] = []
+        for m in re.finditer(r"\S+", s):
+            start, end = m.start(), m.end()
+            for i in range(start, end, 2):
+                out.append((i, min(i + 2, end)))
+        return out
+
+    chunks = sub_chunk(
+        text, max_tokens=50, overlap_tokens=10, tokenizer_cb=sp_style_offsets
+    )
+    for c in chunks:
+        assert "▁" not in c, "SentencePiece marker leaked into chunk"
 
 
 def test_sub_chunk_pathological_overlap_raises() -> None:

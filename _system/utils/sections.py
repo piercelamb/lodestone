@@ -13,6 +13,7 @@ from typing import Callable, NamedTuple, Optional
 _HEADER_RE = re.compile(r"^(#{1,3})\s+(.+?)\s*$")
 _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 _BREADCRUMB_LEAD_RE = re.compile(r"^#{1,3}\s+\S")
+_WHITESPACE_TOKEN_RE = re.compile(r"\S+")
 
 
 class SectionChunk(NamedTuple):
@@ -122,37 +123,51 @@ def sub_chunk(
     text: str,
     max_tokens: int = 350,
     overlap_tokens: int = 20,
-    tokenizer_cb: Optional[Callable[[str], list[str]]] = None,
+    tokenizer_cb: Optional[Callable[[str], list[tuple[int, int]]]] = None,
 ) -> list[str]:
-    """Token-based sliding window.
+    """Token-based sliding window that preserves original whitespace.
 
-    Returns ``[text]`` unchanged if it fits in one window. Otherwise slides a
-    window of ``max_tokens`` with step ``max_tokens - overlap_tokens`` so that
-    adjacent chunks share exactly ``overlap_tokens`` tokens.
+    ``tokenizer_cb`` returns ``(start, end)`` character offsets of each token
+    in ``text``. Chunks are produced by slicing the source string at the
+    first/last token of each window — ``text[window[0][0] : window[-1][1]]``
+    — so original whitespace, casing, and punctuation are preserved verbatim
+    regardless of which tokenizer (whitespace / BPE / WordPiece /
+    SentencePiece) is plugged in. This is load-bearing downstream: entity
+    extractors return span text as a slice of the input they receive, so
+    corrupting the input (e.g. ``" ".join(subword_tokens)``) corrupts every
+    extracted entity name.
 
-    The default tokenizer is ``str.split``; the production caller in
-    ``extract_entities.py`` passes GLiNER2's tokenizer via ``tokenizer_cb``.
-    Note that chunks are reconstructed via ``" ".join(window)``, so original
-    whitespace is not preserved — this is acceptable because chunks are never
-    written back to disk (GLiNER2 re-tokenizes internally).
+    The default callback matches non-whitespace runs, giving the same
+    tokenization as ``str.split`` but as offsets. Production in
+    ``extract_entities.py`` plugs in GLiNER2's fast tokenizer via
+    ``return_offsets_mapping=True`` so sub-chunks respect the model's 384-
+    token ceiling.
+
+    Returns ``[text]`` unchanged if the token count fits in one window.
+    Otherwise slides a window of ``max_tokens`` with step
+    ``max_tokens - overlap_tokens`` so adjacent chunks share exactly
+    ``overlap_tokens`` tokens.
     """
     if overlap_tokens >= max_tokens:
         raise ValueError(
             f"overlap_tokens ({overlap_tokens}) must be < max_tokens ({max_tokens})"
         )
 
-    tokenize = tokenizer_cb if tokenizer_cb is not None else str.split
-    tokens = tokenize(text)
+    if tokenizer_cb is not None:
+        offsets = tokenizer_cb(text)
+    else:
+        offsets = [(m.start(), m.end()) for m in _WHITESPACE_TOKEN_RE.finditer(text)]
 
-    if len(tokens) <= max_tokens:
+    if len(offsets) <= max_tokens:
         return [text]
 
     step = max_tokens - overlap_tokens
     chunks: list[str] = []
     i = 0
-    n = len(tokens)
+    n = len(offsets)
     while i < n:
-        chunks.append(" ".join(tokens[i : i + max_tokens]))
+        window = offsets[i : i + max_tokens]
+        chunks.append(text[window[0][0] : window[-1][1]])
         if i + max_tokens >= n:
             break
         i += step

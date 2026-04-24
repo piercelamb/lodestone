@@ -174,7 +174,7 @@ class TestPipelineStatus:
     def test_classified_advances_to_extracted(self, tmp_db_with_paper, fake_embedder):
         inf = _static_inference(
             [
-                [_span("BookRAG", "Method")],
+                [_span("BookRAG", "method")],
                 [],
             ]
         )
@@ -219,7 +219,7 @@ class TestPipelineStatus:
             paper_name="paper_name_2024",
             conn=conn,
             force=True,
-            run_inference=_static_inference([[_span("BookRAG", "Method")]]),
+            run_inference=_static_inference([[_span("BookRAG", "method")]]),
             embedder=fake_embedder,
         )
         status = conn.execute(
@@ -265,7 +265,7 @@ class TestPipelineStatus:
         extract(
             paper_name="paper_name_2024",
             conn=tmp_db_with_paper,
-            run_inference=_static_inference([[_span("BookRAG", "Method")]]),
+            run_inference=_static_inference([[_span("BookRAG", "method")]]),
             embedder=fake_embedder,
         )
         rows = tmp_db_with_paper.execute(
@@ -283,7 +283,7 @@ class TestPipelineStatus:
 
 class TestSectionSplitterIntegration:
     def test_gliner_input_has_no_breadcrumb(self, tmp_db_with_paper, fake_embedder):
-        inf = _static_inference([[_span("BookRAG", "Method")] for _ in range(10)])
+        inf = _static_inference([[_span("BookRAG", "method")] for _ in range(10)])
         extract(
             paper_name="paper_name_2024",
             conn=tmp_db_with_paper,
@@ -327,10 +327,10 @@ class TestSectionSplitterIntegration:
         _seed_domain(conn)
         _seed_paper(conn, markdown=long_markdown)
 
-        # Every sub-chunk returns the same span; dedup by (entity_type, normalize_term)
+        # Every sub-chunk returns the same span; dedup by normalized name
         # should collapse them into one INSERT.
         def _dup_inf(text, labels, threshold):
-            return [_span("BookRAG", "Method")]
+            return [_span("BookRAG", "method")]
 
         extract(
             paper_name="paper_name_2024",
@@ -342,6 +342,478 @@ class TestSectionSplitterIntegration:
             "SELECT entity_name FROM entities WHERE paper_name = 'paper_name_2024'"
         ).fetchall()
         assert len(rows) == 1
+
+
+# ===========================================================================
+# Label voting: same name across labels resolves to one canonical
+# ===========================================================================
+
+
+class TestLabelVoting:
+    """Regression: GLiNER2 labels the same entity inconsistently across
+    mentions (``RRF`` as method/benchmark/dataset/...). The paper-wide
+    label vote must consolidate these into a single canonical with the
+    majority label, not one canonical per label.
+    """
+
+    def test_same_name_multiple_labels_one_canonical(
+        self, conn, fake_embedder
+    ):
+        # 5 mentions of "RRF" labelled across 4 types: Method wins 2-1-1-1.
+        # Each inference call returns one span so we can control counts.
+        inf = _static_inference(
+            [
+                [_span("RRF", "method")],
+                [_span("RRF", "software")],
+                [_span("RRF", "method")],
+                [_span("RRF", "benchmark")],
+                [_span("RRF", "dataset")],
+                [],
+            ]
+        )
+        markdown = (
+            "# S1\n\nbody one\n"
+            "# S2\n\nbody two\n"
+            "# S3\n\nbody three\n"
+            "# S4\n\nbody four\n"
+            "# S5\n\nbody five\n"
+        )
+        _seed_domain(conn)
+        _seed_paper(conn, markdown=markdown)
+
+        extract(
+            paper_name="paper_name_2024",
+            conn=conn,
+            run_inference=inf,
+            embedder=fake_embedder,
+        )
+
+        # Exactly one canonical row for RRF (regardless of label diversity).
+        canonicals = conn.execute(
+            "SELECT canonical_name, entity_type FROM canonical_terms "
+            "WHERE canonical_name = 'RRF'"
+        ).fetchall()
+        assert len(canonicals) == 1, (
+            f"expected 1 RRF canonical, got {len(canonicals)}: {canonicals}"
+        )
+        # Majority vote winner is Method.
+        assert canonicals[0][1] == "method"
+
+        # Every entities row for RRF carries the voted type.
+        entity_types = {
+            row[0] for row in conn.execute(
+                "SELECT DISTINCT entity_type FROM entities "
+                "WHERE entity_name = 'RRF'"
+            )
+        }
+        assert entity_types == {"method"}
+
+    def test_schwartz_hearst_acronym_collapses_with_expansion(
+        self, conn, fake_embedder
+    ):
+        """Acronym defined in paper text collapses with its expansion.
+
+        If the markdown contains ``Reciprocal Rank Fusion (RRF)`` and
+        later spans for both ``RRF`` and ``Reciprocal Rank Fusion``,
+        the extract stage must produce ONE canonical (the long form)
+        with ``RRF`` persisted as a ``term_aliases`` row.
+        """
+        markdown = (
+            "# Background\n\n"
+            "We use Reciprocal Rank Fusion (RRF) to combine rankings.\n"
+            "# Method\n\nThe RRF formula is well known.\n"
+            "# Results\n\nReciprocal Rank Fusion performs well.\n"
+        )
+        _seed_domain(conn)
+        _seed_paper(conn, markdown=markdown)
+
+        # One span per section: RRF / RRF / Reciprocal Rank Fusion.
+        inf = _static_inference(
+            [
+                [_span("RRF", "method")],
+                [_span("RRF", "method")],
+                [_span("Reciprocal Rank Fusion", "method")],
+                [],
+            ]
+        )
+        extract(
+            paper_name="paper_name_2024",
+            conn=conn,
+            run_inference=inf,
+            embedder=fake_embedder,
+        )
+
+        # ONE canonical — the long form.
+        canonicals = conn.execute(
+            "SELECT canonical_name FROM canonical_terms WHERE term_type='entity'"
+        ).fetchall()
+        names = [r[0] for r in canonicals]
+        assert names == ["Reciprocal Rank Fusion"], (
+            f"expected single long-form canonical; got {names}"
+        )
+
+        # RRF persisted as an alias with match_tier=0 (Schwartz-Hearst).
+        aliases = conn.execute(
+            "SELECT alias, match_tier FROM term_aliases ORDER BY alias"
+        ).fetchall()
+        assert ("RRF", 0) in aliases
+
+        # Every entities row references the long form.
+        ent_names = {
+            r[0] for r in conn.execute(
+                "SELECT DISTINCT entity_name FROM entities "
+                "WHERE paper_name = 'paper_name_2024'"
+            )
+        }
+        assert ent_names == {"Reciprocal Rank Fusion"}
+
+    def test_argmax_per_span_collapses_multi_label_rows(
+        self, conn, fake_embedder
+    ):
+        """GLiNER2 emits one row per label that clears the threshold for
+        a single span; the OLD count-based vote treated each row as its
+        own +=1 vote, so one physical mention could cast three equal
+        votes. Argmax-per-span collapses multi-label rows for the same
+        ``(start, end)`` back to one vote — only the top-scoring label
+        per span gets to vote.
+
+        Two sub_chunks, each with the same ``(start=0, end=3)`` span
+        returned under three labels. Without argmax-per-span, each
+        sub_chunk casts 3 votes (software, method, dataset); method
+        and dataset would accumulate 2 votes each across the two
+        sub_chunks — tying software and letting first-seen pick the
+        winner. With argmax-per-span, only software votes in each
+        sub_chunk; software wins outright 2-0-0.
+        """
+        inf = _static_inference(
+            [
+                [
+                    _span("DPR", "software", score=0.85, start=0, end=3),
+                    _span("DPR", "method",   score=0.61, start=0, end=3),
+                    _span("DPR", "dataset",  score=0.55, start=0, end=3),
+                ],
+                [
+                    _span("DPR", "software", score=0.82, start=0, end=3),
+                    _span("DPR", "method",   score=0.60, start=0, end=3),
+                    _span("DPR", "dataset",  score=0.50, start=0, end=3),
+                ],
+                [],
+            ]
+        )
+        markdown = "# S1\n\nalpha\n# S2\n\nbeta\n"
+        _seed_domain(conn)
+        _seed_paper(conn, markdown=markdown)
+
+        extract(
+            paper_name="paper_name_2024",
+            conn=conn,
+            run_inference=inf,
+            embedder=fake_embedder,
+        )
+
+        row = conn.execute(
+            "SELECT entity_type, entity_type_score FROM canonical_terms "
+            "WHERE canonical_name = 'DPR'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "software"
+        # Score is the max observed score *of the winning label*.
+        assert row[1] == pytest.approx(0.85)
+
+    def test_majority_beats_single_high_score_outlier(
+        self, conn, fake_embedder
+    ):
+        """Count-majority is robust to single high-confidence outliers:
+        three method@0.65 mentions beat one software@0.95 mention, even
+        though software scored higher. The stored score is the max of
+        the *winning* label's mentions (0.65), NOT the paper-wide peak
+        (0.95 for the losing software mention).
+        """
+        inf = _static_inference(
+            [
+                [_span("Foo", "method", score=0.65, start=0)],
+                [_span("Foo", "software", score=0.95, start=0)],
+                [_span("Foo", "method", score=0.64, start=0)],
+                [_span("Foo", "method", score=0.63, start=0)],
+                [],
+            ]
+        )
+        markdown = (
+            "# S1\n\na\n# S2\n\nb\n# S3\n\nc\n# S4\n\nd\n"
+        )
+        _seed_domain(conn)
+        _seed_paper(conn, markdown=markdown)
+        extract(
+            paper_name="paper_name_2024",
+            conn=conn,
+            run_inference=inf,
+            embedder=fake_embedder,
+        )
+        row = conn.execute(
+            "SELECT entity_type, entity_type_score FROM canonical_terms "
+            "WHERE canonical_name = 'Foo'"
+        ).fetchone()
+        assert row == ("method", pytest.approx(0.65))
+
+    def test_winning_score_persists_to_canonical(self, conn, fake_embedder):
+        """Tier 5 writes the max-score-per-winning-label onto the new
+        canonical row's entity_type_score.
+        """
+        inf = _static_inference(
+            [
+                [_span("NovelTerm", "method", score=0.72)],
+                [],
+            ]
+        )
+        _seed_domain(conn)
+        _seed_paper(conn, markdown="# S\n\nbody\n")
+        extract(
+            paper_name="paper_name_2024",
+            conn=conn,
+            run_inference=inf,
+            embedder=fake_embedder,
+        )
+        row = conn.execute(
+            "SELECT entity_type, entity_type_score FROM canonical_terms "
+            "WHERE canonical_name = 'NovelTerm'"
+        ).fetchone()
+        assert row is not None
+        assert row[0] == "method"
+        assert row[1] == pytest.approx(0.72)
+
+    def test_winning_score_is_max_across_mentions(self, conn, fake_embedder):
+        """Same entity mentioned twice with different scores: the stored
+        entity_type_score is the MAX of the two (not first or last)."""
+        inf = _static_inference(
+            [
+                [_span("BookRAG", "method", score=0.65)],
+                [_span("BookRAG", "method", score=0.88)],
+                [_span("BookRAG", "method", score=0.70)],
+                [],
+            ]
+        )
+        markdown = "# S1\n\nalpha\n# S2\n\nbeta\n# S3\n\ngamma\n"
+        _seed_domain(conn)
+        _seed_paper(conn, markdown=markdown)
+        extract(
+            paper_name="paper_name_2024",
+            conn=conn,
+            run_inference=inf,
+            embedder=fake_embedder,
+        )
+        row = conn.execute(
+            "SELECT entity_type, entity_type_score FROM canonical_terms "
+            "WHERE canonical_name = 'BookRAG'"
+        ).fetchone()
+        assert row == ("method", pytest.approx(0.88))
+
+    def test_second_paper_with_higher_score_flips_canonical(
+        self, conn, fake_embedder
+    ):
+        """Two-paper simulation: paper 1 establishes ``DPR`` as method at 0.4;
+        paper 2 extracts ``DPR`` as software at 0.85 — canonical flips,
+        paper 1's entities row follows. Confirms end-to-end wiring from the
+        vote machine through resolver._maybe_flip_entity_type.
+        """
+        _seed_domain(conn)
+        _seed_paper(
+            conn,
+            paper_name="paper_1",
+            arxiv_id="2401.11111",
+            markdown="# S\n\nalpha\n",
+        )
+        _seed_paper(
+            conn,
+            paper_name="paper_2",
+            arxiv_id="2401.22222",
+            markdown="# S\n\nbeta\n",
+        )
+
+        extract(
+            paper_name="paper_1",
+            conn=conn,
+            run_inference=_static_inference(
+                [[_span("DPR", "method", score=0.62)], []]
+            ),
+            embedder=fake_embedder,
+        )
+        # Canonical is now method@0.62; paper_1's entities row is method.
+        row = conn.execute(
+            "SELECT entity_type, entity_type_score FROM canonical_terms "
+            "WHERE canonical_name = 'DPR'"
+        ).fetchone()
+        assert row == ("method", pytest.approx(0.62))
+
+        extract(
+            paper_name="paper_2",
+            conn=conn,
+            run_inference=_static_inference(
+                [[_span("DPR", "software", score=0.85)], []]
+            ),
+            embedder=fake_embedder,
+        )
+
+        row = conn.execute(
+            "SELECT entity_type, entity_type_score FROM canonical_terms "
+            "WHERE canonical_name = 'DPR'"
+        ).fetchone()
+        assert row == ("software", pytest.approx(0.85))
+
+        # Paper 1's historical entities row was migrated.
+        paper_1_type = conn.execute(
+            "SELECT entity_type FROM entities WHERE paper_name = 'paper_1' "
+            "AND entity_name = 'DPR'"
+        ).fetchone()[0]
+        assert paper_1_type == "software"
+
+    def test_bm25_flip_across_papers_with_multi_mention_majority(
+        self, conn, fake_embedder
+    ):
+        """Multi-mention majority vote in both papers, with paper 2's
+        majority-winning label at a higher peak than paper 1's. This is
+        the scenario from the design discussion:
+
+        * Paper 1: BM25 mentioned 3x as method, 1x as software. Majority
+          wins method; stored score = max(method_scores) = 0.70.
+        * Paper 2: BM25 mentioned 3x as software, 1x as method. Majority
+          wins software; winner score = max(software_scores) = 0.85.
+        * 0.85 > 0.70 AND software != method → flip.
+        """
+        _seed_domain(conn)
+        _seed_paper(
+            conn,
+            paper_name="paper_1",
+            arxiv_id="2401.11111",
+            markdown="# S1\n\na\n# S2\n\nb\n# S3\n\nc\n# S4\n\nd\n",
+        )
+        _seed_paper(
+            conn,
+            paper_name="paper_2",
+            arxiv_id="2401.22222",
+            markdown="# S1\n\na\n# S2\n\nb\n# S3\n\nc\n# S4\n\nd\n",
+        )
+
+        # Paper 1: method wins 3-1; peak method score = 0.70.
+        extract(
+            paper_name="paper_1",
+            conn=conn,
+            run_inference=_static_inference(
+                [
+                    [_span("BM25", "method", score=0.70, start=0)],
+                    [_span("BM25", "method", score=0.65, start=0)],
+                    [_span("BM25", "method", score=0.62, start=0)],
+                    [_span("BM25", "software", score=0.95, start=0)],
+                    [],
+                ]
+            ),
+            embedder=fake_embedder,
+        )
+        row = conn.execute(
+            "SELECT entity_type, entity_type_score FROM canonical_terms "
+            "WHERE canonical_name = 'BM25'"
+        ).fetchone()
+        # Paper 1 establishes method@0.70 (NOT software@0.95 — the
+        # software mention loses the majority vote and its score is
+        # discarded along with it).
+        assert row == ("method", pytest.approx(0.70))
+
+        # Paper 2: software wins 3-1; peak software score = 0.85.
+        extract(
+            paper_name="paper_2",
+            conn=conn,
+            run_inference=_static_inference(
+                [
+                    [_span("BM25", "software", score=0.85, start=0)],
+                    [_span("BM25", "software", score=0.80, start=0)],
+                    [_span("BM25", "software", score=0.76, start=0)],
+                    [_span("BM25", "method", score=0.68, start=0)],
+                    [],
+                ]
+            ),
+            embedder=fake_embedder,
+        )
+
+        # Cross-paper flip: paper 2's software@0.85 overturns paper 1's
+        # method@0.70.
+        row = conn.execute(
+            "SELECT entity_type, entity_type_score FROM canonical_terms "
+            "WHERE canonical_name = 'BM25'"
+        ).fetchone()
+        assert row == ("software", pytest.approx(0.85))
+
+        # Paper 1's historical entities row was migrated to software.
+        paper_1_type = conn.execute(
+            "SELECT entity_type FROM entities WHERE paper_name = 'paper_1' "
+            "AND entity_name = 'BM25'"
+        ).fetchone()[0]
+        assert paper_1_type == "software"
+
+    def test_second_paper_with_lower_score_does_not_flip(
+        self, conn, fake_embedder
+    ):
+        _seed_domain(conn)
+        _seed_paper(
+            conn,
+            paper_name="paper_1",
+            arxiv_id="2401.11111",
+            markdown="# S\n\nalpha\n",
+        )
+        _seed_paper(
+            conn,
+            paper_name="paper_2",
+            arxiv_id="2401.22222",
+            markdown="# S\n\nbeta\n",
+        )
+        extract(
+            paper_name="paper_1",
+            conn=conn,
+            run_inference=_static_inference(
+                [[_span("DPR", "software", score=0.85)], []]
+            ),
+            embedder=fake_embedder,
+        )
+        extract(
+            paper_name="paper_2",
+            conn=conn,
+            run_inference=_static_inference(
+                [[_span("DPR", "method", score=0.70)], []]
+            ),
+            embedder=fake_embedder,
+        )
+        row = conn.execute(
+            "SELECT entity_type, entity_type_score FROM canonical_terms "
+            "WHERE canonical_name = 'DPR'"
+        ).fetchone()
+        assert row == ("software", pytest.approx(0.85))
+
+    def test_vote_tiebreak_is_first_seen(self, conn, fake_embedder):
+        """On vote ties, the label seen first in the paper wins
+        (Counter.most_common preserves insertion order on ties).
+        """
+        inf = _static_inference(
+            [
+                [_span("Foo", "software")],  # first
+                [_span("Foo", "method")],
+                [],
+            ]
+        )
+        markdown = "# S1\n\nbody one\n# S2\n\nbody two\n"
+        _seed_domain(conn)
+        _seed_paper(conn, markdown=markdown)
+
+        extract(
+            paper_name="paper_name_2024",
+            conn=conn,
+            run_inference=inf,
+            embedder=fake_embedder,
+        )
+
+        canonicals = conn.execute(
+            "SELECT canonical_name, entity_type FROM canonical_terms "
+            "WHERE canonical_name = 'Foo'"
+        ).fetchall()
+        assert len(canonicals) == 1
+        assert canonicals[0][1] == "software"
 
 
 # ===========================================================================
@@ -370,19 +842,124 @@ class TestGarbageGate:
         assert _is_garbage("xy")
         assert _is_garbage("a")
 
-    @pytest.mark.parametrize("label_word", ["Method", "Dataset", "Metric", "Model", "Technique", "Benchmark"])
+    @pytest.mark.parametrize(
+        "label_word",
+        [
+            "method", "dataset", "metric", "model", "benchmark",
+            "software", "system", "organization", "venue",
+        ],
+    )
     def test_label_word_rejected_after_normalize(self, label_word):
+        """Label words are rejected regardless of case — ``normalize_term``
+        lowercases before the ``_LABEL_WORDS`` check, so ``'Method'``,
+        ``'METHOD'``, and ``'method'`` all match.
+        """
         assert _is_garbage(label_word)
-        assert _is_garbage(label_word.lower())
+        assert _is_garbage(label_word.title())
+        assert _is_garbage(label_word.upper())
 
     def test_empty_or_whitespace_rejected(self):
         assert _is_garbage("")
         assert _is_garbage("   ")
 
+    @pytest.mark.parametrize(
+        "name",
+        [
+            "Pipeline Latency Breakdown\n\nTable E3",
+            "Foo\nBar",
+            "Foo\r\nBar",
+            "Foo\tBar",
+        ],
+    )
+    def test_control_whitespace_rejected(self, name):
+        """Spans that cross paragraph / row / item boundaries are dropped.
+
+        A newline, carriage return, or tab inside an entity name means
+        GLiNER2 concatenated across a structural boundary — the 'entity'
+        is two unrelated things glued together, not a single concept.
+        """
+        assert _is_garbage(name)
+
     def test_normal_entity_not_rejected(self):
         assert not _is_garbage("BookRAG")
         assert not _is_garbage("GraphRAG")
         assert not _is_garbage("MMLU")
+        # Multi-word entity names with regular single spaces are legitimate.
+        assert not _is_garbage("Claude Opus 4")
+        assert not _is_garbage("BEIR benchmarks")
+        # Common entity-name shapes with internal punctuation / digits.
+        assert not _is_garbage("BGE-small")
+        assert not _is_garbage("ColBERTv2")
+        assert not _is_garbage("NDCG@10")
+        assert not _is_garbage("sqlite-vec")
+
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            "Table 2", "Table 5a", "Table C1", "Table E4",
+            "Figure 3", "Fig. 4", "Fig 4a",
+            "Appendix C", "Appendix D",
+            "Section 3.1", "Chapter 2",
+            "Eq. 7", "Equation 12",
+        ],
+    )
+    def test_structural_reference_rejected(self, ref):
+        """Document-structure pointers (Table N, Figure N, Appendix X) are
+        not entities — they're cross-references into the paper body.
+        """
+        assert _is_garbage(ref)
+
+    @pytest.mark.parametrize(
+        "q",
+        [
+            "+5.6%", "+8.3%", "-10%", "-2.5",
+            "10K", "50K", "10.9 ms", "209 docs",
+            "700 chunks per second", "30 papers",
+            "1.5ms", "95%",
+        ],
+    )
+    def test_quantity_value_rejected(self, q):
+        """Raw measurements and value deltas are not entities."""
+        assert _is_garbage(q)
+
+    @pytest.mark.parametrize(
+        "frag",
+        ["NV-", "foo/", "bar:", "baz,", "qux@", "cat#"],
+    )
+    def test_dangling_punctuation_rejected(self, frag):
+        """Spans ending in `-/:,@#` are GLiNER2 boundary truncations."""
+        assert _is_garbage(frag)
+
+    @pytest.mark.parametrize(
+        "frag",
+        ["+ Dedup", "- retry", "+foo", "-bar"],
+    )
+    def test_leading_sign_rejected(self, frag):
+        """Entity names don't start with `+` or `-`; those are markdown-list
+        markers or value-delta prefixes the quantity regex can't always match
+        (e.g. ``+ Dedup`` — sign-space-word).
+        """
+        assert _is_garbage(frag)
+
+    def test_over_length_rejected(self):
+        """Spans longer than 60 chars are phrase captures, not entities."""
+        long_name = "a" * 61
+        assert _is_garbage(long_name)
+        # 60 is the boundary — still accepted if otherwise clean.
+        assert not _is_garbage("a" * 60)
+
+    @pytest.mark.parametrize(
+        "word",
+        [
+            "vector", "hybrid", "scoring", "scale", "mean", "median", "distance",
+            "json", "pdf", "html", "docx", "xml", "yaml", "csv",
+            # Case-insensitive — matches regardless of capitalisation.
+            "Vector", "JSON", "HTML",
+        ],
+    )
+    def test_generic_noun_and_file_format_rejected(self, word):
+        """Concept nouns and file formats are not entities when standalone."""
+        assert _is_garbage(word)
 
 
 class TestGarbageGateEndToEnd:
@@ -391,10 +968,10 @@ class TestGarbageGateEndToEnd:
         inf = _static_inference(
             [
                 [
-                    _span("We", "Method"),
-                    _span("Table", "Method"),
-                    _span("1", "Metric"),
-                    _span("Method", "Method"),
+                    _span("We", "method"),
+                    _span("Table", "method"),
+                    _span("1", "metric"),
+                    _span("Method", "method"),
                 ],
                 [],
             ]
@@ -462,7 +1039,7 @@ class TestSourceBreadcrumb:
 
         def _inf(text, labels, threshold):
             if "BookRAG" in text:
-                return [_span("BookRAG", "Method", start=text.index("BookRAG"))]
+                return [_span("BookRAG", "method", start=text.index("BookRAG"))]
             return []
 
         extract(
@@ -493,7 +1070,7 @@ class TestSourceBreadcrumb:
 
         def _inf(text, labels, threshold):
             if "BookRAG" in text:
-                return [_span("BookRAG", "Method", start=text.index("BookRAG"))]
+                return [_span("BookRAG", "method", start=text.index("BookRAG"))]
             return []
 
         extract(
@@ -557,7 +1134,7 @@ class TestDescriptionExtraction:
         # Sanity check that _description_for's output reaches the DB description column.
         inf = _static_inference(
             [
-                [_span("BookRAG", "Method", start=15)],
+                [_span("BookRAG", "method", start=15)],
                 [],
             ]
         )
@@ -595,7 +1172,7 @@ class TestResolverIntegration:
         extract(
             paper_name="paper_name_2024",
             conn=tmp_db_with_paper,
-            run_inference=_static_inference([[_span("book rag", "Method")]]),
+            run_inference=_static_inference([[_span("book rag", "method")]]),
             embedder=fake_embedder,
         )
         row = tmp_db_with_paper.execute(
@@ -619,8 +1196,8 @@ class TestResolverIntegration:
         inf = _static_inference(
             [
                 [
-                    _span("BookRAG", "Method"),
-                    _span("MMLU", "Benchmark"),
+                    _span("BookRAG", "method"),
+                    _span("MMLU", "benchmark"),
                 ],
                 [],
             ]
@@ -654,7 +1231,7 @@ class TestUnknownLabel:
         try:
             with caplog.at_level(logging.WARNING, logger="lodestone.scripts.extract_entities"):
                 inf = _static_inference(
-                    [[_span("BookRAG", "Method"), _span("MysteryThing", "NotALabel")]]
+                    [[_span("BookRAG", "method"), _span("MysteryThing", "NotALabel")]]
                 )
                 extract(
                     paper_name="paper_name_2024",
@@ -683,9 +1260,9 @@ class TestUnknownLabel:
 
 class TestPerLabelThreshold:
     def test_span_below_per_label_threshold_is_dropped(self, tmp_db_with_paper, fake_embedder):
-        # per_label["Method"] = 0.55; a Method span at 0.50 must be filtered.
+        # per_label["method"] = 0.55; a Method span at 0.50 must be filtered.
         inf = _static_inference(
-            [[_span("BookRAG", "Method", score=0.50)]]
+            [[_span("BookRAG", "method", score=0.50)]]
         )
         extract(
             paper_name="paper_name_2024",
@@ -700,7 +1277,7 @@ class TestPerLabelThreshold:
 
     def test_span_above_per_label_threshold_is_kept(self, tmp_db_with_paper, fake_embedder):
         inf = _static_inference(
-            [[_span("BookRAG", "Method", score=0.60)]]
+            [[_span("BookRAG", "method", score=0.60)]]
         )
         extract(
             paper_name="paper_name_2024",
@@ -723,16 +1300,16 @@ class TestFlattenGlinerOutput:
     def test_flatten_dict_shape(self):
         raw = {
             "entities": {
-                "Method": [
+                "method": [
                     {"text": "BookRAG", "confidence": 0.92, "start": 10, "end": 17},
                     {"text": "GraphRAG", "confidence": 0.85, "start": 30, "end": 38},
                 ],
-                "Dataset": [],
+                "dataset": [],
             }
         }
         spans = _flatten_gliner_output(raw)
         assert len(spans) == 2
-        method_spans = [s for s in spans if s["label"] == "Method"]
+        method_spans = [s for s in spans if s["label"] == "method"]
         assert len(method_spans) == 2
         assert method_spans[0]["text"] == "BookRAG"
         assert method_spans[0]["score"] == pytest.approx(0.92)
@@ -756,9 +1333,9 @@ class TestFlattenGlinerOutput:
         with pytest.raises(ValueError, match="entities"):
             _flatten_gliner_output({"entities": "not a dict"})
         with pytest.raises(ValueError, match="must be a list"):
-            _flatten_gliner_output({"entities": {"Method": "not a list"}})
+            _flatten_gliner_output({"entities": {"method": "not a list"}})
         with pytest.raises(ValueError, match="item must be a dict"):
-            _flatten_gliner_output({"entities": {"Method": ["not a dict"]}})
+            _flatten_gliner_output({"entities": {"method": ["not a dict"]}})
 
 
 # ===========================================================================
@@ -770,8 +1347,8 @@ class TestEntityCountUpdate:
     def test_papers_entity_count_matches_row_count(self, tmp_db_with_paper, fake_embedder):
         inf = _static_inference(
             [
-                [_span("BookRAG", "Method"), _span("GraphRAG", "Method")],
-                [_span("MMLU", "Benchmark")],
+                [_span("BookRAG", "method"), _span("GraphRAG", "method")],
+                [_span("MMLU", "benchmark")],
             ]
         )
         extract(
@@ -800,19 +1377,17 @@ class TestRejectRateWarning:
         self, tmp_db_with_paper, fake_embedder, caplog
     ):
         # 6 garbage + 5 good = 11 total, ~55% rejected → WARNING fires.
-        spans = [
-            _span("We", "Method"),
-            _span("Table", "Method"),
-            _span("Figure", "Method"),
-            _span("Using", "Method"),
-            _span("this", "Method"),
-            _span("that", "Method"),
-            _span("BookRAG", "Method"),
-            _span("GraphRAG", "Method"),
-            _span("RAPTOR", "Method"),
-            _span("LlamaRAG", "Method"),
-            _span("TreeRAG", "Method"),
-        ]
+        # Give each span a unique start offset — production GLiNER2 spans
+        # sit at distinct positions in the source text, and the vote
+        # machine's argmax-per-span dedup keys on (start, end) so any
+        # collision in the fixture would silently collapse spans.
+        texts_garbage = ["We", "Table", "Figure", "Using", "this", "that"]
+        texts_good = ["BookRAG", "GraphRAG", "RAPTOR", "LlamaRAG", "TreeRAG"]
+        spans = []
+        pos = 0
+        for text in texts_garbage + texts_good:
+            spans.append(_span(text, "method", start=pos))
+            pos += len(text) + 1
         inf = _static_inference([spans, []])
 
         logger = logging.getLogger("lodestone.scripts.extract_entities")
@@ -833,7 +1408,7 @@ class TestRejectRateWarning:
 
     def test_no_warn_below_min_samples(self, tmp_db_with_paper, fake_embedder, caplog):
         # 1 garbage span = 100% reject, but n_total < 10 → no WARNING.
-        inf = _static_inference([[_span("We", "Method")]])
+        inf = _static_inference([[_span("We", "method")]])
 
         logger = logging.getLogger("lodestone.scripts.extract_entities")
         logger.addHandler(caplog.handler)
@@ -883,10 +1458,17 @@ class TestCLI:
         monkeypatch.setattr(
             ee,
             "_default_inference",
-            lambda text, labels, threshold: [_span("BookRAG", "Method")],
+            lambda text, labels, threshold: [_span("BookRAG", "method")],
         )
-        # Stub the default tokenizer too so sub_chunk doesn't trigger model load.
-        monkeypatch.setattr(ee, "_default_tokenize", str.split)
+        # Stub the default tokenizer so sub_chunk doesn't trigger a model load.
+        # Offsets-based contract: return one (start, end) pair per whitespace-
+        # delimited token in the input.
+        import re as _re
+        monkeypatch.setattr(
+            ee,
+            "_default_tokenize",
+            lambda t: [(m.start(), m.end()) for m in _re.finditer(r"\S+", t)],
+        )
         # Also stub the real embedder so we don't load sentence-transformers.
         monkeypatch.setattr(ee, "Embedder", _FakeEmbedder)
 
@@ -910,7 +1492,7 @@ def test_real_gliner_extracts_method_entity(tmp_db_with_paper, fake_embedder):
     """Smoke test: real GLiNER2 weights extract at least one Method entity.
 
     Skipped unless ``-m slow`` is passed. Requires the HF cache to contain
-    ``fastino/gliner2-base-v1`` (``validate_models.py`` primes it).
+    ``fastino/gliner2-large-v1`` (``validate_models.py`` primes it).
     """
     extract(
         paper_name="paper_name_2024",

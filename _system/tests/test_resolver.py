@@ -1,6 +1,7 @@
 """Tests for the 5-tier term resolver (_system.resolution.resolver)."""
 from __future__ import annotations
 
+import logging
 import math
 import sqlite3
 
@@ -9,6 +10,9 @@ import sqlite_vec
 
 from _system.resolution import resolver as resolver_mod
 from _system.resolution.resolver import ResolvedTerm, resolve
+
+
+_RESOLVER_LOGGER = "lodestone._system.resolution.resolver"
 
 
 # ---------------------------------------------------------------------------
@@ -23,6 +27,7 @@ def _seed_canonical(
     domain: str = "rag",
     term_type: str = "entity",
     entity_type: str | None = "method",
+    entity_type_score: float = 0.0,
     first_seen_in: str = "seed_paper",
 ) -> int:
     """Insert one canonical_terms row and return the new id.
@@ -34,12 +39,66 @@ def _seed_canonical(
     cur = conn.execute(
         """
         INSERT INTO canonical_terms
-            (domain, term_type, entity_type, canonical_name, first_seen_in)
-        VALUES (?, ?, ?, ?, ?)
+            (domain, term_type, entity_type, entity_type_score,
+             canonical_name, first_seen_in)
+        VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (domain, term_type, entity_type or "", canonical_name, first_seen_in),
+        (
+            domain,
+            term_type,
+            entity_type or "",
+            entity_type_score,
+            canonical_name,
+            first_seen_in,
+        ),
     )
     return cur.lastrowid
+
+
+def _seed_entity_row(
+    conn: sqlite3.Connection,
+    *,
+    paper_name: str,
+    domain: str,
+    entity_name: str,
+    entity_type: str,
+) -> int:
+    """Insert one entities row tied to an existing papers row.
+
+    Used by flip tests to confirm historical entities rows get migrated
+    alongside canonical_terms.
+    """
+    cur = conn.execute(
+        """
+        INSERT INTO papers (
+            arxiv_id, paper_name, title, authors, date, abstract,
+            pdf_url, html_source, ingested_at, status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            f"arxiv_{paper_name}",
+            paper_name,
+            "t",
+            "a",
+            "2024-01-01",
+            "abs",
+            f"https://arxiv.org/pdf/arxiv_{paper_name}",
+            "arxiv",
+            "2024-01-01T00:00:00+00:00",
+            "extracted",
+        ),
+    )
+    paper_id = cur.lastrowid
+    conn.execute(
+        """
+        INSERT INTO entities
+            (paper_id, domain, paper_name, entity_name, entity_type,
+             source_breadcrumb)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (paper_id, domain, paper_name, entity_name, entity_type, "# Section"),
+    )
+    return paper_id
 
 
 def _seed_embedding(
@@ -270,12 +329,11 @@ class TestTier3Fuzzy:
 
         captured: dict[str, int] = {}
 
-        def spy(conn, *, domain, term_type, entity_type, raw):
+        def spy(conn, *, domain, term_type, raw):
             rows = original(
                 conn,
                 domain=domain,
                 term_type=term_type,
-                entity_type=entity_type,
                 raw=raw,
             )
             captured["n"] = len(rows)
@@ -301,17 +359,37 @@ class TestTier3Fuzzy:
 
 
 # ---------------------------------------------------------------------------
-# Tier 4: sqlite-vec KNN
+# Tier 4: sqlite-vec top-K + gradient walk
+#
+# All tests below construct candidate vectors as ``v[0] = cos(θ); v[axis] =
+# sin(θ)`` so the dot product with a query at ``v[0] = 1`` is exactly cos(θ).
+# Different ``axis`` values per seed keep the seed embeddings linearly
+# distinct without affecting their cosine-against-query.
 # ---------------------------------------------------------------------------
 
 
+def _unit_vec_with_dot(dot_with_query: float, axis: int) -> list[float]:
+    """Return a 384-dim unit vector whose dot product with the canonical query
+    (``v[0]=1``) is ``dot_with_query``. Energy in dim 0 sets the dot; the
+    remainder is parked in ``axis`` so distinct seeds stay orthogonal in their
+    non-query components.
+    """
+    if axis == 0:
+        raise ValueError("axis must be != 0 to keep the residual orthogonal to query")
+    vec = [0.0] * 384
+    vec[0] = dot_with_query
+    residual = math.sqrt(max(0.0, 1.0 - dot_with_query * dot_with_query))
+    vec[axis] = residual
+    return vec
+
+
 class TestTier4Embedding:
-    def test_near_neighbor_above_threshold_hits(self, conn, fake_embedder):
-        term_id = _seed_canonical(conn, canonical_name="hierarchical indexing")
-        # Unit vector; nearly-identical query vector has cos ~ 1.
-        seed_vec = [0.0] * 384
-        seed_vec[0] = 1.0
-        _seed_embedding(conn, term_id=term_id, vector=seed_vec)
+    def test_sharp_drop_after_top1_merges(self, conn, fake_embedder):
+        """Top-1 cos≈0.985, top-2 cos≈0.643 → ratio 0.653 < 0.88 → 1 survivor."""
+        a_id = _seed_canonical(conn, canonical_name="hierarchical indexing")
+        b_id = _seed_canonical(conn, canonical_name="distant concept")
+        _seed_embedding(conn, term_id=a_id, vector=_unit_vec_with_dot(math.cos(math.radians(10)), axis=1))
+        _seed_embedding(conn, term_id=b_id, vector=_unit_vec_with_dot(math.cos(math.radians(50)), axis=2))
 
         query_vec = [0.0] * 384
         query_vec[0] = 1.0
@@ -326,27 +404,51 @@ class TestTier4Embedding:
             source_paper="p1",
             embedder=fake_embedder,
         )
-        assert result.term_id == term_id
-        assert result.canonical_name == "hierarchical indexing"
         assert result.matched_via == "tier4"
+        assert result.term_id == a_id
+        assert result.canonical_name == "hierarchical indexing"
         rows = _alias_rows(conn)
-        assert rows == [(term_id, "tree retrieval", "p1", 4)]
+        assert rows == [(a_id, "tree retrieval", "p1", 4)]
 
-    def test_threshold_rejects_below_085_cosine(self, conn, fake_embedder):
-        """Query and seed vectors at cos≈0.5 (distance≈1.0) — below 0.85 threshold."""
-        term_id = _seed_canonical(conn, canonical_name="hierarchical indexing")
-        seed_vec = [0.0] * 384
-        seed_vec[0] = 1.0
-        _seed_embedding(conn, term_id=term_id, vector=seed_vec)
+    def test_two_close_candidates_fall_through_to_tier5(self, conn, fake_embedder):
+        """Top-1 cos≈0.999, top-2 cos≈0.998 → ratio ≈ 1.0 → 2 survivors → tier 5."""
+        a_id = _seed_canonical(conn, canonical_name="adaptive RRF")
+        b_id = _seed_canonical(conn, canonical_name="adaptive RRF fusion")
+        _seed_embedding(conn, term_id=a_id, vector=_unit_vec_with_dot(math.cos(math.radians(2)), axis=1))
+        _seed_embedding(conn, term_id=b_id, vector=_unit_vec_with_dot(math.cos(math.radians(3)), axis=2))
 
-        # 60° apart: cos=0.5. d^2 = 2 - 2*0.5 = 1.0, above 0.3 threshold.
-        angle = math.radians(60)
         query_vec = [0.0] * 384
-        query_vec[0] = math.cos(angle)
-        query_vec[1] = math.sin(angle)
+        query_vec[0] = 1.0
+        fake_embedder.preset("adaptive ranking fusion", query_vec)
+
+        before_canon = _canonical_count(conn)
+        result = resolve(
+            conn,
+            "adaptive ranking fusion",
+            domain="rag",
+            term_type="entity",
+            entity_type="method",
+            source_paper="p1",
+            embedder=fake_embedder,
+        )
+        assert result.matched_via == "tier5"
+        assert result.created_new is True
+        assert result.term_id != a_id and result.term_id != b_id
+        assert _canonical_count(conn) == before_canon + 1
+        # Neither pre-existing canonical absorbed an alias.
+        for tid, _alias, _src, _tier in _alias_rows(conn):
+            assert tid not in (a_id, b_id)
+
+    def test_top1_below_floor_falls_through_to_tier5(self, conn, fake_embedder):
+        """Top-1 cos≈0.643 < 0.70 floor → no merge, even with no other candidates."""
+        a_id = _seed_canonical(conn, canonical_name="hierarchical indexing")
+        _seed_embedding(conn, term_id=a_id, vector=_unit_vec_with_dot(1.0, axis=1))
+
+        query_vec = [0.0] * 384
+        query_vec[0] = math.cos(math.radians(50))
+        query_vec[1] = math.sin(math.radians(50))
         fake_embedder.preset("unrelated thing", query_vec)
 
-        # No tier 1/2/3 hit, tier 4 below threshold → falls through to tier 5.
         result = resolve(
             conn,
             "unrelated thing",
@@ -358,24 +460,58 @@ class TestTier4Embedding:
         )
         assert result.matched_via == "tier5"
         assert result.created_new is True
+        # The original canonical should not have absorbed this raw form.
+        assert (a_id, "unrelated thing", "p1", 4) not in _alias_rows(conn)
 
-    def test_threshold_accepts_just_above_085_cosine(self, conn, fake_embedder):
-        """Query at exactly the seed vector — cos=1.0, distance=0. Always a hit."""
-        term_id = _seed_canonical(conn, canonical_name="hierarchical indexing")
-        seed_vec = [0.0] * 384
-        seed_vec[0] = 1.0
-        _seed_embedding(conn, term_id=term_id, vector=seed_vec)
+    def test_uniform_decline_all_survive_falls_through_to_tier5(self, conn, fake_embedder):
+        """K=10 candidates with every consecutive ratio ≥ 0.88 → all survive →
+        no sharp drop → tier 5. 'Everything is mildly similar' isn't a merge.
+        """
+        # Hand-picked ramp where every adjacent ratio ≥ 0.88. Only the first
+        # value is above the 0.70 floor — but the floor only gates top-1; the
+        # walk continues regardless.
+        ramp = [0.99, 0.92, 0.86, 0.80, 0.75, 0.70, 0.66, 0.62, 0.58, 0.55]
+        ids: list[int] = []
+        for i, c in enumerate(ramp):
+            cid = _seed_canonical(conn, canonical_name=f"ramp{i}")
+            ids.append(cid)
+            _seed_embedding(conn, term_id=cid, vector=_unit_vec_with_dot(c, axis=i + 1))
 
-        # ~30° apart: cos≈0.866, just above threshold. d^2 = 2 - 2*cos ≈ 0.268.
-        angle = math.radians(30)
         query_vec = [0.0] * 384
-        query_vec[0] = math.cos(angle)
-        query_vec[1] = math.sin(angle)
-        fake_embedder.preset("close enough", query_vec)
+        query_vec[0] = 1.0
+        fake_embedder.preset("ramp probe", query_vec)
+
+        before_canon = _canonical_count(conn)
+        result = resolve(
+            conn,
+            "ramp probe",
+            domain="rag",
+            term_type="entity",
+            entity_type="method",
+            source_paper="p1",
+            embedder=fake_embedder,
+        )
+        assert result.matched_via == "tier5"
+        assert result.created_new is True
+        assert _canonical_count(conn) == before_canon + 1
+        # No aliases attached to any ramp canonical.
+        for tid, _alias, _src, _tier in _alias_rows(conn):
+            assert tid not in ids
+
+    def test_just_above_gradient_single_survivor_merges(self, conn, fake_embedder):
+        """top1=0.90, top2=0.79; ratio 0.878 < 0.88 → top2 fails → 1 survivor."""
+        a_id = _seed_canonical(conn, canonical_name="winner")
+        b_id = _seed_canonical(conn, canonical_name="runner-up")
+        _seed_embedding(conn, term_id=a_id, vector=_unit_vec_with_dot(0.90, axis=1))
+        _seed_embedding(conn, term_id=b_id, vector=_unit_vec_with_dot(0.79, axis=2))
+
+        query_vec = [0.0] * 384
+        query_vec[0] = 1.0
+        fake_embedder.preset("close to A", query_vec)
 
         result = resolve(
             conn,
-            "close enough",
+            "close to A",
             domain="rag",
             term_type="entity",
             entity_type="method",
@@ -383,7 +519,57 @@ class TestTier4Embedding:
             embedder=fake_embedder,
         )
         assert result.matched_via == "tier4"
-        assert result.term_id == term_id
+        assert result.term_id == a_id
+
+    def test_just_below_gradient_two_survivors_fall_through(self, conn, fake_embedder):
+        """top1=0.90, top2=0.80; ratio 0.889 ≥ 0.88 → top2 passes → 2 survivors."""
+        a_id = _seed_canonical(conn, canonical_name="winner")
+        b_id = _seed_canonical(conn, canonical_name="runner-up")
+        _seed_embedding(conn, term_id=a_id, vector=_unit_vec_with_dot(0.90, axis=1))
+        _seed_embedding(conn, term_id=b_id, vector=_unit_vec_with_dot(0.80, axis=2))
+
+        query_vec = [0.0] * 384
+        query_vec[0] = 1.0
+        fake_embedder.preset("close to both", query_vec)
+
+        result = resolve(
+            conn,
+            "close to both",
+            domain="rag",
+            term_type="entity",
+            entity_type="method",
+            source_paper="p1",
+            embedder=fake_embedder,
+        )
+        assert result.matched_via == "tier5"
+        assert result.created_new is True
+        # Neither pre-existing canonical should have absorbed an alias.
+        for tid, _alias, _src, _tier in _alias_rows(conn):
+            assert tid not in (a_id, b_id)
+
+    def test_single_candidate_above_floor_merges(self, conn, fake_embedder):
+        """Degenerate case: only one canonical in scope, no runner-up to
+        compare against. Falls back to 'top-1 above floor → merge'."""
+        a_id = _seed_canonical(conn, canonical_name="lonely canonical")
+        _seed_embedding(conn, term_id=a_id, vector=_unit_vec_with_dot(1.0, axis=1))
+
+        # Query at cos ≈ 0.95 → above floor, no runner-up.
+        query_vec = [0.0] * 384
+        query_vec[0] = math.cos(math.radians(18))
+        query_vec[1] = math.sin(math.radians(18))
+        fake_embedder.preset("similar lonely", query_vec)
+
+        result = resolve(
+            conn,
+            "similar lonely",
+            domain="rag",
+            term_type="entity",
+            entity_type="method",
+            source_paper="p1",
+            embedder=fake_embedder,
+        )
+        assert result.matched_via == "tier4"
+        assert result.term_id == a_id
 
 
 # ---------------------------------------------------------------------------
@@ -615,16 +801,22 @@ class TestMultiPaperProvenance:
 
 class TestResolvedTermShape:
     def test_is_named_tuple_with_expected_fields(self, conn, fake_embedder):
-        term_id = _seed_canonical(conn, canonical_name="BookRAG")
+        term_id = _seed_canonical(
+            conn, canonical_name="BookRAG", entity_type="method"
+        )
         r = resolve(conn, "BookRAG", domain="rag", term_type="entity",
                     entity_type="method", source_paper="p1", embedder=fake_embedder)
         # NamedTuple: positional and attribute access both work.
         assert r[0] == r.term_id == term_id
         assert r[1] == r.canonical_name == "BookRAG"
-        assert r[2] == r.matched_via == "tier1"
-        assert r[3] == r.created_new is False
+        assert r[2] == r.entity_type == "method"
+        assert r[3] == r.entity_type_score == 0.0
+        assert r[4] == r.matched_via == "tier1"
+        assert r[5] == r.created_new is False
         assert isinstance(r.term_id, int)
         assert isinstance(r.canonical_name, str)
+        assert isinstance(r.entity_type, str)
+        assert isinstance(r.entity_type_score, float)
         assert isinstance(r.matched_via, str)
         assert isinstance(r.created_new, bool)
 
@@ -668,3 +860,291 @@ class TestPendingFtsRebuilds:
             assert 99 not in resolver_mod.pending_fts_rebuilds(other)
         finally:
             other.close()
+
+
+# ---------------------------------------------------------------------------
+# entity_type flip on higher-confidence re-encounter
+# ---------------------------------------------------------------------------
+
+
+def _read_canonical(
+    conn: sqlite3.Connection, term_id: int
+) -> tuple[str, float]:
+    row = conn.execute(
+        "SELECT entity_type, entity_type_score FROM canonical_terms WHERE id = ?",
+        (term_id,),
+    ).fetchone()
+    return (row[0], float(row[1]))
+
+
+class TestEntityTypeFlip:
+    def test_tier1_flip_on_higher_score_different_type(
+        self, conn, fake_embedder, caplog
+    ):
+        """Paper 1 inserts at score 0.4 / method; paper 2 resolves the same name
+        as software at 0.8 — canonical flips and INFO log fires."""
+        term_id = _seed_canonical(
+            conn,
+            canonical_name="DPR",
+            entity_type="method",
+            entity_type_score=0.4,
+        )
+        _seed_entity_row(
+            conn,
+            paper_name="p_old",
+            domain="rag",
+            entity_name="DPR",
+            entity_type="method",
+        )
+
+        logger = logging.getLogger(_RESOLVER_LOGGER)
+        logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=_RESOLVER_LOGGER):
+                r = resolve(
+                    conn,
+                    "DPR",
+                    domain="rag",
+                    term_type="entity",
+                    entity_type="software",
+                    entity_type_score=0.8,
+                    source_paper="p2",
+                    embedder=fake_embedder,
+                )
+        finally:
+            logger.removeHandler(caplog.handler)
+
+        assert r.term_id == term_id
+        assert r.entity_type == "software"
+        assert r.entity_type_score == pytest.approx(0.8)
+        assert r.matched_via == "tier1"
+        assert _read_canonical(conn, term_id) == ("software", pytest.approx(0.8))
+
+        # Historical entities row must track the flip so index_paper's
+        # JOIN on (canonical_name, entity_type) keeps finding it.
+        entity_type_old_paper = conn.execute(
+            "SELECT entity_type FROM entities WHERE paper_name = ? "
+            "AND entity_name = ?",
+            ("p_old", "DPR"),
+        ).fetchone()[0]
+        assert entity_type_old_paper == "software"
+
+        assert any(
+            "entity_type flip" in rec.getMessage()
+            and rec.levelname == "INFO"
+            for rec in caplog.records
+        ), "expected an INFO log entry describing the flip"
+
+    def test_tier1_no_flip_on_lower_score(
+        self, conn, fake_embedder, caplog
+    ):
+        term_id = _seed_canonical(
+            conn,
+            canonical_name="DPR",
+            entity_type="software",
+            entity_type_score=0.8,
+        )
+        logger = logging.getLogger(_RESOLVER_LOGGER)
+        logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.INFO, logger=_RESOLVER_LOGGER):
+                r = resolve(
+                    conn,
+                    "DPR",
+                    domain="rag",
+                    term_type="entity",
+                    entity_type="method",
+                    entity_type_score=0.4,
+                    source_paper="p2",
+                    embedder=fake_embedder,
+                )
+        finally:
+            logger.removeHandler(caplog.handler)
+        assert r.entity_type == "software"
+        assert r.entity_type_score == pytest.approx(0.8)
+        assert _read_canonical(conn, term_id) == ("software", pytest.approx(0.8))
+        assert not any(
+            "entity_type flip" in rec.getMessage() for rec in caplog.records
+        )
+
+    def test_tier1_no_flip_on_equal_score(self, conn, fake_embedder):
+        """Strictly-greater gate: equal score does not flip."""
+        term_id = _seed_canonical(
+            conn,
+            canonical_name="DPR",
+            entity_type="method",
+            entity_type_score=0.7,
+        )
+        r = resolve(
+            conn,
+            "DPR",
+            domain="rag",
+            term_type="entity",
+            entity_type="software",
+            entity_type_score=0.7,
+            source_paper="p2",
+            embedder=fake_embedder,
+        )
+        assert r.entity_type == "method"
+        assert r.entity_type_score == pytest.approx(0.7)
+        assert _read_canonical(conn, term_id) == ("method", pytest.approx(0.7))
+
+    def test_tier1_no_flip_on_same_type(self, conn, fake_embedder):
+        """Same type + higher score: score is NOT bumped. The stored score is
+        the score at which the *type* was established; types matching means
+        no evidence to reconsider, even if a higher-confidence mention lands.
+        (Per handoff: 'If paper 2's resolved entity_type matches the stored
+        one: no change.')"""
+        term_id = _seed_canonical(
+            conn,
+            canonical_name="DPR",
+            entity_type="method",
+            entity_type_score=0.5,
+        )
+        r = resolve(
+            conn,
+            "DPR",
+            domain="rag",
+            term_type="entity",
+            entity_type="method",
+            entity_type_score=0.9,
+            source_paper="p2",
+            embedder=fake_embedder,
+        )
+        assert r.entity_type == "method"
+        assert r.entity_type_score == pytest.approx(0.5)
+        assert _read_canonical(conn, term_id) == ("method", pytest.approx(0.5))
+
+    def test_tier5_persists_score(self, conn, fake_embedder):
+        v = [0.0] * 384
+        v[7] = 1.0
+        fake_embedder.preset("NovelTerm", v)
+
+        r = resolve(
+            conn,
+            "NovelTerm",
+            domain="rag",
+            term_type="entity",
+            entity_type="method",
+            entity_type_score=0.72,
+            source_paper="p1",
+            embedder=fake_embedder,
+        )
+        assert r.matched_via == "tier5"
+        assert r.entity_type == "method"
+        assert r.entity_type_score == pytest.approx(0.72)
+        stored = _read_canonical(conn, r.term_id)
+        assert stored == ("method", pytest.approx(0.72))
+
+    def test_tier3_flip_migrates_entities_rows(self, conn, fake_embedder):
+        """Fuzzy re-encounter still flips: paper 1 seeds BookRAG/method@0.3;
+        paper 2's 'BookRAGs' resolves via tier 3 as software@0.9, overturning
+        both the canonical and paper 1's entities row."""
+        term_id = _seed_canonical(
+            conn,
+            canonical_name="BookRAG",
+            entity_type="method",
+            entity_type_score=0.3,
+        )
+        _seed_entity_row(
+            conn,
+            paper_name="p_old",
+            domain="rag",
+            entity_name="BookRAG",
+            entity_type="method",
+        )
+
+        r = resolve(
+            conn,
+            "BookRAGs",
+            domain="rag",
+            term_type="entity",
+            entity_type="software",
+            entity_type_score=0.9,
+            source_paper="p2",
+            embedder=fake_embedder,
+        )
+        assert r.matched_via == "tier3"
+        assert r.entity_type == "software"
+        assert r.entity_type_score == pytest.approx(0.9)
+        assert _read_canonical(conn, term_id) == ("software", pytest.approx(0.9))
+        assert conn.execute(
+            "SELECT entity_type FROM entities WHERE paper_name = ? "
+            "AND entity_name = ?",
+            ("p_old", "BookRAG"),
+        ).fetchone()[0] == "software"
+
+    def test_flip_does_not_touch_other_domain_entities(
+        self, conn, fake_embedder
+    ):
+        """Historical UPDATE is scoped by domain: a DPR/method row in another
+        domain must not be rewritten by a rag-domain flip."""
+        conn.execute(
+            "INSERT OR IGNORE INTO domains (name) VALUES (?)",
+            ("vision",),
+        )
+        _seed_canonical(
+            conn,
+            canonical_name="DPR",
+            entity_type="method",
+            entity_type_score=0.3,
+        )
+        _seed_entity_row(
+            conn,
+            paper_name="p_old_rag",
+            domain="rag",
+            entity_name="DPR",
+            entity_type="method",
+        )
+        _seed_entity_row(
+            conn,
+            paper_name="p_old_vision",
+            domain="vision",
+            entity_name="DPR",
+            entity_type="method",
+        )
+        resolve(
+            conn,
+            "DPR",
+            domain="rag",
+            term_type="entity",
+            entity_type="software",
+            entity_type_score=0.8,
+            source_paper="p2",
+            embedder=fake_embedder,
+        )
+        rag_type = conn.execute(
+            "SELECT entity_type FROM entities WHERE paper_name = ?",
+            ("p_old_rag",),
+        ).fetchone()[0]
+        vision_type = conn.execute(
+            "SELECT entity_type FROM entities WHERE paper_name = ?",
+            ("p_old_vision",),
+        ).fetchone()[0]
+        assert rag_type == "software"
+        assert vision_type == "method"
+
+    def test_non_entity_callers_never_flip(self, conn, fake_embedder):
+        """Collections / topics resolves pass entity_type=None and score=0.0.
+        The gate on non-empty new type must prevent any flip, even though
+        stored entity_type is '' and the comparison is trivially 'different'.
+        """
+        term_id = _seed_canonical(
+            conn,
+            canonical_name="retrieval-augmented generation",
+            term_type="collection",
+            entity_type=None,
+            entity_type_score=0.0,
+        )
+        r = resolve(
+            conn,
+            "retrieval-augmented generation",
+            domain="rag",
+            term_type="collection",
+            entity_type=None,
+            source_paper="p2",
+            embedder=fake_embedder,
+        )
+        assert r.entity_type == ""
+        assert r.entity_type_score == 0.0
+        assert _read_canonical(conn, term_id) == ("", 0.0)
