@@ -14,6 +14,7 @@ EXPECTED_TABLES = {
     "papers",
     "figures",
     "page_images",
+    "paper_references",
     "abstracts",
     "sections",
     "terms_fts",
@@ -42,6 +43,7 @@ def _user_tables(conn: sqlite3.Connection) -> set[str]:
 # Plain (non-virtual) tables — support row-count queries directly.
 _PLAIN_TABLES = {
     "domains", "collections", "papers", "figures", "page_images",
+    "paper_references",
     "canonical_terms", "term_aliases", "entities", "paper_topics",
 }
 
@@ -68,7 +70,7 @@ def _seed_paper(conn: sqlite3.Connection, paper_id: int = 1) -> None:
     )
 
 
-def test_init_db_creates_all_12_tables(conn):
+def test_init_db_creates_all_expected_tables(conn):
     assert _user_tables(conn) == EXPECTED_TABLES
 
 

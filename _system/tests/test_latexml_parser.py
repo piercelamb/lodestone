@@ -11,7 +11,12 @@ from pathlib import Path
 
 import pytest
 
-from _system.html.latexml_parser import FigureDescriptor, ParsedPaper, parse
+from _system.html.latexml_parser import (
+    FigureDescriptor,
+    ParsedPaper,
+    ReferenceDescriptor,
+    parse,
+)
 
 FIXTURE = Path(__file__).parent / "fixtures" / "latexml_small.html"
 
@@ -301,13 +306,13 @@ def test_subfigure_panels_get_flat_figure_numbers() -> None:
 # --- API shape ---
 
 
-def test_return_type_is_named_tuple_with_two_fields() -> None:
-    """ParsedPaper and FigureDescriptor are NamedTuples (hashable-adjacent)."""
+def test_return_type_is_named_tuple_with_three_fields() -> None:
+    """ParsedPaper / FigureDescriptor / ReferenceDescriptor are NamedTuples."""
     paper = parse(
         '<html><body><p>hi</p></body></html>', base_url="https://example.com/"
     )
     assert isinstance(paper, tuple)
-    assert paper._fields == ("markdown", "figures")
+    assert paper._fields == ("markdown", "figures", "references")
 
 
 def test_figure_descriptor_is_named_tuple() -> None:
@@ -520,3 +525,246 @@ def test_module_does_not_import_heavy_deps() -> None:
     assert "import subprocess" not in src
     assert "sentence_transformers" not in src
     assert "gliner2" not in src
+
+
+# --- bibliography extraction (standard ltx_bibitem regime) ---
+
+
+def _wrap_biblist(*items: str) -> str:
+    """Wrap bibitem `<li>` strings in the standard `<ul class='ltx_biblist'>`
+    + bibliography section. The article class is set so the parser scopes
+    in correctly."""
+    body = "".join(items)
+    return (
+        '<html><body><article class="ltx_document">'
+        '<section class="ltx_bibliography">'
+        '<h2 class="ltx_title">References</h2>'
+        f'<ul class="ltx_biblist">{body}</ul>'
+        "</section></article></body></html>"
+    )
+
+
+def test_reference_descriptor_is_named_tuple() -> None:
+    rd = ReferenceDescriptor(
+        bibitem_id="bib.bib1", ref_number=1, raw_text="x", cited_arxiv_id=None
+    )
+    assert rd._fields == ("bibitem_id", "ref_number", "raw_text", "cited_arxiv_id")
+
+
+def test_bibitem_extracted_from_standard_html() -> None:
+    """Ar5iv-style bibitem with bibblocks; arxiv-id captured, bibitem_id kept."""
+    html = _wrap_biblist(
+        '<li id="bib.bib1" class="ltx_bibitem">'
+        '<span class="ltx_tag ltx_role_refnum ltx_tag_bibitem">Beltagy et al. (2020)</span>'
+        '<span class="ltx_bibblock">Iz Beltagy, Matthew E Peters, and Arman Cohan.</span>'
+        '<span class="ltx_bibblock">Longformer: The long-document transformer.</span>'
+        '<span class="ltx_bibblock"><em>arXiv preprint arXiv:2004.05150</em>, 2020.</span>'
+        "</li>"
+    )
+    paper = parse(html, base_url="https://ar5iv.labs.arxiv.org/html/2310.08560/")
+    assert len(paper.references) == 1
+    ref = paper.references[0]
+    assert ref.bibitem_id == "bib.bib1"
+    assert ref.ref_number == 1
+    assert ref.cited_arxiv_id == "2004.05150"
+    assert "Longformer" in ref.raw_text
+    # Bibtag (the rendered "[N]" / "Author (Year)" label) must NOT pollute
+    # raw_text — it carries no semantic information beyond ref_number and
+    # would just inflate the field for query-time display.
+    assert "Beltagy et al. (2020)" not in ref.raw_text
+
+
+def test_bibitem_position_is_one_based_ref_number() -> None:
+    """ref_number = position+1 across a multi-bibitem list."""
+    html = _wrap_biblist(
+        '<li id="bib.bib1" class="ltx_bibitem">'
+        '<span class="ltx_bibblock">First. arXiv:1111.11111.</span></li>',
+        '<li id="bib.bib2" class="ltx_bibitem">'
+        '<span class="ltx_bibblock">Second. arXiv:2222.22222.</span></li>',
+        '<li id="bib.bib3" class="ltx_bibitem">'
+        '<span class="ltx_bibblock">Third. arXiv:3333.33333.</span></li>',
+    )
+    paper = parse(html, base_url="https://example.com/")
+    assert [r.ref_number for r in paper.references] == [1, 2, 3]
+    assert [r.bibitem_id for r in paper.references] == ["bib.bib1", "bib.bib2", "bib.bib3"]
+    assert [r.cited_arxiv_id for r in paper.references] == [
+        "1111.11111", "2222.22222", "3333.33333",
+    ]
+
+
+def test_bibitem_with_no_arxiv_id_yields_null_cited() -> None:
+    """A NeurIPS-only reference with no preprint id parses fine, just no link."""
+    html = _wrap_biblist(
+        '<li id="bib.bib1" class="ltx_bibitem">'
+        '<span class="ltx_bibblock">Brown et al. Language models are few-shot learners.</span>'
+        '<span class="ltx_bibblock"><em>NeurIPS</em>, 2020.</span>'
+        "</li>"
+    )
+    paper = parse(html, base_url="https://example.com/")
+    assert len(paper.references) == 1
+    assert paper.references[0].cited_arxiv_id is None
+
+
+def test_bibitem_legacy_arxiv_id_preserved() -> None:
+    """Pre-2007 ids of shape `cs/0701006` survive normalization."""
+    html = _wrap_biblist(
+        '<li id="bib.bib1" class="ltx_bibitem">'
+        '<span class="ltx_bibblock">Old paper. arXiv:cs/0701006.</span></li>'
+    )
+    paper = parse(html, base_url="https://example.com/")
+    assert paper.references[0].cited_arxiv_id == "cs/0701006"
+
+
+def test_bibitem_arxiv_url_form_normalizes_to_bare() -> None:
+    """https URL → bare canonical form, version suffix stripped."""
+    html = _wrap_biblist(
+        '<li id="bib.bib1" class="ltx_bibitem">'
+        '<span class="ltx_bibblock">See https://arxiv.org/abs/2310.08560v2 for details.</span></li>'
+    )
+    paper = parse(html, base_url="https://example.com/")
+    assert paper.references[0].cited_arxiv_id == "2310.08560"
+
+
+def test_bibitem_arxiv_id_with_trailing_punctuation() -> None:
+    """`(arXiv:2310.08560).` resolves cleanly — punctuation outside the id."""
+    html = _wrap_biblist(
+        '<li id="bib.bib1" class="ltx_bibitem">'
+        '<span class="ltx_bibblock">See (arXiv:2310.08560).</span></li>'
+    )
+    paper = parse(html, base_url="https://example.com/")
+    assert paper.references[0].cited_arxiv_id == "2310.08560"
+
+
+def test_bibitem_with_two_arxiv_ids_keeps_first() -> None:
+    """A bibitem citing both a journal and a preprint version takes the first."""
+    html = _wrap_biblist(
+        '<li id="bib.bib1" class="ltx_bibitem">'
+        '<span class="ltx_bibblock">Foo. arXiv:1111.11111. See also arXiv:2222.22222.</span></li>'
+    )
+    paper = parse(html, base_url="https://example.com/")
+    assert paper.references[0].cited_arxiv_id == "1111.11111"
+
+
+def test_bibitem_with_versioned_modern_id_strips_version() -> None:
+    html = _wrap_biblist(
+        '<li id="bib.bib1" class="ltx_bibitem">'
+        '<span class="ltx_bibblock">Foo. arXiv:2310.08560v3.</span></li>'
+    )
+    paper = parse(html, base_url="https://example.com/")
+    assert paper.references[0].cited_arxiv_id == "2310.08560"
+
+
+# --- bibliography extraction (hand-typed paragraph fallback) ---
+
+
+def _wrap_handtyped_refs(*paragraphs: str, heading: str = "References") -> str:
+    """A 2604.15484-style hand-typed bibliography: a section with a
+    "References" / "Bibliography" heading whose body is bare `<p>` paragraphs
+    with manual `[N]` numbering. No ltx_bibitem markup."""
+    body = "".join(paragraphs)
+    return (
+        '<html><body><article class="ltx_document">'
+        '<section class="ltx_subsection">'
+        f'<h3 class="ltx_title">{heading}</h3>'
+        f"{body}"
+        "</section></article></body></html>"
+    )
+
+
+def test_handtyped_paragraphs_extracted_when_no_bibitem() -> None:
+    """When no `ltx_bibitem` is present, fall back to <p>s in a References section."""
+    html = _wrap_handtyped_refs(
+        '<p class="ltx_p">[1] Carbonell, J. The use of MMR. <em>SIGIR</em>.</p>',
+        '<p class="ltx_p">[2] Packer, C. MemGPT. <em>arXiv:2310.08560</em>.</p>',
+        '<p class="ltx_p">[3] Cormack, G. RRF. <em>SIGIR</em>.</p>',
+    )
+    paper = parse(html, base_url="https://arxiv.org/html/2604.15484/")
+    assert len(paper.references) == 3
+    assert [r.bibitem_id for r in paper.references] == [None, None, None]
+    assert [r.ref_number for r in paper.references] == [1, 2, 3]
+    assert paper.references[1].cited_arxiv_id == "2310.08560"
+    # The leading "[N] " token must be stripped from raw_text.
+    assert not paper.references[0].raw_text.startswith("[1]")
+
+
+def test_handtyped_bibliography_heading_also_matches() -> None:
+    """Authors title the section either 'References' or 'Bibliography'."""
+    html = _wrap_handtyped_refs(
+        '<p class="ltx_p">[1] Foo. arXiv:1111.11111.</p>',
+        heading="Bibliography",
+    )
+    paper = parse(html, base_url="https://example.com/")
+    assert len(paper.references) == 1
+    assert paper.references[0].cited_arxiv_id == "1111.11111"
+
+
+def test_handtyped_paragraph_without_leading_number_falls_back_to_position() -> None:
+    """Paragraph that doesn't start with `[N]` still gets a stable ref_number."""
+    html = _wrap_handtyped_refs(
+        '<p class="ltx_p">Carbonell, J. The use of MMR. SIGIR.</p>',
+        '<p class="ltx_p">[2] Packer, C. arXiv:2310.08560.</p>',
+    )
+    paper = parse(html, base_url="https://example.com/")
+    assert [r.ref_number for r in paper.references] == [1, 2]
+
+
+def test_handtyped_skipped_when_bibitem_present() -> None:
+    """Standard bibitem path takes priority — heading-based fallback only fires
+    when zero bibitems are found, otherwise both regimes would double-count."""
+    html = (
+        '<html><body><article class="ltx_document">'
+        '<section class="ltx_bibliography">'
+        '<h2 class="ltx_title">References</h2>'
+        '<ul class="ltx_biblist">'
+        '<li id="bib.bib1" class="ltx_bibitem">'
+        '<span class="ltx_bibblock">Foo. arXiv:1111.11111.</span></li>'
+        "</ul>"
+        # Stray paragraph that would otherwise be picked up by the fallback.
+        '<p class="ltx_p">[2] Should not be picked up.</p>'
+        "</section></article></body></html>"
+    )
+    paper = parse(html, base_url="https://example.com/")
+    assert len(paper.references) == 1
+    assert paper.references[0].bibitem_id == "bib.bib1"
+
+
+# --- empty / missing bibliography ---
+
+
+def test_no_bibliography_returns_empty_list_and_warns(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Some workshop papers truly have no references; that's not an error."""
+    html = (
+        '<html><body><article class="ltx_document">'
+        '<section class="ltx_section">'
+        '<h2 class="ltx_title">Body</h2>'
+        '<p>just some body text, no references at all.</p>'
+        "</section></article></body></html>"
+    )
+    # See test_math_without_alttext_escapes_dollars_and_warns above for the
+    # propagate=False workaround pattern.
+    logger = logging.getLogger("lodestone.html.latexml_parser")
+    logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger="lodestone.html.latexml_parser"):
+            paper = parse(html, base_url="https://example.com/2604.99999/")
+    finally:
+        logger.removeHandler(caplog.handler)
+    assert paper.references == []
+    assert any(
+        "no bibliography found" in rec.getMessage() and "2604.99999" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_empty_bibliography_section_returns_empty_list() -> None:
+    """A References section with no body content is treated as empty."""
+    html = (
+        '<html><body><article class="ltx_document">'
+        '<section class="ltx_subsection">'
+        '<h3 class="ltx_title">References</h3>'
+        "</section></article></body></html>"
+    )
+    paper = parse(html, base_url="https://example.com/")
+    assert paper.references == []

@@ -66,6 +66,33 @@ CREATE TABLE IF NOT EXISTS page_images (
     PRIMARY KEY(paper_id, page_number)
 );
 
+CREATE TABLE IF NOT EXISTS paper_references (
+    id INTEGER PRIMARY KEY,
+    paper_id INTEGER NOT NULL REFERENCES papers(id),
+    -- Source-side identity. bibitem_id is the LaTeXML anchor target
+    -- ("bib.bib28") for standard `<li class="ltx_bibitem">` extractions;
+    -- NULL for hand-typed papers where references are bare `<p>` paragraphs
+    -- in a "References" section. ref_number is the [N] from a hand-typed
+    -- paper or the 1-based bibitem position for the standard regime, so
+    -- query-time `\[(\d+)\]` lookups are uniform across both shapes.
+    bibitem_id TEXT,
+    ref_number INTEGER NOT NULL,
+    raw_text TEXT NOT NULL,
+    -- Resolved-target identity. cited_arxiv_id is the bare canonical form
+    -- (e.g. "2310.08560" or legacy "cs/0701006"), normalized from the
+    -- `arXiv:...` / `arxiv.org/abs/...` token regex. NULL when the
+    -- reference contains no arxiv-id (NeurIPS-only paper, missing eprint
+    -- field, etc.). cited_paper_id is set when cited_arxiv_id matches a
+    -- row in papers; otherwise NULL.
+    cited_arxiv_id TEXT,
+    cited_paper_id INTEGER REFERENCES papers(id),
+    UNIQUE(paper_id, ref_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_refs_paper ON paper_references(paper_id);
+CREATE INDEX IF NOT EXISTS idx_paper_refs_cited_arxiv ON paper_references(cited_arxiv_id);
+CREATE INDEX IF NOT EXISTS idx_paper_refs_cited_paper ON paper_references(cited_paper_id);
+
 -- ============================================================
 -- GROUP 2: FULL-TEXT SEARCH (BM25)
 -- ============================================================

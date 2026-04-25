@@ -1,4 +1,4 @@
-"""LaTeXML / ar5iv HTML -> markdown + figure descriptors.
+"""LaTeXML / ar5iv HTML -> markdown + figure descriptors + reference descriptors.
 
 Pure / offline. No HTTP, no DB, no subprocess. The only "network-ish" op is
 ``urljoin(base_url, src)``, which is pure string work. Any download of
@@ -16,6 +16,7 @@ from urllib.parse import urljoin
 
 import lxml.html
 
+from _system.utils.arxiv_urls import extract_arxiv_id_from_text
 from _system.utils.logging import get_logger
 
 _logger = get_logger("html.latexml_parser")
@@ -34,6 +35,10 @@ class LtxClass(StrEnum):
     CAPTION = "ltx_caption"
     TAG = "ltx_tag"
     REF = "ltx_ref"
+    BIBLIOGRAPHY = "ltx_bibliography"
+    BIBLIST = "ltx_biblist"
+    BIBITEM = "ltx_bibitem"
+    BIBBLOCK = "ltx_bibblock"
 
 
 class FigureDescriptor(NamedTuple):
@@ -47,9 +52,33 @@ class FigureDescriptor(NamedTuple):
     inline_mime: Optional[str]
 
 
+class ReferenceDescriptor(NamedTuple):
+    """One bibliography entry recovered from the paper's HTML.
+
+    ``bibitem_id`` is the LaTeXML anchor target (e.g. ``bib.bib28``) for
+    entries pulled from a standard ``<li class="ltx_bibitem">``. Hand-typed
+    bibliographies (paragraphs in a "References" section, no LaTeXML markup)
+    leave it ``None``.
+
+    ``ref_number`` is always present: the literal ``[N]`` from a hand-typed
+    paragraph, or the 1-based bibitem position for the standard regime.
+    Query-time lookups regex ``\\[(\\d+)\\]`` against section text and join
+    on this column, so the value must be uniform across regimes.
+
+    ``cited_arxiv_id`` is the bare canonical form (no version suffix), or
+    ``None`` if the entry contains no recognizable arxiv mention.
+    """
+
+    bibitem_id: Optional[str]
+    ref_number: int
+    raw_text: str
+    cited_arxiv_id: Optional[str]
+
+
 class ParsedPaper(NamedTuple):
     markdown: str
     figures: list[FigureDescriptor]
+    references: list[ReferenceDescriptor]
 
 
 _SECTION_DEPTHS: dict[str, int] = {
@@ -70,6 +99,18 @@ _BLANK_RUN_RE = re.compile(r"\n{3,}")
 
 _HEADER_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 _SKIP_TAGS = {"head", "script", "style", "noscript"}
+
+# Heading text (after numbering tags are stripped) that identifies the
+# bibliography section in hand-typed papers. Authors who skip `\bibitem`
+# and number references manually still title the section "References" or
+# "Bibliography" by convention. Matched case-insensitively against the
+# normalized title text.
+_REFERENCES_HEADING_RE = re.compile(r"^(references|bibliography)\s*$", re.IGNORECASE)
+
+# Leading "[N] " token on a hand-typed reference paragraph. The bracketed
+# number is captured; if absent, the reference falls back to its 1-based
+# paragraph index for `ref_number`.
+_LEADING_REF_NUMBER_RE = re.compile(r"^\s*\[(\d+)\]\s*")
 
 
 def _normalize_ws(s: str) -> str:
@@ -105,7 +146,10 @@ def parse(html: str, base_url: str) -> ParsedPaper:
         target = bodies[0] if bodies else root
     markdown = _convert(target, state)
     markdown = _postprocess(markdown)
-    return ParsedPaper(markdown=markdown, figures=state.figures)
+    references = _extract_references(target, base_url)
+    return ParsedPaper(
+        markdown=markdown, figures=state.figures, references=references
+    )
 
 
 @dataclass
@@ -463,3 +507,136 @@ def _postprocess(md: str) -> str:
     md = _BLANK_RUN_RE.sub("\n\n", md)
     md = md.strip()
     return md + "\n" if md else ""
+
+
+def _extract_references(target, base_url: str) -> list[ReferenceDescriptor]:
+    """Pull bibliography entries out of the HTML.
+
+    Two regimes are supported:
+
+    1. **Standard LaTeXML output** — every reference is rendered as
+       ``<li class="ltx_bibitem" id="bib.bibN">`` containing one or more
+       ``<span class="ltx_bibblock">`` children. This covers ~95% of arxiv
+       papers. We pull bibitem_id from the ``id`` attribute and concatenate
+       all bibblock text into ``raw_text``.
+
+    2. **Hand-typed bibliographies** — some authors skip ``\\cite{}``/
+       ``\\bibitem`` entirely and just number entries manually as plain
+       paragraphs inside a section titled "References" or "Bibliography".
+       Paper 2604.15484 is the canonical example. When zero ``ltx_bibitem``
+       are found we fall back to walking ``<p>`` paragraphs in any section
+       whose heading matches the references regex.
+
+    When neither shape is present we log a warning and return ``[]`` rather
+    than raising — short workshop papers legitimately have no bibliography.
+
+    The function is pure / offline. ``base_url`` is included only for log
+    context (it identifies which paper produced the warning).
+    """
+    bibitems = _find_bibitems(target)
+    if bibitems:
+        return _references_from_bibitems(bibitems)
+    paragraphs = _find_reference_paragraphs(target)
+    if paragraphs:
+        return _references_from_paragraphs(paragraphs)
+    _logger.warning(
+        "no bibliography found (neither ltx_bibitem nor a References section): %s",
+        base_url,
+    )
+    return []
+
+
+def _find_bibitems(target) -> list:
+    """Return all descendants with class ``ltx_bibitem``, in document order."""
+    return [el for el in target.iter() if isinstance(el.tag, str) and LtxClass.BIBITEM in _classes(el)]
+
+
+def _references_from_bibitems(bibitems: list) -> list[ReferenceDescriptor]:
+    out: list[ReferenceDescriptor] = []
+    for idx, item in enumerate(bibitems, start=1):
+        raw_text = _bibitem_text(item)
+        if not raw_text:
+            continue
+        bibitem_id = item.get("id") or None
+        out.append(
+            ReferenceDescriptor(
+                bibitem_id=bibitem_id,
+                ref_number=idx,
+                raw_text=raw_text,
+                cited_arxiv_id=extract_arxiv_id_from_text(raw_text),
+            )
+        )
+    return out
+
+
+def _bibitem_text(item) -> str:
+    """Concatenate the ``ltx_bibblock`` children's text, stripping the
+    ``ltx_tag`` (the rendered "[N]" or "Author (Year)" label) so it doesn't
+    pollute ``raw_text`` for arxiv-id matching.
+    """
+    blocks = [
+        c for c in item
+        if isinstance(c.tag, str) and LtxClass.BIBBLOCK in _classes(c)
+    ]
+    if blocks:
+        return _normalize_ws(" ".join(_normalize_ws(b.text_content()) for b in blocks))
+    # Some styles emit the entry text directly inside the <li> without
+    # wrapping each block — fall back to the full text content minus any
+    # leading ltx_tag span (which holds the [N] / refnum label).
+    parts: list[str] = []
+    if item.text:
+        parts.append(item.text)
+    for child in item:
+        if not isinstance(child.tag, str):
+            continue
+        if LtxClass.TAG in _classes(child):
+            if child.tail:
+                parts.append(child.tail)
+            continue
+        parts.append(child.text_content())
+        if child.tail:
+            parts.append(child.tail)
+    return _normalize_ws("".join(parts))
+
+
+def _find_reference_paragraphs(target) -> list:
+    """Locate `<p>` paragraphs inside a section whose heading matches
+    "References" / "Bibliography" — the hand-typed-paper fallback.
+    """
+    for section in target.iter("section"):
+        title_elem = _find_section_title(section)
+        if title_elem is None:
+            continue
+        title_text = _extract_title_text(title_elem)
+        if not _REFERENCES_HEADING_RE.match(title_text):
+            continue
+        paragraphs = [
+            el for el in section.iter("p")
+            if (el.text_content() or "").strip()
+        ]
+        if paragraphs:
+            return paragraphs
+    return []
+
+
+def _references_from_paragraphs(paragraphs: list) -> list[ReferenceDescriptor]:
+    out: list[ReferenceDescriptor] = []
+    for fallback_idx, p in enumerate(paragraphs, start=1):
+        raw_full = _normalize_ws(p.text_content())
+        if not raw_full:
+            continue
+        ref_number = fallback_idx
+        raw_text = raw_full
+        m = _LEADING_REF_NUMBER_RE.match(raw_full)
+        if m is not None:
+            ref_number = int(m.group(1))
+            raw_text = raw_full[m.end():].strip() or raw_full
+        out.append(
+            ReferenceDescriptor(
+                bibitem_id=None,
+                ref_number=ref_number,
+                raw_text=raw_text,
+                cited_arxiv_id=extract_arxiv_id_from_text(raw_text),
+            )
+        )
+    return out
