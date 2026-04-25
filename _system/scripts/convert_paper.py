@@ -36,6 +36,9 @@ class ConvertResult(NamedTuple):
     status: str
     markdown_chars: int
     figures: int
+    references: int
+    references_resolved_forward: int
+    references_resolved_backward: int
 
 
 def convert(
@@ -120,20 +123,85 @@ def convert(
             """,
             (parsed.markdown, PaperStatus.CONVERTED.value, paper_name),
         )
+        # Replace-all semantics on re-convert: the parser is the source of
+        # truth for this paper's references. Drop everything we had stored
+        # under paper_id and re-insert from the fresh parse. cited_paper_id
+        # is left NULL on insert; both resolve passes below populate it.
+        conn.execute(
+            "DELETE FROM paper_references WHERE paper_id = ?", (paper_id,)
+        )
+        if parsed.references:
+            conn.executemany(
+                """
+                INSERT INTO paper_references (
+                    paper_id, bibitem_id, ref_number, raw_text, cited_arxiv_id
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (paper_id, r.bibitem_id, r.ref_number, r.raw_text, r.cited_arxiv_id)
+                    for r in parsed.references
+                ],
+            )
+        # Forward resolve: references this paper just inserted whose
+        # cited_arxiv_id matches a paper already in the DB. The EXISTS
+        # guard restricts the UPDATE to rows that will actually link, so
+        # ``rowcount`` reflects resolved references rather than inspected
+        # ones (a row whose cited_arxiv_id has no matching paper would
+        # otherwise be touched as NULL→NULL and count toward rowcount).
+        # Self-citation (paper -> own arxiv_id) is allowed.
+        forward_cur = conn.execute(
+            """
+            UPDATE paper_references
+               SET cited_paper_id = (
+                   SELECT id FROM papers
+                    WHERE arxiv_id = paper_references.cited_arxiv_id
+               )
+             WHERE paper_id = ?
+               AND cited_arxiv_id IS NOT NULL
+               AND cited_paper_id IS NULL
+               AND EXISTS (
+                   SELECT 1 FROM papers
+                    WHERE arxiv_id = paper_references.cited_arxiv_id
+               )
+            """,
+            (paper_id,),
+        )
+        forward_resolved = forward_cur.rowcount
+        # Backward resolve: any *other* paper's previously-dangling reference
+        # whose cited_arxiv_id matches THIS paper's arxiv_id. Needed because
+        # paper A may have ingested before paper B; A's row stays NULL until
+        # B's CONVERT runs.
+        backward_cur = conn.execute(
+            """
+            UPDATE paper_references
+               SET cited_paper_id = ?
+             WHERE cited_arxiv_id = ?
+               AND cited_paper_id IS NULL
+            """,
+            (paper_id, arxiv_id),
+        )
+        backward_resolved = backward_cur.rowcount
 
     _LOG.info(
-        "converted paper_id=%s paper_name=%s html_source=%s markdown_chars=%d figures=%d",
+        "converted paper_id=%s paper_name=%s html_source=%s markdown_chars=%d "
+        "figures=%d references=%d forward_resolved=%d backward_resolved=%d",
         paper_id,
         paper_name,
         source.value,
         len(parsed.markdown),
         len(parsed.figures),
+        len(parsed.references),
+        forward_resolved,
+        backward_resolved,
     )
     return ConvertResult(
         paper_name=paper_name,
         status=PaperStatus.CONVERTED.value,
         markdown_chars=len(parsed.markdown),
         figures=len(parsed.figures),
+        references=len(parsed.references),
+        references_resolved_forward=forward_resolved,
+        references_resolved_backward=backward_resolved,
     )
 
 

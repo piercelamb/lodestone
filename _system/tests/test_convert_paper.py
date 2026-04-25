@@ -248,3 +248,306 @@ def test_convert_returns_convert_result(seeded_db):
     assert result.status == PaperStatus.CONVERTED.value
     assert result.figures == 2
     assert result.markdown_chars > 0
+
+
+# --- bibliographic reference persistence ---
+
+
+_TWO_FIGURE_HTML_WITH_BIBLIST = """<!doctype html>
+<html><body>
+<section class="ltx_section" id="S1">
+  <h2 class="ltx_title ltx_title_section"><span class="ltx_tag">1.</span> Method</h2>
+  <p>Method prose.</p>
+  <figure class="ltx_figure" id="S1.F1">
+    <img src="fig1.png"/>
+    <figcaption class="ltx_caption"><span class="ltx_tag">Figure 1.</span> Overview</figcaption>
+  </figure>
+  <p>Between figures.</p>
+  <figure class="ltx_figure" id="S1.F2">
+    <img src="fig2.png"/>
+    <figcaption class="ltx_caption"><span class="ltx_tag">Figure 2.</span> Detail</figcaption>
+  </figure>
+</section>
+<section class="ltx_bibliography">
+  <h2 class="ltx_title">References</h2>
+  <ul class="ltx_biblist">
+    <li id="bib.bib1" class="ltx_bibitem">
+      <span class="ltx_bibblock">Beltagy et al. arXiv:2004.05150.</span>
+    </li>
+    <li id="bib.bib2" class="ltx_bibitem">
+      <span class="ltx_bibblock">Brown et al. NeurIPS, 2020.</span>
+    </li>
+    <li id="bib.bib3" class="ltx_bibitem">
+      <span class="ltx_bibblock">Packer et al. MemGPT. arXiv:2310.08560.</span>
+    </li>
+  </ul>
+</section>
+</body></html>
+"""
+
+
+def test_references_inserted_on_convert(conn):
+    """Standard ltx_bibitem references end up in paper_references."""
+    paper_id = _seed(conn, raw_html=_TWO_FIGURE_HTML_WITH_BIBLIST)
+    convert(paper_name="paper_name_2023", conn=conn)
+    rows = conn.execute(
+        """
+        SELECT bibitem_id, ref_number, cited_arxiv_id, cited_paper_id
+          FROM paper_references
+         WHERE paper_id = ?
+         ORDER BY ref_number
+        """,
+        (paper_id,),
+    ).fetchall()
+    assert len(rows) == 3
+    assert [r[0] for r in rows] == ["bib.bib1", "bib.bib2", "bib.bib3"]
+    assert [r[1] for r in rows] == [1, 2, 3]
+    assert [r[2] for r in rows] == ["2004.05150", None, "2310.08560"]
+    # No other paper exists, so cited_paper_id stays NULL even when an
+    # arxiv-id was extracted.
+    assert all(r[3] is None for r in rows)
+
+
+def test_convert_result_includes_reference_counts(conn):
+    _seed(conn, raw_html=_TWO_FIGURE_HTML_WITH_BIBLIST)
+    result = convert(paper_name="paper_name_2023", conn=conn)
+    assert result.references == 3
+    assert result.references_resolved_forward == 0
+    assert result.references_resolved_backward == 0
+
+
+def test_forward_resolution_links_already_ingested_paper(conn):
+    """Paper B already exists with arxiv_id 2310.08560; converting paper A
+    that cites it should set cited_paper_id = B.id during the same txn."""
+    paper_b_id = _seed(
+        conn,
+        arxiv_id="2310.08560",
+        paper_name="memgpt_paper_2023",
+        status=PaperStatus.CONVERTED.value,
+        raw_html=None,
+        figure_count=0,
+    )
+    paper_a_id = _seed(
+        conn,
+        arxiv_id="2401.00001",
+        paper_name="paper_a_2024",
+        raw_html=_TWO_FIGURE_HTML_WITH_BIBLIST,
+    )
+    result = convert(paper_name="paper_a_2024", conn=conn)
+    assert result.references_resolved_forward == 1
+    assert result.references_resolved_backward == 0
+    rows = conn.execute(
+        "SELECT cited_arxiv_id, cited_paper_id FROM paper_references "
+        "WHERE paper_id = ? ORDER BY ref_number",
+        (paper_a_id,),
+    ).fetchall()
+    assert (rows[2][0], rows[2][1]) == ("2310.08560", paper_b_id)
+    # The other extracted arxiv-id (2004.05150) doesn't match any paper.
+    assert rows[0] == ("2004.05150", None)
+
+
+def test_backward_resolution_links_dangling_references(conn):
+    """Paper A was converted earlier with a reference to arxiv 2310.08560
+    that didn't resolve (cited_paper_id NULL because B wasn't in the DB).
+    When B subsequently lands and runs CONVERT, A's row must update."""
+    paper_a_id = _seed(
+        conn,
+        arxiv_id="2401.00001",
+        paper_name="paper_a_2024",
+        raw_html=_TWO_FIGURE_HTML_WITH_BIBLIST,
+    )
+    convert(paper_name="paper_a_2024", conn=conn)
+    # Sanity: nothing resolved yet.
+    pre = conn.execute(
+        "SELECT cited_paper_id FROM paper_references "
+        "WHERE paper_id = ? AND cited_arxiv_id = ?",
+        (paper_a_id, "2310.08560"),
+    ).fetchone()
+    assert pre[0] is None
+
+    # Now ingest paper B (the cited paper) and convert it.
+    paper_b_id = _seed(
+        conn,
+        arxiv_id="2310.08560",
+        paper_name="memgpt_paper_2023",
+        raw_html=_TWO_FIGURE_HTML,  # B has no bibliography of its own
+    )
+    result = convert(paper_name="memgpt_paper_2023", conn=conn)
+    assert result.references_resolved_backward == 1
+    post = conn.execute(
+        "SELECT cited_paper_id FROM paper_references "
+        "WHERE paper_id = ? AND cited_arxiv_id = ?",
+        (paper_a_id, "2310.08560"),
+    ).fetchone()
+    assert post[0] == paper_b_id
+
+
+def test_re_convert_replaces_old_references(conn):
+    """Convert is replace-all: an earlier set of stale references must not
+    survive into a re-convert run."""
+    paper_id = _seed(conn, raw_html=_TWO_FIGURE_HTML_WITH_BIBLIST)
+    convert(paper_name="paper_name_2023", conn=conn)
+    # Mutate one of the rows to detect replacement.
+    conn.execute(
+        "UPDATE paper_references SET raw_text = 'STALE' "
+        "WHERE paper_id = ? AND ref_number = 1",
+        (paper_id,),
+    )
+    # Restore raw_html (convert nulled it) and re-run with the same html.
+    conn.execute(
+        "UPDATE papers SET raw_html = ?, status = ? WHERE id = ?",
+        (_TWO_FIGURE_HTML_WITH_BIBLIST, PaperStatus.CONVERTED.value, paper_id),
+    )
+    convert(paper_name="paper_name_2023", conn=conn)
+    rows = conn.execute(
+        "SELECT raw_text FROM paper_references "
+        "WHERE paper_id = ? ORDER BY ref_number",
+        (paper_id,),
+    ).fetchall()
+    assert all("STALE" not in r[0] for r in rows)
+
+
+def test_cascade_deletes_paper_references(conn):
+    """delete_paper_cascade removes paper_references along with the paper."""
+    from _system.db.cascade import delete_paper_cascade
+
+    paper_id = _seed(conn, raw_html=_TWO_FIGURE_HTML_WITH_BIBLIST)
+    convert(paper_name="paper_name_2023", conn=conn)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM paper_references WHERE paper_id = ?",
+        (paper_id,),
+    ).fetchone()[0] == 3
+    conn.execute("BEGIN")
+    delete_paper_cascade(conn, paper_id=paper_id)
+    conn.commit()
+    assert conn.execute(
+        "SELECT COUNT(*) FROM paper_references WHERE paper_id = ?",
+        (paper_id,),
+    ).fetchone()[0] == 0
+
+
+def test_cascade_nulls_outbound_cited_paper_id(conn):
+    """When deleting paper B, any other paper's reference whose
+    cited_paper_id pointed at B must be NULLed (not deleted) so the FK
+    stays valid and the dangling reference can be re-resolved later."""
+    from _system.db.cascade import delete_paper_cascade
+
+    paper_b_id = _seed(
+        conn,
+        arxiv_id="2310.08560",
+        paper_name="memgpt_paper_2023",
+        status=PaperStatus.CONVERTED.value,
+        raw_html=None,
+        figure_count=0,
+    )
+    paper_a_id = _seed(
+        conn,
+        arxiv_id="2401.00001",
+        paper_name="paper_a_2024",
+        raw_html=_TWO_FIGURE_HTML_WITH_BIBLIST,
+    )
+    convert(paper_name="paper_a_2024", conn=conn)
+    # Sanity: forward resolve linked paper A's ref to B.
+    pre = conn.execute(
+        "SELECT cited_paper_id FROM paper_references "
+        "WHERE paper_id = ? AND cited_arxiv_id = ?",
+        (paper_a_id, "2310.08560"),
+    ).fetchone()
+    assert pre[0] == paper_b_id
+    conn.execute("BEGIN")
+    delete_paper_cascade(conn, paper_id=paper_b_id)
+    conn.commit()
+    post = conn.execute(
+        "SELECT cited_arxiv_id, cited_paper_id FROM paper_references "
+        "WHERE paper_id = ? AND cited_arxiv_id = ?",
+        (paper_a_id, "2310.08560"),
+    ).fetchone()
+    # cited_arxiv_id preserved so a re-ingest of B can re-resolve.
+    assert post == ("2310.08560", None)
+
+
+def test_convert_failure_rolls_back_references(conn, monkeypatch):
+    """If anything inside the convert transaction raises after references
+    are inserted, the transaction must roll back — paper_references rows
+    must not survive."""
+    paper_id = _seed(conn, raw_html=_TWO_FIGURE_HTML_WITH_BIBLIST)
+
+    # Real parse runs; raise inside the txn afterwards by sabotaging the
+    # backward-resolve UPDATE through a sqlite trigger.
+    conn.execute(
+        """
+        CREATE TRIGGER abort_on_paper_refs
+        BEFORE INSERT ON paper_references
+        BEGIN
+          SELECT RAISE(ABORT, 'forced abort for test');
+        END
+        """
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        convert(paper_name="paper_name_2023", conn=conn)
+    # Trigger ran, txn rolled back. No references should have been written.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM paper_references WHERE paper_id = ?",
+        (paper_id,),
+    ).fetchone()[0] == 0
+    # And the markdown UPDATE that ran before the INSERT must also have
+    # rolled back: status remains FETCHED, raw_html still set.
+    row = conn.execute(
+        "SELECT status, raw_html, markdown FROM papers WHERE id = ?",
+        (paper_id,),
+    ).fetchone()
+    assert row[0] == PaperStatus.FETCHED.value
+    assert row[1] is not None
+    assert row[2] is None
+
+
+def test_self_citation_resolves_to_same_paper(conn):
+    """A v2 update referencing v1 (same arxiv_id) is harmless: forward
+    resolve will set cited_paper_id = paper's own id."""
+    self_cite_html = """<!doctype html>
+<html><body>
+<section class="ltx_bibliography">
+  <h2 class="ltx_title">References</h2>
+  <ul class="ltx_biblist">
+    <li id="bib.bib1" class="ltx_bibitem">
+      <span class="ltx_bibblock">Self. arXiv:2301.00001.</span>
+    </li>
+  </ul>
+</section>
+</body></html>
+"""
+    paper_id = _seed(
+        conn,
+        arxiv_id="2301.00001",
+        raw_html=self_cite_html,
+        figure_count=0,
+    )
+    result = convert(paper_name="paper_name_2023", conn=conn)
+    assert result.references_resolved_forward == 1
+    row = conn.execute(
+        "SELECT cited_paper_id FROM paper_references WHERE paper_id = ?",
+        (paper_id,),
+    ).fetchone()
+    assert row[0] == paper_id
+
+
+def test_paper_with_no_bibliography_inserts_zero_references(
+    conn,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No bibliography section + no ltx_bibitem = empty reference list, no error."""
+    import logging
+
+    paper_id = _seed(conn)  # _TWO_FIGURE_HTML has no bibliography
+    logger = logging.getLogger("lodestone.html.latexml_parser")
+    logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger="lodestone.html.latexml_parser"):
+            convert(paper_name="paper_name_2023", conn=conn)
+    finally:
+        logger.removeHandler(caplog.handler)
+    assert conn.execute(
+        "SELECT COUNT(*) FROM paper_references WHERE paper_id = ?",
+        (paper_id,),
+    ).fetchone()[0] == 0
+    assert any("no bibliography found" in r.getMessage() for r in caplog.records)
