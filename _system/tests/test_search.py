@@ -6,8 +6,8 @@ JSON / human output formatters.
 
 The seeded DB fixture builds a small, self-consistent corpus — two papers
 with matching ``abstracts`` / ``sections`` / ``terms_fts`` rows, a
-canonical ``RAPTOR`` term with aliases + embedding, a figure BLOB keyed
-on both ``figure_number`` and ``display_number``, and a page image.
+canonical ``RAPTOR`` term with aliases + embedding, and a figure BLOB
+keyed on both ``figure_number`` and ``display_number``.
 """
 from __future__ import annotations
 
@@ -30,8 +30,8 @@ from _system.utils.sections import split_sections
 
 
 # ---------------------------------------------------------------------------
-# Small valid PNG blob — 1x1 pixel, used for every figure / page image in
-# the fixtures so we only need one BLOB constant.
+# Small valid PNG blob — 1x1 pixel, used for every figure in the fixtures
+# so we only need one BLOB constant.
 # ---------------------------------------------------------------------------
 
 _PNG_1x1 = bytes.fromhex(
@@ -309,19 +309,6 @@ def _insert_figure(
     )
 
 
-def _insert_page_image(
-    conn: sqlite3.Connection,
-    *,
-    paper_id: int,
-    page_number: int,
-    image: bytes,
-) -> None:
-    conn.execute(
-        "INSERT INTO page_images (paper_id, page_number, image) VALUES (?, ?, ?)",
-        (paper_id, page_number, image),
-    )
-
-
 # ---------------------------------------------------------------------------
 # Main seed fixture — stands up the tiny corpus used by almost every test.
 # ---------------------------------------------------------------------------
@@ -546,7 +533,7 @@ def seeded_db(conn: sqlite3.Connection) -> sqlite3.Connection:
     # Paper topic
     _insert_paper_topic(conn, paper_id=p1_id, domain="rag", topic="entity resolution")
 
-    # Figure + page image (used by BLOB extraction tests)
+    # Figures (used by BLOB extraction tests)
     _insert_figure(
         conn,
         paper_id=p1_id,
@@ -567,8 +554,6 @@ def seeded_db(conn: sqlite3.Connection) -> sqlite3.Connection:
         section_context="Method",
         image=_PNG_1x1,
     )
-    _insert_page_image(conn, paper_id=p1_id, page_number=7, image=_PNG_1x1)
-
     return conn
 
 
@@ -1001,24 +986,6 @@ class TestModeFigure:
             search_mod.mode_figure(seeded_db, paper="bookrag_2024", n="999")
 
 
-class TestModePage:
-    def test_extracts_blob_to_tempfile(self, seeded_db):
-        r = search_mod.mode_page(seeded_db, paper="bookrag_2024", n=7)
-        assert r["mode"] == "page"
-        path = Path(r["path"])
-        assert path.exists()
-        assert path.name.startswith("lodestone_bookrag_2024_page7_")
-        assert path.read_bytes() == _PNG_1x1
-
-    def test_rejects_illegal_paper_name(self, seeded_db):
-        with pytest.raises(ValueError):
-            search_mod.mode_page(seeded_db, paper="../evil", n=7)
-
-    def test_missing_page_raises(self, seeded_db):
-        with pytest.raises(ValueError):
-            search_mod.mode_page(seeded_db, paper="bookrag_2024", n=999)
-
-
 # ===========================================================================
 # CLI mode-conflict guard
 # ===========================================================================
@@ -1089,9 +1056,6 @@ class TestOutputFormatting:
         fig = search_mod.mode_figure(seeded_db, paper="bookrag_2024", n="3")
         assert fig["mode"] == "figure"
 
-        page = search_mod.mode_page(seeded_db, paper="bookrag_2024", n=7)
-        assert page["mode"] == "page"
-
     def test_human_formatter_nonempty_per_mode(self, seeded_db):
         payloads = [
             search_mod.mode_bm25(
@@ -1110,7 +1074,6 @@ class TestOutputFormatting:
             search_mod.mode_toc(seeded_db, paper_name="bookrag_2024"),
             search_mod.mode_read(seeded_db, paper_name="bookrag_2024", section=None),
             search_mod.mode_figure(seeded_db, paper="bookrag_2024", n="3"),
-            search_mod.mode_page(seeded_db, paper="bookrag_2024", n=7),
         ]
         for payload in payloads:
             out = search_mod.to_human(payload)

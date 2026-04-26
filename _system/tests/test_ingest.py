@@ -321,11 +321,6 @@ def _seed_full_paper(conn: sqlite3.Connection, arxiv_id: str, paper_name: str,
         "VALUES (?, ?, ?, ?, ?)",
         (paper_id, 1, "Fig 1", b"\x89PNG\r\n\x1a\n", "image/png"),
     )
-    # page_images
-    conn.execute(
-        "INSERT INTO page_images (paper_id, page_number, image) VALUES (?, ?, ?)",
-        (paper_id, 1, b"\x89PNG\r\n\x1a\n"),
-    )
     # Global taxonomy rows that must SURVIVE the cascade.
     conn.execute(
         "INSERT INTO canonical_terms (domain, term_type, entity_type, canonical_name, "
@@ -362,7 +357,7 @@ def test_force_cascade_deletes_paper_and_children(conn):
         assert conn.execute(
             f"SELECT COUNT(*) FROM {tbl} WHERE paper_name = ?", ("paper_to_wipe",)
         ).fetchone()[0] == 0
-    for tbl in ("entities", "paper_topics", "figures", "page_images"):
+    for tbl in ("entities", "paper_topics", "figures"):
         assert conn.execute(
             f"SELECT COUNT(*) FROM {tbl} WHERE paper_id = ?", (paper_id,)
         ).fetchone()[0] == 0

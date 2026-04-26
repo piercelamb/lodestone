@@ -29,9 +29,9 @@ Five modes, all emit JSON by default. Add `--human` for pretty text.
 4. **Table of contents** — `--toc <paper>` emits the section tree
    extracted during ingest (levels 1–3).
 5. **Content extraction** — `--read <paper> [--section "Method"]`,
-   `--figure <paper> <N>`, `--page <paper> <N>`. BLOB data (figures,
-   page renders) is written to a temp file via `tempfile.mkstemp`; the
-   returned path is ephemeral. Copy if you need to keep it.
+   `--figure <paper> <N>`. Figure BLOBs are written to a temp file via
+   `tempfile.mkstemp`; the returned path is ephemeral. Copy if you need
+   to keep it.
 
 ### Key flags
 
@@ -51,9 +51,9 @@ uv run _system/scripts/ingest.py --url <arxiv_url_or_id> [--force] [--domain <sl
   `arxiv_id` picks up at the last completed stage, driven by
   `papers.status`. No duplicate work. `ingest.py` is fully resumable.
 - `--force` cascade-deletes the paper (abstracts, sections, entities,
-  paper_topics, figures, page_images, papers) inside one transaction,
-  then re-ingests. Preserves global taxonomy (`canonical_terms`,
-  `term_aliases`, `term_embeddings`) so reuse across papers isn't lost.
+  paper_topics, figures, papers) inside one transaction, then re-ingests.
+  Preserves global taxonomy (`canonical_terms`, `term_aliases`,
+  `term_embeddings`) so reuse across papers isn't lost.
 - `--domain <slug>` overrides the classifier's domain choice and
   threads through to both fetch and classify.
 

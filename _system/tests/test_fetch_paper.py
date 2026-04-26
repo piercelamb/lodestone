@@ -1,8 +1,7 @@
 """Unit tests for _system/scripts/fetch_paper.py.
 
-Network is fully mocked via ``httpx.MockTransport``; the arxiv library is
-replaced with a direct-metadata callable; PDF rendering is replaced with
-a sentinel list. No test touches real internet or real pypdfium2.
+Network is fully mocked via ``httpx.MockTransport`` and the arxiv library
+is replaced with a direct-metadata callable. No test touches real internet.
 """
 from __future__ import annotations
 
@@ -164,7 +163,6 @@ def test_second_fetch_dedups_early_no_network(conn):
             arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: meta,
-            render_pages=lambda _b: [b"pngbytes0", b"pngbytes1"],
         )
     assert len(first_recorder.calls) > 0
 
@@ -177,7 +175,6 @@ def test_second_fetch_dedups_early_no_network(conn):
             arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: pytest.fail("arxiv lookup ran on dedup"),
-            render_pages=lambda _b: pytest.fail("page render ran on dedup"),
         )
     assert second_recorder.calls == []
     assert returned.arxiv_id == arxiv_id
@@ -214,7 +211,6 @@ def test_html_source_fallback_arxiv_404_ar5iv_200(conn, fast_sleep):
             arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: meta,
-            render_pages=lambda _b: [],
         )
     assert pm.html_source == "ar5iv"
 
@@ -235,17 +231,14 @@ def test_both_html_sources_fail_persists_failed_html_stub(conn, fast_sleep):
             arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: meta,
-            render_pages=lambda _b: pytest.fail("no PDF should be rendered on FAILED_HTML"),
         )
     assert pm.status == "failed_html"
     assert pm.raw_html is None
     assert pm.html_source is None
 
     figures = conn.execute("SELECT COUNT(*) FROM figures").fetchone()[0]
-    pages = conn.execute("SELECT COUNT(*) FROM page_images").fetchone()[0]
     papers = conn.execute("SELECT COUNT(*) FROM papers WHERE arxiv_id = ?", (arxiv_id,)).fetchone()[0]
     assert figures == 0
-    assert pages == 0
     assert papers == 1
 
 
@@ -269,7 +262,6 @@ def test_raw_html_is_persisted_on_success(conn, fast_sleep):
             arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: _make_meta(),
-            render_pages=lambda _b: [],
         )
 
     raw = conn.execute("SELECT raw_html FROM papers WHERE arxiv_id = ?", (arxiv_id,)).fetchone()[0]
@@ -302,7 +294,6 @@ def test_version_suffix_preserved(conn, fast_sleep):
             arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: _make_meta(),
-            render_pages=lambda _b: [],
         )
     assert pm.arxiv_id == "2301.12345v2"
     # Versioned id should appear in the html URL as-is.
@@ -359,7 +350,6 @@ def test_user_agent_header_present_on_every_request(conn, fast_sleep):
             arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: _make_meta(),
-            render_pages=lambda _b: [],
         )
 
     assert seen, "expected at least one mocked request"
@@ -423,7 +413,6 @@ def test_data_uri_figure_persisted_without_any_network(conn, fast_sleep):
             arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: _make_meta(),
-            render_pages=lambda _b: [],
         )
 
     assert seen_image_calls == [], f"unexpected image HTTP calls: {seen_image_calls}"
@@ -525,7 +514,6 @@ def test_layer_priority_pwc_wins_over_html_scan(conn, fast_sleep):
             arxiv_id="2301.00055",
             client=client,
             arxiv_lookup=lambda _id: _make_meta(),
-            render_pages=lambda _b: [],
         )
     assert pm.code_repo == "https://github.com/pwcowner/pwcrepo"
 
@@ -550,7 +538,6 @@ def test_layer_3_discovers_repo_in_arxiv_comment(conn, fast_sleep):
             arxiv_id="2301.00066",
             client=client,
             arxiv_lookup=lambda _id: meta,
-            render_pages=lambda _b: [],
         )
     assert pm.code_repo == "https://github.com/commenter/fromcomment"
 
@@ -582,7 +569,6 @@ def test_soft_dedup_warning_logged_when_same_content_hash_different_id(
             arxiv_id="2301.00088",
             client=client,
             arxiv_lookup=lambda _id: _make_meta(title="Paper A"),
-            render_pages=lambda _b: [],
         )
 
     # The `lodestone.*` logger has propagate=False, so caplog's root handler
@@ -597,8 +583,7 @@ def test_soft_dedup_warning_logged_when_same_content_hash_different_id(
                     arxiv_id="2301.00089",
                     client=client,
                     arxiv_lookup=lambda _id: _make_meta(title="Paper B"),
-                    render_pages=lambda _b: [],
-                )
+                        )
     finally:
         logger.removeHandler(caplog.handler)
     assert any("soft-dedup" in r.message for r in caplog.records), (
@@ -613,8 +598,8 @@ def test_soft_dedup_warning_logged_when_same_content_hash_different_id(
 
 def test_force_refetch_preserves_slug_and_clears_children(conn, fast_sleep):
     """force=True re-runs the pipeline but keeps paper_name + ingested_at,
-    and clears dependent rows (figures, page_images, entities, paper_topics,
-    FTS) so the paper DELETE doesn't trip FK constraints."""
+    and clears dependent rows (figures, entities, paper_topics, FTS) so
+    the paper DELETE doesn't trip FK constraints."""
     arxiv_id = "2301.45678"
     data_uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 
@@ -635,7 +620,6 @@ def test_force_refetch_preserves_slug_and_clears_children(conn, fast_sleep):
             arxiv_id=arxiv_id,
             client=client,
             arxiv_lookup=lambda _id: _make_meta(),
-            render_pages=lambda _b: [b"page1"],
         )
 
     # Simulate downstream pipeline stages populating children. A naive
@@ -671,7 +655,6 @@ def test_force_refetch_preserves_slug_and_clears_children(conn, fast_sleep):
             force=True,
             client=client,
             arxiv_lookup=lambda _id: _make_meta(),
-            render_pages=lambda _b: [b"page1", b"page2"],
         )
 
     # Slug + ingested_at preserved
@@ -688,12 +671,8 @@ def test_force_refetch_preserves_slug_and_clears_children(conn, fast_sleep):
     topics = conn.execute(
         "SELECT COUNT(*) FROM paper_topics WHERE paper_id = ?", (paper_id,)
     ).fetchone()[0]
-    pages = conn.execute(
-        "SELECT COUNT(*) FROM page_images WHERE paper_id = ?", (paper_id,)
-    ).fetchone()[0]
     assert ents == 0
     assert topics == 0
-    assert pages == 2  # new render
 
 
 # ---------------------------------------------------------------------------
@@ -731,7 +710,6 @@ def test_no_db_transaction_open_during_network(conn, fast_sleep, monkeypatch):
             arxiv_id="2301.00100",
             client=client,
             arxiv_lookup=lambda _id: _make_meta(),
-            render_pages=lambda _b: [],
         )
 
     http_indices = [i for i, e in enumerate(events) if e.startswith("HTTP")]

@@ -13,7 +13,6 @@ EXPECTED_TABLES = {
     "collections",
     "papers",
     "figures",
-    "page_images",
     "paper_references",
     "abstracts",
     "sections",
@@ -42,7 +41,7 @@ def _user_tables(conn: sqlite3.Connection) -> set[str]:
 
 # Plain (non-virtual) tables — support row-count queries directly.
 _PLAIN_TABLES = {
-    "domains", "collections", "papers", "figures", "page_images",
+    "domains", "collections", "papers", "figures",
     "paper_references",
     "canonical_terms", "term_aliases", "entities", "paper_topics",
 }
@@ -176,6 +175,27 @@ def test_init_db_backfills_collections_from_legacy_papers(conn):
     ).fetchone()
     assert row is not None
     assert row[2] is None  # legacy rows land with NULL description
+
+
+def test_init_db_drops_legacy_page_images(conn):
+    """page_images was retired (LaTeXML strips page layout — chunks have no
+    page index to correlate back to a render). init_db must DROP the table
+    on any DB that predates the removal so the schema converges.
+    """
+    conn.execute(
+        "CREATE TABLE page_images ("
+        "  paper_id INTEGER NOT NULL,"
+        "  page_number INTEGER NOT NULL,"
+        "  image BLOB NOT NULL,"
+        "  PRIMARY KEY(paper_id, page_number))"
+    )
+
+    init_db(conn)
+
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = 'page_images'"
+    ).fetchone()
+    assert row is None
 
 
 def test_papers_raw_html_accepts_large_payload(conn):

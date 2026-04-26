@@ -8,7 +8,6 @@ dependencies = [
     "httpx",
     "beautifulsoup4",
     "lxml",
-    "pypdfium2",
     "Pillow",
     "pydantic>=2",
     "sentence-transformers",

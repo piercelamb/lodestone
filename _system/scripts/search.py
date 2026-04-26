@@ -14,8 +14,8 @@ Five modes dispatched by argparse:
    markdown (skipping fenced code blocks).
 5. **Content extraction** — ``--read PAPER [--section S]`` emits markdown
    (optionally sliced by :func:`find_hierarchical_section`);
-   ``--figure PAPER N`` / ``--page PAPER N`` write the BLOB to a
-   :func:`tempfile.mkstemp` path and return the path.
+   ``--figure PAPER N`` writes the figure BLOB to a
+   :func:`tempfile.mkstemp` path and returns the path.
 
 JSON is emitted to stdout by default. ``--human`` renders a short plaintext
 per mode. All logging goes to stderr via the shared :mod:`_system.utils.logging`
@@ -704,7 +704,7 @@ def mode_read(
 
 
 # ---------------------------------------------------------------------------
-# Mode 5b — Figure / page BLOB extraction
+# Mode 5b — Figure BLOB extraction
 # ---------------------------------------------------------------------------
 
 
@@ -717,7 +717,7 @@ def _assert_safe_paper_name(paper: str) -> None:
 
 
 def _safe_n_for_filename(n: Any) -> str:
-    """Sanitize the figure / page identifier for use in a tempfile prefix.
+    """Sanitize the figure identifier for use in a tempfile prefix.
 
     Paper names are already slug-validated, but ``n`` can legitimately be a
     caption label like ``"Figure 3a"`` with spaces. Collapse anything not in
@@ -806,35 +806,6 @@ def mode_figure(
         "figure_number": n,
         "path": path,
         "mime_type": mime_type or "image/png",
-    }
-
-
-def mode_page(
-    conn: sqlite3.Connection,
-    *,
-    paper: str,
-    n: int,
-) -> dict[str, Any]:
-    """Extract a page image BLOB to a ``tempfile.mkstemp`` path."""
-    paper_id = _lookup_paper_id(conn, paper)
-
-    row = conn.execute(
-        "SELECT image FROM page_images WHERE paper_id = ? AND page_number = ?",
-        (paper_id, int(n)),
-    ).fetchone()
-    if row is None:
-        raise ValueError(f"page not found: paper={paper!r} page={n!r}")
-    image = row[0]
-
-    path = _write_blob_tempfile(
-        image, prefix=f"lodestone_{paper}_page{_safe_n_for_filename(n)}_"
-    )
-    return {
-        "mode": "page",
-        "paper_name": paper,
-        "page_number": int(n),
-        "path": path,
-        "mime_type": "image/png",
     }
 
 
@@ -958,12 +929,6 @@ def to_human(payload: dict[str, Any]) -> str:
             f"({payload.get('mime_type')})"
         )
 
-    elif mode == "page":
-        lines.append(
-            f"page {payload.get('page_number')} of "
-            f"{payload.get('paper_name')} → {payload.get('path')}"
-        )
-
     else:
         lines.append(f"(unknown mode: {mode!r})")
         lines.append(json.dumps(payload, indent=2))
@@ -985,7 +950,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  2. Taxonomy lookup (--entity/--topic/--collection without QUERY)\n"
             "  3. Browse (--collections/--topics/--entity-type/--aliases/--needs-review)\n"
             "  4. ToC (--toc PAPER)\n"
-            "  5. Read / figure / page (--read / --figure / --page)"
+            "  5. Read / figure (--read / --figure)"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1024,8 +989,6 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--figure", nargs=2, metavar=("PAPER", "N"), default=None,
                    help="extract figure N from PAPER to a tempfile")
-    p.add_argument("--page", nargs=2, metavar=("PAPER", "N"), default=None,
-                   help="extract page image N from PAPER to a tempfile")
 
     p.add_argument("--human", action="store_true",
                    help="emit plaintext instead of JSON")
@@ -1074,8 +1037,6 @@ def _check_mode_conflicts(
         modes.append("--read")
     if args.figure is not None:
         modes.append("--figure")
-    if args.page is not None:
-        modes.append("--page")
 
     if len(modes) > 1:
         parser.error(
@@ -1085,19 +1046,10 @@ def _check_mode_conflicts(
 
 
 def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, Any]:
-    # Mode 5b: figure / page
+    # Mode 5b: figure
     if args.figure is not None:
         paper, n = args.figure
         return mode_figure(conn, paper=paper, n=n)
-    if args.page is not None:
-        paper, n_str = args.page
-        try:
-            n_int = int(n_str)
-        except ValueError as exc:
-            raise ValueError(
-                f"--page N must be an integer, got {n_str!r}"
-            ) from exc
-        return mode_page(conn, paper=paper, n=n_int)
 
     # Mode 5a: read
     if args.read is not None:
@@ -1164,7 +1116,7 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
     raise SystemExit(
         "no action selected — pass a positional QUERY or one of the mode "
         "flags (--entity/--topic/--collection/--collections/--topics/"
-        "--entity-type/--aliases/--needs-review/--toc/--read/--figure/--page). "
+        "--entity-type/--aliases/--needs-review/--toc/--read/--figure). "
         "Run with --help for details."
     )
 
