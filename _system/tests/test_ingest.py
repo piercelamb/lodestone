@@ -304,12 +304,6 @@ def _seed_full_paper(conn: sqlite3.Connection, arxiv_id: str, paper_name: str,
         (paper_id, domain, paper_name, "Method", 1,
          "distinctive_section_marker_abc"),
     )
-    # entities
-    conn.execute(
-        "INSERT INTO entities (paper_id, domain, paper_name, entity_name, entity_type, "
-        "source_breadcrumb) VALUES (?, ?, ?, ?, ?, ?)",
-        (paper_id, domain, paper_name, "Widget", "method", "Abstract"),
-    )
     # paper_topics
     conn.execute(
         "INSERT INTO paper_topics (paper_id, domain, topic) VALUES (?, ?, ?)",
@@ -321,10 +315,13 @@ def _seed_full_paper(conn: sqlite3.Connection, arxiv_id: str, paper_name: str,
         "VALUES (?, ?, ?, ?, ?)",
         (paper_id, 1, "Fig 1", b"\x89PNG\r\n\x1a\n", "image/png"),
     )
-    # Global taxonomy rows that must SURVIVE the cascade.
+    # Canonical taxonomy + term_aliases (the appearance log replaces the
+    # old `entities` table). The Widget canonical is shared across all
+    # callers — INSERT OR IGNORE so multiple papers can seed the same
+    # canonical without UNIQUE violations.
     conn.execute(
-        "INSERT INTO canonical_terms (domain, term_type, entity_type, canonical_name, "
-        "first_seen_in) VALUES (?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO canonical_terms (domain, term_type, entity_type, "
+        " canonical_name, first_seen_in) VALUES (?, ?, ?, ?, ?)",
         (domain, "entity", "method", "Widget", paper_name),
     )
     term_id = conn.execute(
@@ -332,18 +329,25 @@ def _seed_full_paper(conn: sqlite3.Connection, arxiv_id: str, paper_name: str,
         ("Widget", domain),
     ).fetchone()[0]
     conn.execute(
-        "INSERT INTO term_aliases (term_id, alias, source_paper, match_tier) VALUES (?, ?, ?, ?)",
-        (term_id, "Widget", paper_name, 1),
-    )
-    vec = [0.0] * 384
-    vec[0] = 1.0
-    import struct
-    blob = struct.pack(f"{len(vec)}f", *vec)
-    conn.execute(
-        "INSERT INTO term_embeddings (term_id, embedding, term_type, entity_type, domain) "
+        "INSERT INTO term_aliases "
+        " (term_id, alias, source_paper, source_breadcrumb, match_tier) "
         "VALUES (?, ?, ?, ?, ?)",
-        (term_id, blob, "entity", "method", domain),
+        (term_id, "Widget", paper_name, "Abstract", 1),
     )
+    # term_embeddings PK is term_id; only the first seed inserts.
+    existing_emb = conn.execute(
+        "SELECT 1 FROM term_embeddings WHERE term_id = ?", (term_id,)
+    ).fetchone()
+    if existing_emb is None:
+        vec = [0.0] * 384
+        vec[0] = 1.0
+        import struct
+        blob = struct.pack(f"{len(vec)}f", *vec)
+        conn.execute(
+            "INSERT INTO term_embeddings (term_id, embedding, term_type, entity_type, domain) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (term_id, blob, "entity", "method", domain),
+        )
     return paper_id
 
 
@@ -357,10 +361,16 @@ def test_force_cascade_deletes_paper_and_children(conn):
         assert conn.execute(
             f"SELECT COUNT(*) FROM {tbl} WHERE paper_name = ?", ("paper_to_wipe",)
         ).fetchone()[0] == 0
-    for tbl in ("entities", "paper_topics", "figures"):
+    for tbl in ("paper_topics", "figures"):
         assert conn.execute(
             f"SELECT COUNT(*) FROM {tbl} WHERE paper_id = ?", (paper_id,)
         ).fetchone()[0] == 0
+    # term_aliases keys by paper_name (TEXT) — the cascade wipes per-paper
+    # appearance rows alongside the paper.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM term_aliases WHERE source_paper = ?",
+        ("paper_to_wipe",),
+    ).fetchone()[0] == 0
 
 
 def test_force_cascade_clears_sections_fts_for_paper(conn):
@@ -384,9 +394,19 @@ def test_force_cascade_clears_abstracts_fts_for_paper(conn):
 
 
 def test_force_cascade_preserves_canonical_taxonomy(conn):
+    """Cascade preserves the canonical taxonomy (canonical_terms,
+    term_embeddings) — those rows are cross-paper. ``term_aliases`` is
+    no longer cross-paper after the merge: it's the per-paper
+    appearance log keyed by source_paper, so the cascade DOES wipe
+    this paper's alias rows. A second paper's aliases referencing the
+    same canonical must survive."""
     paper_id = _seed_full_paper(conn, "2301.44444", "paper_def")
+    other_paper_id = _seed_full_paper(conn, "2301.44445", "paper_other")
     terms_before = conn.execute("SELECT COUNT(*) FROM canonical_terms").fetchone()[0]
-    aliases_before = conn.execute("SELECT COUNT(*) FROM term_aliases").fetchone()[0]
+    other_aliases_before = conn.execute(
+        "SELECT COUNT(*) FROM term_aliases WHERE source_paper = ?",
+        ("paper_other",),
+    ).fetchone()[0]
     emb_before = conn.execute("SELECT COUNT(*) FROM term_embeddings").fetchone()[0]
 
     ingest._force_delete_paper(conn, paper_id=paper_id)
@@ -394,9 +414,15 @@ def test_force_cascade_preserves_canonical_taxonomy(conn):
     assert conn.execute(
         "SELECT COUNT(*) FROM canonical_terms"
     ).fetchone()[0] == terms_before
+    # The deleted paper's alias rows are gone; the other paper's are intact.
     assert conn.execute(
-        "SELECT COUNT(*) FROM term_aliases"
-    ).fetchone()[0] == aliases_before
+        "SELECT COUNT(*) FROM term_aliases WHERE source_paper = ?",
+        ("paper_def",),
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM term_aliases WHERE source_paper = ?",
+        ("paper_other",),
+    ).fetchone()[0] == other_aliases_before
     assert conn.execute(
         "SELECT COUNT(*) FROM term_embeddings"
     ).fetchone()[0] == emb_before
@@ -468,10 +494,20 @@ def test_summary_needs_review_reflects_flag(conn, patched_stages):
 def test_summary_counts_match_db(conn, patched_stages):
     # Seed a paper that's already INDEXED so the no-op path takes counts.
     paper_id = _seed_full_paper(conn, "2301.67777", "counts_paper")
+    # Add a second canonical + appearance row for entity_count.
     conn.execute(
-        "INSERT INTO entities (paper_id, domain, paper_name, entity_name, entity_type, "
-        "source_breadcrumb) VALUES (?, ?, ?, ?, ?, ?)",
-        (paper_id, "rag", "counts_paper", "SecondWidget", "method", "Abstract"),
+        "INSERT INTO canonical_terms (domain, term_type, entity_type, "
+        " canonical_name, first_seen_in) VALUES (?, ?, ?, ?, ?)",
+        ("rag", "entity", "method", "SecondWidget", "counts_paper"),
+    )
+    second_term_id = conn.execute(
+        "SELECT id FROM canonical_terms WHERE canonical_name = 'SecondWidget'"
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO term_aliases "
+        " (term_id, alias, source_paper, source_breadcrumb, match_tier) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (second_term_id, "SecondWidget", "counts_paper", "Abstract", 1),
     )
     conn.execute(
         "INSERT INTO figures (paper_id, figure_number, caption, image, mime_type) "
@@ -488,7 +524,7 @@ def test_summary_counts_match_db(conn, patched_stages):
 
     # section_count: seed added 1; extra 1 = 2
     assert summary["section_count"] == 2
-    # entity_count: seed added 1; extra 1 = 2
+    # entity_count: seed added 1 distinct entity; extra 1 distinct = 2
     assert summary["entity_count"] == 2
     # figure_count: seed added 1; extra 1 = 2
     assert summary["figure_count"] == 2

@@ -156,13 +156,24 @@ CREATE TABLE IF NOT EXISTS canonical_terms (
 CREATE INDEX IF NOT EXISTS idx_terms_domain_type ON canonical_terms(domain, term_type);
 CREATE INDEX IF NOT EXISTS idx_terms_name ON canonical_terms(canonical_name);
 
+-- term_aliases is the per-(concept, paper, section) appearance log.
+-- Every mention writes a row, including ones where alias == canonical_name
+-- (tier-1 hits and tier-5 mints). The breadcrumb identifies which section
+-- of the paper the mention came from; topic/collection rows from the
+-- classify stage carry source_breadcrumb='' (no positional axis).
+-- Old DBs with a 3-column PK and a sibling `entities` table are migrated
+-- to this shape by `_system.db.migrations._migrate_entities_to_aliases`.
 CREATE TABLE IF NOT EXISTS term_aliases (
     term_id INTEGER NOT NULL REFERENCES canonical_terms(id),
     alias TEXT NOT NULL,
     source_paper TEXT NOT NULL,
+    source_breadcrumb TEXT NOT NULL DEFAULT '',
     match_tier INTEGER,
-    PRIMARY KEY(term_id, alias, source_paper)
+    PRIMARY KEY(term_id, alias, source_paper, source_breadcrumb)
 );
+
+CREATE INDEX IF NOT EXISTS idx_aliases_source_paper ON term_aliases(source_paper);
+CREATE INDEX IF NOT EXISTS idx_aliases_term_paper  ON term_aliases(term_id, source_paper);
 
 CREATE VIRTUAL TABLE term_embeddings USING vec0(
     term_id INTEGER PRIMARY KEY,
@@ -171,22 +182,6 @@ CREATE VIRTUAL TABLE term_embeddings USING vec0(
     entity_type TEXT,
     domain TEXT
 );
-
-CREATE TABLE IF NOT EXISTS entities (
-    id INTEGER PRIMARY KEY,
-    paper_id INTEGER NOT NULL REFERENCES papers(id),
-    domain TEXT NOT NULL,
-    paper_name TEXT NOT NULL,
-    entity_name TEXT NOT NULL,
-    entity_type TEXT NOT NULL,
-    source_breadcrumb TEXT NOT NULL,
-    description TEXT,
-    UNIQUE(paper_id, entity_name, source_breadcrumb)
-);
-
-CREATE INDEX IF NOT EXISTS idx_entities_domain ON entities(domain);
-CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(entity_name);
-CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(domain, entity_type);
 
 -- ============================================================
 -- GROUP 4: PAPER-TOPIC MAPPING

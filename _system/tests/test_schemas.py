@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from _system.schemas.entities import Entity, EntityType, PaperEntities
+from _system.schemas.entities import EntityType
 from _system.schemas.figures import PaperFigure
 from _system.schemas.paper_metadata import (
     SECTION_CHUNK_LEVELS,
@@ -151,25 +151,6 @@ class TestEntityType:
             "software", "system", "organization", "venue",
         }
         assert {m.value for m in members} == expected
-
-
-class TestEntity:
-    def test_minimal_entity_has_default_aliases_and_description(self):
-        e = Entity(name="BERT", type=EntityType.MODEL, source_section="# Method")
-        assert e.name == "BERT"
-        assert e.aliases == []
-        assert e.description is None
-
-    def test_paper_entities_holds_entity_list(self):
-        pe = PaperEntities(
-            paper_name="P",
-            domain="nlp",
-            entities=[
-                Entity(name="X", type=EntityType.METHOD, source_section="# M"),
-            ],
-        )
-        assert len(pe.entities) == 1
-        assert pe.entities[0].type == EntityType.METHOD
 
 
 class TestPaperFigure:

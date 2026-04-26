@@ -257,21 +257,33 @@ def _entities_preview_batch(
     if not paper_ids:
         return {}
     placeholders = ",".join("?" * len(paper_ids))
-    # ROW_NUMBER() scopes the LIMIT-per-paper inside a single pass so we
-    # avoid N+1 without streaming every entity row back to Python.
+    # term_aliases keys appearances by paper_name; join through papers
+    # to map back to paper_id. The inner GROUP BY collapses the
+    # per-section duplicates (same canonical mentioned in N sections of
+    # one paper produces N alias rows) before ROW_NUMBER caps the
+    # per-paper preview at _ENTITY_PREVIEW_LIMIT in a single pass.
     rows = conn.execute(
         f"""
-        SELECT paper_id, entity_name, entity_type FROM (
-            SELECT paper_id, entity_name, entity_type,
+        SELECT paper_id, canonical_name, entity_type FROM (
+            SELECT paper_id, canonical_name, entity_type,
                    ROW_NUMBER() OVER (
                        PARTITION BY paper_id
-                       ORDER BY entity_type, entity_name
+                       ORDER BY entity_type, canonical_name
                    ) AS rn
-              FROM entities
-             WHERE paper_id IN ({placeholders})
+              FROM (
+                  SELECT p.id AS paper_id,
+                         ct.canonical_name,
+                         ct.entity_type
+                    FROM papers p
+                    JOIN term_aliases ta ON ta.source_paper = p.paper_name
+                    JOIN canonical_terms ct ON ct.id = ta.term_id
+                   WHERE p.id IN ({placeholders})
+                     AND ct.term_type = 'entity'
+                   GROUP BY p.id, ct.id
+              )
         )
          WHERE rn <= ?
-         ORDER BY paper_id, entity_type, entity_name
+         ORDER BY paper_id, entity_type, canonical_name
         """,
         (*paper_ids, _ENTITY_PREVIEW_LIMIT),
     ).fetchall()
@@ -385,9 +397,14 @@ def mode_taxonomy_lookup(
         resolved_via = "vector"
 
     # ------- Build the result payload ------------------------------------
+    # term_aliases is now an appearance log: rows where alias == canonical_name
+    # are present (and intentional) for tier-1 hits and tier-5 mints. The
+    # SELECT DISTINCT below collapses the per-section duplicates so the
+    # alias trail stays human-readable; the full appearance set is what
+    # drives the per-paper sections payload below.
     aliases_rows = conn.execute(
-        "SELECT alias, source_paper FROM term_aliases "
-        " WHERE term_id = ? ORDER BY alias",
+        "SELECT DISTINCT alias, source_paper FROM term_aliases "
+        " WHERE term_id = ? ORDER BY alias, source_paper",
         (term_id,),
     ).fetchall()
     aliases_payload = [
@@ -412,13 +429,17 @@ def mode_taxonomy_lookup(
 
     # Papers per kind
     if kind_enum is TaxonomyKind.ENTITY:
-        # Single pass — rows sorted by (paper_name, source_breadcrumb) are
-        # bucketed into the papers list without per-paper follow-up queries.
+        # Single pass — rows sorted by (source_paper, source_breadcrumb)
+        # are bucketed into the papers list without per-paper follow-up
+        # queries. Empty breadcrumbs (paper-level mentions, e.g. those
+        # contributed by the classify stage if a name overlaps) are
+        # filtered out to keep the sections payload focused on positional
+        # info.
         erows = conn.execute(
-            "SELECT DISTINCT paper_name, source_breadcrumb FROM entities "
-            " WHERE entity_name = ? AND domain = ? "
-            " ORDER BY paper_name, source_breadcrumb",
-            (canonical_name, dom),
+            "SELECT DISTINCT source_paper, source_breadcrumb FROM term_aliases "
+            " WHERE term_id = ? AND source_breadcrumb != '' "
+            " ORDER BY source_paper, source_breadcrumb",
+            (term_id,),
         ).fetchall()
         papers: list[dict[str, Any]] = []
         for pn, sb in erows:
@@ -576,16 +597,23 @@ def mode_browse(
         if not entity_type:
             raise ValueError("mode_browse(which='entity_type') requires "
                              "filters['entity_type']")
+        # Per-canonical paper count is COUNT(DISTINCT source_paper) on
+        # the appearance log so per-section duplicates don't inflate the
+        # number. Canonicals with no appearance rows yet (a transient
+        # state during ingestion) drop out via the inner JOIN, matching
+        # the old entities-keyed semantic.
         sql = (
-            "SELECT entity_name, COUNT(DISTINCT paper_id) AS n "
-            "  FROM entities "
-            " WHERE entity_type = ? "
+            "SELECT ct.canonical_name, COUNT(DISTINCT ta.source_paper) AS n "
+            "  FROM canonical_terms ct "
+            "  JOIN term_aliases ta ON ta.term_id = ct.id "
+            " WHERE ct.term_type = 'entity' "
+            "   AND ct.entity_type = ? "
         )
         params = [entity_type]
         if domain:
-            sql += " AND domain = ? "
+            sql += " AND ct.domain = ? "
             params.append(domain)
-        sql += " GROUP BY entity_name ORDER BY n DESC, entity_name"
+        sql += " GROUP BY ct.canonical_name ORDER BY n DESC, ct.canonical_name"
         rows = conn.execute(sql, params).fetchall()
         return {
             "mode": view,

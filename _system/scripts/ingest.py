@@ -103,7 +103,14 @@ def _summary(conn: sqlite3.Connection, arxiv_id: str) -> dict:
         "SELECT COUNT(*) FROM sections WHERE paper_name = ?", (paper_name,)
     ).fetchone()[0]
     entity_count = conn.execute(
-        "SELECT COUNT(*) FROM entities WHERE paper_id = ?", (paper_id,)
+        """
+        SELECT COUNT(DISTINCT ta.term_id)
+          FROM term_aliases ta
+          JOIN canonical_terms ct ON ct.id = ta.term_id
+         WHERE ta.source_paper = ?
+           AND ct.term_type = 'entity'
+        """,
+        (paper_name,),
     ).fetchone()[0]
     figure_count = conn.execute(
         "SELECT COUNT(*) FROM figures WHERE paper_id = ?", (paper_id,)

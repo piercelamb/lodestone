@@ -629,8 +629,19 @@ def test_force_refetch_preserves_slug_and_clears_children(conn, fast_sleep):
         "SELECT id FROM papers WHERE arxiv_id = ?", (arxiv_id,)
     ).fetchone()[0]
     conn.execute(
-        "INSERT INTO entities (paper_id, domain, paper_name, entity_name, entity_type, source_breadcrumb) VALUES (?, ?, ?, ?, ?, ?)",
-        (paper_id, "rag", first.paper_name, "Some Entity", "method", "Abstract"),
+        "INSERT INTO canonical_terms (domain, term_type, entity_type, "
+        " canonical_name, first_seen_in) "
+        "VALUES (?, 'entity', 'method', 'Some Entity', ?)",
+        ("rag", first.paper_name),
+    )
+    seeded_term_id = conn.execute(
+        "SELECT id FROM canonical_terms WHERE canonical_name = 'Some Entity'"
+    ).fetchone()[0]
+    conn.execute(
+        "INSERT INTO term_aliases "
+        " (term_id, alias, source_paper, source_breadcrumb, match_tier) "
+        "VALUES (?, 'Some Entity', ?, 'Abstract', 1)",
+        (seeded_term_id, first.paper_name),
     )
     conn.execute(
         "INSERT INTO paper_topics (paper_id, domain, topic) VALUES (?, ?, ?)",
@@ -665,8 +676,12 @@ def test_force_refetch_preserves_slug_and_clears_children(conn, fast_sleep):
     paper_id = conn.execute(
         "SELECT id FROM papers WHERE arxiv_id = ?", (arxiv_id,)
     ).fetchone()[0]
+    paper_name = conn.execute(
+        "SELECT paper_name FROM papers WHERE id = ?", (paper_id,)
+    ).fetchone()[0]
     ents = conn.execute(
-        "SELECT COUNT(*) FROM entities WHERE paper_id = ?", (paper_id,)
+        "SELECT COUNT(*) FROM term_aliases WHERE source_paper = ?",
+        (paper_name,),
     ).fetchone()[0]
     topics = conn.execute(
         "SELECT COUNT(*) FROM paper_topics WHERE paper_id = ?", (paper_id,)
