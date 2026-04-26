@@ -37,7 +37,6 @@ def _body() -> str:
     "--needs-review",
     "--read",
     "--figure",
-    "--page",
     "--human",
     "aliases",
     "provenance",

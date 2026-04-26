@@ -1,9 +1,9 @@
 """Two-phase fetch of an arxiv paper.
 
-Phase 1: arxiv metadata + HTML discovery + PDF download + page rendering +
-LaTeXML parse + figure downloads + code-repo discovery. Pure in-memory; no
-open sqlite transaction. Phase 2: a single ``BEGIN/COMMIT`` that writes
-``papers`` + ``figures`` + ``page_images``.
+Phase 1: arxiv metadata + HTML discovery + PDF download (for content-hash
+dedup only) + LaTeXML parse + figure downloads + code-repo discovery.
+Pure in-memory; no open sqlite transaction. Phase 2: a single
+``BEGIN/COMMIT`` that writes ``papers`` + ``figures``.
 
 On both HTML hosts failing (arxiv.org/html then ar5iv.labs.arxiv.org),
 persists a stub ``papers`` row with ``status=failed_html`` and returns
@@ -55,7 +55,6 @@ Image.MAX_IMAGE_PIXELS = 256 * 1024 * 1024
 
 _MAX_IMAGE_BYTES = 20 * 1024 * 1024
 _MAX_IMAGE_WIDTH = 1920
-_PDF_RENDER_DPI = 300
 _JPEG_QUALITY = 85
 _PWC_RATE_SLEEP_S = 1.0
 
@@ -201,33 +200,6 @@ def _download_pdf(client: httpx.Client, arxiv_id: str) -> bytes:
     resp = client.get(url)
     resp.raise_for_status()
     return resp.content
-
-
-def _render_pdf_pages(pdf_bytes: bytes) -> list[bytes]:
-    """Render each PDF page to a PNG byte string at 300 DPI."""
-    import pypdfium2 as pdfium
-
-    pdf = pdfium.PdfDocument(pdf_bytes)
-    scale = _PDF_RENDER_DPI / 72.0
-    out: list[bytes] = []
-    try:
-        for i in range(len(pdf)):
-            page = pdf[i]
-            try:
-                pil_image = page.render(scale=scale).to_pil()
-                buf = io.BytesIO()
-                pil_image.save(buf, format="PNG")
-                out.append(buf.getvalue())
-            except Image.DecompressionBombError as exc:
-                _LOG.warning("page %d rendered an oversize image, skipping (%s)", i, exc)
-            finally:
-                try:
-                    page.close()
-                except Exception:  # pragma: no cover — pdfium quirks
-                    pass
-    finally:
-        pdf.close()
-    return out
 
 
 def _download_figure(
@@ -528,16 +500,15 @@ def _persist(
     conn: sqlite3.Connection,
     pm: PaperMetadata,
     figures: list[_ProcessedFigure],
-    page_images: list[bytes],
 ) -> None:
-    """Phase 2: single transaction writing papers + figures + page_images.
+    """Phase 2: single transaction writing papers + figures.
 
     Idempotency: on a forced re-fetch, any existing papers row (and every
-    dependent row across ``figures``, ``page_images``, ``entities``,
-    ``paper_topics``, and the FTS ``abstracts`` / ``sections`` virtual
-    tables) is deleted inside the same transaction before the fresh INSERT.
-    Callers that want paper_name / ingested_at preservation must set those
-    on the incoming PaperMetadata — ``fetch()`` does this.
+    dependent row across ``figures``, ``entities``, ``paper_topics``, and
+    the FTS ``abstracts`` / ``sections`` virtual tables) is deleted inside
+    the same transaction before the fresh INSERT. Callers that want
+    paper_name / ingested_at preservation must set those on the incoming
+    PaperMetadata — ``fetch()`` does this.
     """
     with transaction(conn):
         if pm.domain:
@@ -590,12 +561,6 @@ def _persist(
                 ],
             )
 
-        if page_images:
-            conn.executemany(
-                "INSERT INTO page_images (paper_id, page_number, image) VALUES (?, ?, ?)",
-                [(paper_id, i + 1, img) for i, img in enumerate(page_images)],
-            )
-
 
 def fetch(
     *,
@@ -605,20 +570,17 @@ def fetch(
     domain_override: str | None = None,
     client: httpx.Client | None = None,
     arxiv_lookup: Callable[[str], _ArxivMetadata] | None = None,
-    render_pages: Callable[[bytes], list[bytes] | None] = None,
 ) -> PaperMetadata:
     """Two-phase fetch of an arxiv paper. See module docstring for details.
 
     Keyword-only; all stage functions in the ingest pipeline share this
-    contract (see section 14). Test hooks (``client``, ``arxiv_lookup``,
-    ``render_pages``) let unit tests skip the network and PDF rendering
-    deterministically; production callers pass nothing and the defaults
-    kick in.
+    contract (see section 14). Test hooks (``client``, ``arxiv_lookup``)
+    let unit tests skip the network deterministically; production callers
+    pass nothing and the defaults kick in.
     """
     owns_client = client is None
     client = client or _make_default_client()
     arxiv_lookup = arxiv_lookup or _default_arxiv_lookup
-    render_pages = render_pages or _render_pdf_pages
 
     try:
         # Early dedup: skip all network if this arxiv_id is already in the DB.
@@ -646,8 +608,6 @@ def fetch(
         content_hash = hashlib.sha256(pdf_bytes).hexdigest()
 
         _log_soft_dedup(conn, content_hash, arxiv_id)
-
-        page_images = render_pages(pdf_bytes)
 
         base_url = base_url_for_source(html_source, arxiv_id)
         parsed = parse_latexml(html_body, base_url)
@@ -679,7 +639,7 @@ def fetch(
             needs_review=False,
             ingested_at=ingested_at,
         )
-        _persist(conn, pm, processed_figures, page_images)
+        _persist(conn, pm, processed_figures)
         return pm
     finally:
         if owns_client:
@@ -715,7 +675,7 @@ def _persist_failed_html(
         needs_review=False,
         ingested_at=ingested_at,
     )
-    _persist(conn, pm, figures=[], page_images=[])
+    _persist(conn, pm, figures=[])
     return pm
 
 

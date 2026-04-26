@@ -281,8 +281,7 @@ def _convert_figure(elem, state: _State) -> str:
     inline_mime: Optional[str] = None
 
     placeholder = (
-        f'<!-- Figure {fig_num}: "{caption}" '
-        f"— no image in HTML, see page images -->"
+        f'<!-- Figure {fig_num}: "{caption}" — no image in HTML -->'
     )
     image_ref = f"![Figure {fig_num}: {caption}](figure:{fig_num})"
 

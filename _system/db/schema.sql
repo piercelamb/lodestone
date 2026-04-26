@@ -59,12 +59,10 @@ CREATE TABLE IF NOT EXISTS figures (
     UNIQUE(paper_id, figure_number)
 );
 
-CREATE TABLE IF NOT EXISTS page_images (
-    paper_id INTEGER NOT NULL REFERENCES papers(id),
-    page_number INTEGER NOT NULL,
-    image BLOB NOT NULL,
-    PRIMARY KEY(paper_id, page_number)
-);
+-- Drop the legacy page_images table on any DB that predates the removal.
+-- LaTeXML strips page layout, so chunks have no page index to correlate
+-- back to a render — the table was vestigial. Idempotent.
+DROP TABLE IF EXISTS page_images;
 
 CREATE TABLE IF NOT EXISTS paper_references (
     id INTEGER PRIMARY KEY,
