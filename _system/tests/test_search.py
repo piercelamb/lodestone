@@ -245,22 +245,33 @@ def _insert_entity(
     source_breadcrumb: str,
     description: str = "",
 ) -> None:
+    """Compatibility shim: seed an entity-typed canonical (if needed) and
+    its appearance row in ``term_aliases``. ``paper_id`` is unused now —
+    appearance rows key by paper_name. ``description`` is ignored: the
+    column was dropped in the entities/term_aliases merge."""
+    del paper_id, description
     conn.execute(
         """
-        INSERT OR IGNORE INTO entities
-            (paper_id, domain, paper_name, entity_name, entity_type,
-             source_breadcrumb, description)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO canonical_terms
+            (domain, term_type, entity_type, canonical_name, first_seen_in)
+        VALUES (?, 'entity', ?, ?, ?)
         """,
-        (
-            paper_id,
-            domain,
-            paper_name,
-            entity_name,
-            entity_type,
-            source_breadcrumb,
-            description,
-        ),
+        (domain, entity_type, entity_name, paper_name),
+    )
+    term_id = conn.execute(
+        """
+        SELECT id FROM canonical_terms
+         WHERE domain = ? AND term_type = 'entity' AND canonical_name = ?
+        """,
+        (domain, entity_name),
+    ).fetchone()[0]
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO term_aliases
+            (term_id, alias, source_paper, source_breadcrumb, match_tier)
+        VALUES (?, ?, ?, ?, 1)
+        """,
+        (term_id, entity_name, paper_name, source_breadcrumb),
     )
 
 

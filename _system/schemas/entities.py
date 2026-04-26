@@ -1,10 +1,8 @@
-"""Entity data contracts produced by the GLiNER2 extraction stage."""
+"""Entity-type label vocabulary shared by the GLiNER2 inference stage and the
+``canonical_terms.entity_type`` column."""
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Optional
-
-from pydantic import BaseModel
 
 
 class EntityType(StrEnum):
@@ -17,17 +15,3 @@ class EntityType(StrEnum):
     SYSTEM = "system"
     ORGANIZATION = "organization"
     VENUE = "venue"
-
-
-class Entity(BaseModel):
-    name: str
-    type: EntityType
-    aliases: list[str] = []
-    source_section: str
-    description: Optional[str] = None
-
-
-class PaperEntities(BaseModel):
-    paper_name: str
-    domain: str
-    entities: list[Entity]

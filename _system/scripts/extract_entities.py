@@ -3,10 +3,14 @@
 Fourth pipeline stage (after ``fetch`` → ``convert`` → ``classify``): loads the
 paper's markdown, splits into sections via the shared section splitter, sub-
 chunks each section under GLiNER2's 384-token ceiling, runs labels-with-
-descriptions inference, applies the garbage gate, resolves every surviving
-entity name through the shared 5-tier resolver, and writes canonical rows into
-``entities`` with replace-all semantics per paper. Sets
-``papers.status = 'extracted'`` on success.
+descriptions inference, applies the garbage gate, and resolves every surviving
+entity name through the shared 5-tier resolver. The resolver writes a
+``term_aliases`` appearance row per surviving mention with the chunk's
+breadcrumb so downstream queries can locate the section the entity came
+from. Sets ``papers.status = 'extracted'`` and updates
+``papers.entity_count`` on success. Re-running the stage on a paper wipes
+its entity-typed alias rows first; topic/collection aliases written by
+the classify stage are preserved.
 
 The GLiNER2 model is loaded once per process via a module-level singleton.
 Callers never load GLiNER2 at import time — the model is pulled in lazily from
@@ -39,8 +43,6 @@ from _system.utils.sections import split_sections, strip_breadcrumb, sub_chunk
 
 _LOG = get_logger("scripts.extract_entities")
 
-_DESCRIPTION_WINDOW_CHARS = 200
-_DESCRIPTION_MAX_CHARS = 240
 _ACRONYM_MIN_LEN = 3
 _REJECT_RATE_WARN = 0.5
 _REJECT_RATE_WARN_MIN_SAMPLES = 10
@@ -60,7 +62,6 @@ _ENTITY_STOPLIST: frozenset[str] = frozenset(
 _LABEL_WORDS: frozenset[str] = frozenset(t.value for t in EntityType)
 
 _NUMERIC_RE = re.compile(r"\d+")
-_SENTENCE_SPLIT_RE = re.compile(r"[.!?]\s+")
 # Document-structure references: "Table 2", "Figure 3a", "Appendix C",
 # "Section 4.1", "Eq. 7". These are pointers, not entities.
 _STRUCTURAL_REF_RE = re.compile(
@@ -451,19 +452,34 @@ def extract(
         winning_type[norm] = (winner, winner_score)
 
     # ------------------------------------------------------------------
-    # Pass 2 (transactional): dedup per section, resolve, insert.
+    # Pass 2 (transactional): dedup per section, resolve (which writes
+    # the term_aliases appearance row), and update papers.entity_count.
     # ------------------------------------------------------------------
     with transaction(conn):
-        conn.execute("DELETE FROM entities WHERE paper_id = ?", (paper_id,))
+        # Wipe entity-typed alias rows for this paper so re-extraction
+        # doesn't accumulate stale appearance records. Topic/collection
+        # aliases (term_type != 'entity') are left untouched — classify
+        # owns those and won't re-run as part of this stage.
+        conn.execute(
+            """
+            DELETE FROM term_aliases
+             WHERE source_paper = ?
+               AND term_id IN (
+                   SELECT id FROM canonical_terms WHERE term_type = 'entity'
+               )
+            """,
+            (paper_name,),
+        )
 
         # Track canonicals already created in this paper so we only
-        # insert the Schwartz-Hearst short form as an alias once.
+        # insert the Schwartz-Hearst short form as an alias once per
+        # canonical per paper.
         aliased_term_ids: set[int] = set()
 
         for chunk, sub_chunks_list, chunk_valid_spans in per_chunk:
             # Per-section first-seen dedup keyed on normalized name only
             # (one concept per section, regardless of label variation).
-            seen: dict[str, tuple[EntityType, float, str, str]] = {}
+            seen: dict[str, tuple[EntityType, float, str]] = {}
             for sub, spans in zip(sub_chunks_list, chunk_valid_spans):
                 for span in spans:
                     name = (span.get("text") or "").strip()
@@ -474,15 +490,9 @@ def extract(
                     if norm in seen:
                         continue
                     etype, etype_score = winning_type[norm]
-                    start = int(span.get("start", 0))
-                    seen[norm] = (
-                        etype,
-                        etype_score,
-                        canonical_text,
-                        _description_for(sub, start),
-                    )
+                    seen[norm] = (etype, etype_score, canonical_text)
 
-            for norm, (etype, etype_score, raw_name, description) in seen.items():
+            for norm, (etype, etype_score, raw_name) in seen.items():
                 n_total += 1
                 if _is_garbage(raw_name):
                     n_rejected += 1
@@ -500,13 +510,14 @@ def extract(
                     entity_type=etype.value,
                     entity_type_score=etype_score,
                     source_paper=paper_name,
+                    source_breadcrumb=chunk.breadcrumb,
                     embedder=_get_embedder(),
                 )
 
                 # Persist the Schwartz-Hearst short form(s) as aliases.
-                # Alias insertion is idempotent per (term_id, alias,
-                # source_paper); guarding on ``aliased_term_ids`` is
-                # purely to avoid redundant INSERT OR IGNOREs per paper.
+                # Alias insertion is idempotent per composite PK;
+                # guarding on ``aliased_term_ids`` is purely to avoid
+                # redundant INSERT OR IGNOREs per paper.
                 if (
                     resolved.term_id not in aliased_term_ids
                     and norm in observed_short_forms
@@ -518,29 +529,19 @@ def extract(
                             canonical_name=resolved.canonical_name,
                             alias=short,
                             source_paper=paper_name,
+                            source_breadcrumb=chunk.breadcrumb,
                         )
                     aliased_term_ids.add(resolved.term_id)
 
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO entities
-                      (paper_id, domain, paper_name, entity_name, entity_type,
-                       source_breadcrumb, description)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        paper_id,
-                        paper_domain,
-                        paper_name,
-                        resolved.canonical_name,
-                        resolved.entity_type,
-                        chunk.breadcrumb,
-                        description,
-                    ),
-                )
-
         entity_count = conn.execute(
-            "SELECT COUNT(*) FROM entities WHERE paper_id = ?", (paper_id,)
+            """
+            SELECT COUNT(DISTINCT ta.term_id)
+              FROM term_aliases ta
+              JOIN canonical_terms ct ON ct.id = ta.term_id
+             WHERE ta.source_paper = ?
+               AND ct.term_type = 'entity'
+            """,
+            (paper_name,),
         ).fetchone()[0]
 
         conn.execute(
@@ -639,42 +640,6 @@ def _is_garbage(name: str) -> bool:
     if len(s) < _ACRONYM_MIN_LEN and s.upper() not in _ACRONYM_ALLOWLIST:
         return True
     return False
-
-
-# ---------------------------------------------------------------------------
-# Description extraction
-# ---------------------------------------------------------------------------
-
-
-def _description_for(sub_chunk_text: str, offset: int) -> str:
-    """Return a ≤240-char description of the sentence fragment covering ``offset``.
-
-    Strategy: take a ±200-char window around ``offset``, then pick the
-    sentence fragment covering ``offset`` using ``[.!?]\\s+`` as the sentence
-    boundary. Falls back to the raw window when no boundary brackets the offset.
-    Hard-truncates at 240 chars (no ellipsis).
-    """
-    n = len(sub_chunk_text)
-    if n == 0:
-        return ""
-
-    lo = max(0, offset - _DESCRIPTION_WINDOW_CHARS)
-    hi = min(n, offset + _DESCRIPTION_WINDOW_CHARS)
-    window = sub_chunk_text[lo:hi]
-    if not window:
-        return ""
-    local_offset = max(0, min(offset - lo, len(window) - 1))
-
-    frag_start = 0
-    frag_end = len(window)
-    for m in _SENTENCE_SPLIT_RE.finditer(window):
-        if local_offset < m.start():
-            frag_end = m.start()
-            break
-        frag_start = m.end()
-
-    picked = window[frag_start:frag_end].strip()
-    return picked[:_DESCRIPTION_MAX_CHARS]
 
 
 # ---------------------------------------------------------------------------

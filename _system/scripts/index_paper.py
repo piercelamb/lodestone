@@ -241,78 +241,27 @@ def _touched_term_ids(
 ) -> set[int]:
     """Union of canonical term ids this paper touches.
 
-    Three sources:
-    - ``entities`` rows joined back to ``canonical_terms`` on
-      ``(domain, 'entity', entity_type, entity_name)``.
-    - ``paper_topics`` rows joined to ``canonical_terms`` on
-      ``(domain, 'topic', '', topic)``.
-    - ``papers.collection`` matched against ``canonical_terms`` on
-      ``(domain, 'collection', '', collection)``.
+    Single source: ``term_aliases`` is the appearance log keyed by
+    ``source_paper`` (paper_name TEXT). Joining through ``papers`` to the
+    ``paper_id`` argument yields every canonical the paper touches —
+    entity-typed, topic-typed, and collection-typed alike — without
+    re-deriving the join from each per-stage table separately.
 
-    Entities / paper_topics carry the canonical *name* (not term_id) in
-    schema, so we re-join to canonical_terms here. A matching row is required;
-    an entity whose canonical row has been deleted is silently dropped from
-    the touched set (the orphan itself is a separate data-integrity problem).
+    The ``paper_topics`` and ``papers.collection`` arguments are no longer
+    needed for the union; we keep ``domain`` / ``collection`` in the
+    signature for caller compatibility but do not use them.
     """
-    term_ids: set[int] = set()
-
-    # LEFT JOIN so orphan entity_names (no matching canonical_terms row) show
-    # up as NULL ct.id. We count them to surface a WARN if extract_entities'
-    # contract of writing canonical names into entities.entity_name breaks.
+    del domain, collection  # retained in signature for caller compatibility
     rows = conn.execute(
         """
-        SELECT DISTINCT e.entity_name, ct.id
-          FROM entities e
-          LEFT JOIN canonical_terms ct
-            ON ct.domain = e.domain
-           AND ct.term_type = 'entity'
-           AND ct.entity_type = e.entity_type
-           AND ct.canonical_name = e.entity_name
-         WHERE e.paper_id = ?
+        SELECT DISTINCT ta.term_id
+          FROM term_aliases ta
+          JOIN papers p ON p.paper_name = ta.source_paper
+         WHERE p.id = ?
         """,
         (paper_id,),
     ).fetchall()
-    matched_ids = {r[1] for r in rows if r[1] is not None}
-    term_ids.update(matched_ids)
-    orphan_names = {r[0] for r in rows if r[1] is None}
-    if orphan_names:
-        _LOG.warning(
-            "paper_id=%s: %d distinct entity_names in entities have no "
-            "matching canonical_terms row — check extract_entities invariants.",
-            paper_id, len(orphan_names),
-        )
-
-    rows = conn.execute(
-        """
-        SELECT DISTINCT ct.id
-          FROM paper_topics pt
-          JOIN canonical_terms ct
-            ON ct.domain = pt.domain
-           AND ct.term_type = 'topic'
-           AND ct.entity_type = ''
-           AND ct.canonical_name = pt.topic
-         WHERE pt.paper_id = ?
-        """,
-        (paper_id,),
-    ).fetchall()
-    term_ids.update(r[0] for r in rows)
-
-    # domain / collection can be None (pre-classify) or "" (sentinel from
-    # extract_entities when classify didn't run). Both are falsy; skip the
-    # collection lookup in either case.
-    if domain and collection:
-        row = conn.execute(
-            """
-            SELECT id FROM canonical_terms
-             WHERE domain = ? AND term_type = 'collection'
-               AND entity_type = '' AND canonical_name = ?
-            """,
-            (domain, collection),
-        ).fetchone()
-        if row is not None:
-            term_ids.add(row[0])
-
-    return term_ids
+    return {r[0] for r in rows}
 
 
 def _fetch_canonical_rows(

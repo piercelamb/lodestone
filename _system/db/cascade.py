@@ -1,8 +1,10 @@
 """Per-paper cascade-delete helper used by both ``fetch_paper`` (force-refetch
 path) and ``ingest`` (``--force`` cascade).
 
-Global taxonomy (``canonical_terms``, ``term_aliases``, ``term_embeddings``,
-``terms_fts``) is **not** touched here — those rows are cross-paper.
+Canonical taxonomy rows (``canonical_terms``, ``term_embeddings``,
+``terms_fts``) are not touched — those are cross-paper. ``term_aliases``
+rows ARE per-paper (they're the appearance log keyed by ``source_paper``)
+and are deleted alongside the rest of the paper's children.
 """
 from __future__ import annotations
 
@@ -28,7 +30,16 @@ def delete_paper_cascade(conn: sqlite3.Connection, *, paper_id: int) -> None:
     )
     conn.execute("DELETE FROM paper_references WHERE paper_id = ?", (paper_id,))
     conn.execute("DELETE FROM figures      WHERE paper_id = ?", (paper_id,))
-    conn.execute("DELETE FROM entities     WHERE paper_id = ?", (paper_id,))
+    # term_aliases keys by paper_name (TEXT), not paper_id, so look up
+    # the name first. Wipes entity, topic, AND collection alias rows for
+    # this paper — the per-paper concepts they record are about to vanish.
+    conn.execute(
+        """
+        DELETE FROM term_aliases
+         WHERE source_paper = (SELECT paper_name FROM papers WHERE id = ?)
+        """,
+        (paper_id,),
+    )
     conn.execute("DELETE FROM paper_topics WHERE paper_id = ?", (paper_id,))
     conn.execute("DELETE FROM abstracts    WHERE paper_id = ?", (paper_id,))
     conn.execute("DELETE FROM sections     WHERE paper_id = ?", (paper_id,))

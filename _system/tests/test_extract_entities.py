@@ -27,11 +27,46 @@ from _system.scripts.extract_entities import (
     PaperNotFound,
     StatusTooLow,
     UnknownStatusError,
-    _description_for,
     _flatten_gliner_output,
     _is_garbage,
     extract,
 )
+
+
+# ---------------------------------------------------------------------------
+# Compatibility shims: the old ``entities`` table is gone — its data lives
+# in ``term_aliases`` joined to ``canonical_terms`` for term_type='entity'.
+# These helpers keep the test queries readable.
+# ---------------------------------------------------------------------------
+
+
+_ENTITY_ROWS_SQL = """
+    SELECT ct.canonical_name AS entity_name,
+           ct.entity_type    AS entity_type,
+           ta.source_breadcrumb,
+           ta.source_paper   AS paper_name
+      FROM term_aliases ta
+      JOIN canonical_terms ct ON ct.id = ta.term_id
+     WHERE ct.term_type = 'entity'
+"""
+
+
+def _entity_rows_for_paper(conn: sqlite3.Connection, paper_name: str) -> list:
+    """Return one row per entity-mention site for ``paper_name``."""
+    return conn.execute(
+        _ENTITY_ROWS_SQL + " AND ta.source_paper = ? "
+        " ORDER BY entity_name, ta.source_breadcrumb",
+        (paper_name,),
+    ).fetchall()
+
+
+def _entity_count_for_paper(conn: sqlite3.Connection, paper_name: str) -> int:
+    """COUNT(*) over the merged appearance log, matching the old
+    ``COUNT(*) FROM entities WHERE paper_name = ?`` semantic."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM (" + _ENTITY_ROWS_SQL + " AND ta.source_paper = ?)",
+        (paper_name,),
+    ).fetchone()[0]
 
 
 # ---------------------------------------------------------------------------
@@ -248,18 +283,25 @@ class TestPipelineStatus:
             )
 
     def test_rerun_clears_existing_entities(self, tmp_db_with_paper, fake_embedder):
-        paper_id = tmp_db_with_paper.execute(
-            "SELECT id FROM papers WHERE paper_name = ?", ("paper_name_2024",)
-        ).fetchone()[0]
-        # Seed 3 stale entities for this paper
+        # Seed 3 stale entity-typed alias rows for this paper. Each needs a
+        # canonical to point at, so create those first.
         for i in range(3):
+            cur = tmp_db_with_paper.execute(
+                """
+                INSERT INTO canonical_terms
+                    (domain, term_type, entity_type, entity_type_score,
+                     canonical_name, first_seen_in)
+                VALUES ('rag', 'entity', 'method', 0.5, ?, 'paper_name_2024')
+                """,
+                (f"stale_entity_{i}",),
+            )
             tmp_db_with_paper.execute(
                 """
-                INSERT INTO entities (paper_id, domain, paper_name, entity_name,
-                                      entity_type, source_breadcrumb, description)
-                VALUES (?, 'rag', 'paper_name_2024', ?, 'method', '# Stale', 'old')
+                INSERT INTO term_aliases
+                    (term_id, alias, source_paper, source_breadcrumb, match_tier)
+                VALUES (?, ?, 'paper_name_2024', '# Stale', 1)
                 """,
-                (paper_id, f"stale_entity_{i}"),
+                (cur.lastrowid, f"stale_entity_{i}"),
             )
 
         extract(
@@ -268,9 +310,7 @@ class TestPipelineStatus:
             run_inference=_static_inference([[_span("BookRAG", "method")]]),
             embedder=fake_embedder,
         )
-        rows = tmp_db_with_paper.execute(
-            "SELECT entity_name FROM entities WHERE paper_id = ?", (paper_id,)
-        ).fetchall()
+        rows = _entity_rows_for_paper(tmp_db_with_paper, "paper_name_2024")
         names = {r[0] for r in rows}
         assert not any(n.startswith("stale_entity_") for n in names)
         assert len(names) == 1
@@ -339,7 +379,8 @@ class TestSectionSplitterIntegration:
             embedder=fake_embedder,
         )
         rows = conn.execute(
-            "SELECT entity_name FROM entities WHERE paper_name = 'paper_name_2024'"
+            "SELECT entity_name FROM (" + _ENTITY_ROWS_SQL +
+            "   AND ta.source_paper = 'paper_name_2024')"
         ).fetchall()
         assert len(rows) == 1
 
@@ -399,11 +440,14 @@ class TestLabelVoting:
         # Majority vote winner is Method.
         assert canonicals[0][1] == "method"
 
-        # Every entities row for RRF carries the voted type.
+        # The canonical for RRF carries the voted type. After the
+        # entities/term_aliases merge, mention rows derive entity_type
+        # from the canonical via JOIN, so a single canonical row is the
+        # single source of truth for the label.
         entity_types = {
             row[0] for row in conn.execute(
-                "SELECT DISTINCT entity_type FROM entities "
-                "WHERE entity_name = 'RRF'"
+                "SELECT entity_type FROM canonical_terms "
+                "WHERE canonical_name = 'RRF' AND term_type = 'entity'"
             )
         }
         assert entity_types == {"method"}
@@ -458,13 +502,8 @@ class TestLabelVoting:
         ).fetchall()
         assert ("RRF", 0) in aliases
 
-        # Every entities row references the long form.
-        ent_names = {
-            r[0] for r in conn.execute(
-                "SELECT DISTINCT entity_name FROM entities "
-                "WHERE paper_name = 'paper_name_2024'"
-            )
-        }
+        # Every appearance row references the long form's canonical.
+        ent_names = {r[0] for r in _entity_rows_for_paper(conn, "paper_name_2024")}
         assert ent_names == {"Reciprocal Rank Fusion"}
 
     def test_argmax_per_span_collapses_multi_label_rows(
@@ -659,11 +698,14 @@ class TestLabelVoting:
         ).fetchone()
         assert row == ("software", pytest.approx(0.85))
 
-        # Paper 1's historical entities row was migrated.
+        # Paper 1's mention now reports the post-flip type via the
+        # canonical_terms JOIN (no per-row migration needed; the canonical
+        # is the single source of truth for entity_type).
         paper_1_type = conn.execute(
-            "SELECT entity_type FROM entities WHERE paper_name = 'paper_1' "
-            "AND entity_name = 'DPR'"
-        ).fetchone()[0]
+            _ENTITY_ROWS_SQL +
+            "   AND ta.source_paper = 'paper_1' "
+            "   AND ct.canonical_name = 'DPR' "
+        ).fetchone()[1]
         assert paper_1_type == "software"
 
     def test_bm25_flip_across_papers_with_multi_mention_majority(
@@ -741,11 +783,13 @@ class TestLabelVoting:
         ).fetchone()
         assert row == ("software", pytest.approx(0.85))
 
-        # Paper 1's historical entities row was migrated to software.
+        # Paper 1's mention now reports the post-flip type via the
+        # canonical_terms JOIN.
         paper_1_type = conn.execute(
-            "SELECT entity_type FROM entities WHERE paper_name = 'paper_1' "
-            "AND entity_name = 'BM25'"
-        ).fetchone()[0]
+            _ENTITY_ROWS_SQL +
+            "   AND ta.source_paper = 'paper_1' "
+            "   AND ct.canonical_name = 'BM25' "
+        ).fetchone()[1]
         assert paper_1_type == "software"
 
     def test_second_paper_with_lower_score_does_not_flip(
@@ -1048,13 +1092,11 @@ class TestSourceBreadcrumb:
             run_inference=_inf,
             embedder=fake_embedder,
         )
-        rows = conn.execute(
-            "SELECT entity_name, source_breadcrumb FROM entities "
-            "WHERE paper_name = 'paper_name_2024' ORDER BY source_breadcrumb"
-        ).fetchall()
+        rows = _entity_rows_for_paper(conn, "paper_name_2024")
         # Parent chunks + child chunks both contain BookRAG, so dedup per
         # section gives one row each with distinct source_breadcrumb values.
-        breadcrumbs = {r[1] for r in rows}
+        # _entity_rows_for_paper returns (entity_name, entity_type, breadcrumb, paper_name).
+        breadcrumbs = {r[2] for r in rows}
         assert len(breadcrumbs) >= 2
         # Every row holds the same canonical entity_name
         assert {r[0] for r in rows} == {"BookRAG"}
@@ -1079,12 +1121,7 @@ class TestSourceBreadcrumb:
             run_inference=_inf,
             embedder=fake_embedder,
         )
-        breadcrumbs = [
-            r[0]
-            for r in conn.execute(
-                "SELECT source_breadcrumb FROM entities WHERE paper_name = 'paper_name_2024'"
-            )
-        ]
+        breadcrumbs = [r[2] for r in _entity_rows_for_paper(conn, "paper_name_2024")]
         # Child section's breadcrumb is "# Method > ## Architecture".
         assert any(" > " in bc for bc in breadcrumbs)
 
@@ -1092,66 +1129,6 @@ class TestSourceBreadcrumb:
 # ===========================================================================
 # Description extraction
 # ===========================================================================
-
-
-class TestDescriptionExtraction:
-    def test_uses_nearest_sentence_boundary(self):
-        text = (
-            "Sentence one is here. "
-            "BookRAG is the method we propose. "
-            "Sentence three wraps up."
-        )
-        offset = text.index("BookRAG")
-        desc = _description_for(text, offset)
-        # Description MUST start at the sentence boundary, not mid-sentence.
-        assert desc.startswith("BookRAG"), (
-            f"description should start at sentence boundary; got {desc!r}"
-        )
-        # Description ends at the sentence terminator (no leak into next sentence).
-        assert "propose" in desc
-        assert "Sentence one" not in desc
-        assert "Sentence three" not in desc
-
-    def test_capped_at_240_chars(self):
-        # A single 500-char sentence with no internal boundary.
-        text = "X" * 500
-        desc = _description_for(text, 250)
-        assert len(desc) <= 240
-
-    def test_falls_back_to_raw_window_when_no_boundary(self):
-        # Continuous text with no sentence boundary → falls back to raw window.
-        text = "alpha beta gamma delta epsilon " * 20
-        offset = len(text) // 2
-        desc = _description_for(text, offset)
-        # Description is non-empty and within cap.
-        assert desc
-        assert len(desc) <= 240
-
-    def test_empty_text_returns_empty(self):
-        assert _description_for("", 0) == ""
-
-    def test_description_written_to_db_matches(self, tmp_db_with_paper, fake_embedder):
-        # Sanity check that _description_for's output reaches the DB description column.
-        inf = _static_inference(
-            [
-                [_span("BookRAG", "method", start=15)],
-                [],
-            ]
-        )
-        extract(
-            paper_name="paper_name_2024",
-            conn=tmp_db_with_paper,
-            run_inference=inf,
-            embedder=fake_embedder,
-        )
-        descs = [
-            r[0]
-            for r in tmp_db_with_paper.execute(
-                "SELECT description FROM entities WHERE paper_name = 'paper_name_2024'"
-            )
-        ]
-        assert descs
-        assert all(d is not None and 0 < len(d) <= 240 for d in descs)
 
 
 # ===========================================================================
@@ -1176,7 +1153,8 @@ class TestResolverIntegration:
             embedder=fake_embedder,
         )
         row = tmp_db_with_paper.execute(
-            "SELECT entity_name FROM entities WHERE paper_name = 'paper_name_2024'"
+            "SELECT entity_name FROM (" + _ENTITY_ROWS_SQL +
+            "   AND ta.source_paper = 'paper_name_2024')"
         ).fetchone()
         assert row is not None
         assert row[0] == "BookRAG"
@@ -1243,7 +1221,8 @@ class TestUnknownLabel:
             logger.removeHandler(caplog.handler)
 
         rows = tmp_db_with_paper.execute(
-            "SELECT entity_name FROM entities WHERE paper_name = 'paper_name_2024'"
+            "SELECT entity_name FROM (" + _ENTITY_ROWS_SQL +
+            "   AND ta.source_paper = 'paper_name_2024')"
         ).fetchall()
         names = {r[0] for r in rows}
         # MysteryThing must not have been written.
@@ -1271,7 +1250,8 @@ class TestPerLabelThreshold:
             embedder=fake_embedder,
         )
         count = tmp_db_with_paper.execute(
-            "SELECT COUNT(*) FROM entities WHERE paper_name = 'paper_name_2024'"
+            "SELECT COUNT(*) FROM (" + _ENTITY_ROWS_SQL +
+            "   AND ta.source_paper = 'paper_name_2024')"
         ).fetchone()[0]
         assert count == 0
 
@@ -1286,7 +1266,8 @@ class TestPerLabelThreshold:
             embedder=fake_embedder,
         )
         count = tmp_db_with_paper.execute(
-            "SELECT COUNT(*) FROM entities WHERE paper_name = 'paper_name_2024'"
+            "SELECT COUNT(*) FROM (" + _ENTITY_ROWS_SQL +
+            "   AND ta.source_paper = 'paper_name_2024')"
         ).fetchone()[0]
         assert count == 1
 
@@ -1361,7 +1342,8 @@ class TestEntityCountUpdate:
             "SELECT entity_count FROM papers WHERE paper_name = 'paper_name_2024'"
         ).fetchone()[0]
         count_from_table = tmp_db_with_paper.execute(
-            "SELECT COUNT(*) FROM entities WHERE paper_name = 'paper_name_2024'"
+            "SELECT COUNT(*) FROM (" + _ENTITY_ROWS_SQL +
+            "   AND ta.source_paper = 'paper_name_2024')"
         ).fetchone()[0]
         assert count_from_row == count_from_table
         assert count_from_row == 3
@@ -1500,7 +1482,8 @@ def test_real_gliner_extracts_method_entity(tmp_db_with_paper, fake_embedder):
         embedder=fake_embedder,
     )
     count = tmp_db_with_paper.execute(
-        "SELECT COUNT(*) FROM entities WHERE paper_name = 'paper_name_2024' "
-        "AND entity_type = 'method'"
+        "SELECT COUNT(*) FROM (" + _ENTITY_ROWS_SQL +
+        "   AND ta.source_paper = 'paper_name_2024' "
+        "   AND ct.entity_type = 'method')"
     ).fetchone()[0]
     assert count >= 1

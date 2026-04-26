@@ -133,8 +133,8 @@ def _seed_alias(
     conn.execute(
         """
         INSERT OR IGNORE INTO term_aliases
-            (term_id, alias, source_paper, match_tier)
-        VALUES (?, ?, ?, ?)
+            (term_id, alias, source_paper, source_breadcrumb, match_tier)
+        VALUES (?, ?, ?, '', ?)
         """,
         (term_id, alias, source_paper, match_tier),
     )
@@ -151,15 +151,32 @@ def _seed_entity(
     source_breadcrumb: str = "# Method",
     description: str = "description",
 ) -> None:
+    """Compatibility shim: seed an entity-typed canonical (if needed) and
+    its appearance row in ``term_aliases``. ``paper_id`` and
+    ``description`` are unused after the entities/term_aliases merge."""
+    del paper_id, description
     conn.execute(
         """
-        INSERT OR IGNORE INTO entities
-            (paper_id, domain, paper_name, entity_name, entity_type,
-             source_breadcrumb, description)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT OR IGNORE INTO canonical_terms
+            (domain, term_type, entity_type, canonical_name, first_seen_in)
+        VALUES (?, 'entity', ?, ?, ?)
         """,
-        (paper_id, domain, paper_name, entity_name, entity_type,
-         source_breadcrumb, description),
+        (domain, entity_type, entity_name, paper_name),
+    )
+    term_id = conn.execute(
+        """
+        SELECT id FROM canonical_terms
+         WHERE domain = ? AND term_type = 'entity' AND canonical_name = ?
+        """,
+        (domain, entity_name),
+    ).fetchone()[0]
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO term_aliases
+            (term_id, alias, source_paper, source_breadcrumb, match_tier)
+        VALUES (?, ?, ?, ?, 1)
+        """,
+        (term_id, entity_name, paper_name, source_breadcrumb),
     )
 
 
@@ -416,11 +433,19 @@ class TestTermsFtsScoping:
         ).fetchone()
         assert aliases_row is not None
         parts = aliases_row[0].split()
-        assert sorted(parts) == sorted(["book-rag", "bookragv2", "BR"])
+        # _seed_entity writes its own appearance row carrying the canonical
+        # name as alias ("BookRAG"). After the entities/term_aliases merge
+        # this is expected: term_aliases is the appearance log, so every
+        # mention contributes a row regardless of whether the surface form
+        # equals the canonical.
+        assert sorted(parts) == sorted(
+            ["book-rag", "bookragv2", "BR", "BookRAG"]
+        )
 
     def test_topics_and_collection_also_touch_terms(self, conn):
-        """paper_topics and papers.collection must also enter the touched-term
-        set so their terms_fts rows get built alongside entity terms."""
+        """topic + collection canonicals enter the touched-term set via the
+        ``term_aliases`` appearance log (classify writes alias rows with
+        ``source_breadcrumb=''`` for paper-level concepts)."""
         _seed_domain(conn)
         paper_id = _seed_paper(
             conn, paper_name="paper_name_2024", collection="retrieval",
@@ -443,6 +468,10 @@ class TestTermsFtsScoping:
             entity_name="EntityE",
         )
         _seed_paper_topic(conn, paper_id=paper_id, topic="TopicT")
+        # classify-side appearance rows: topic + collection both record
+        # the paper as a source with breadcrumb=''.
+        _seed_alias(conn, topic_term, "TopicT", source_paper="paper_name_2024")
+        _seed_alias(conn, coll_term, "retrieval", source_paper="paper_name_2024")
 
         index_one(paper_name="paper_name_2024", conn=conn)
 
@@ -669,45 +698,8 @@ class TestReindexOwnTermsFts:
         assert n == 1
 
 
-class TestOrphanEntity:
-    def test_orphan_entity_without_canonical_does_not_crash(self, conn):
-        """If an ``entities`` row's name has no matching canonical_terms row,
-        index_one must not crash. The orphan should be silently dropped from
-        ``touched`` and a WARN emitted so the mismatch surfaces in logs.
-
-        Lodestone's root logger sets ``propagate=False`` and pins its handler
-        to ``sys.stderr`` at module-load time — neither ``caplog`` nor
-        ``capsys`` capture its output. Attach a temporary handler directly
-        to the ``lodestone.scripts.index_paper`` logger.
-        """
-        import logging
-
-        _seed_domain(conn)
-        paper_id = _seed_paper(conn)
-        _seed_entity(
-            conn, paper_id=paper_id, paper_name="paper_name_2024",
-            entity_name="GhostEntity", entity_type="method",
-        )
-
-        records: list[logging.LogRecord] = []
-
-        class _CaptureHandler(logging.Handler):
-            def emit(self, record):
-                records.append(record)
-
-        handler = _CaptureHandler(level=logging.WARNING)
-        logger = logging.getLogger("lodestone.scripts.index_paper")
-        logger.addHandler(handler)
-        try:
-            index_one(paper_name="paper_name_2024", conn=conn)
-        finally:
-            logger.removeHandler(handler)
-
-        n = conn.execute("SELECT COUNT(*) FROM terms_fts").fetchone()[0]
-        assert n == 0
-
-        warn_messages = [r.getMessage() for r in records if r.levelno >= logging.WARNING]
-        assert any("entity_names" in m for m in warn_messages), (
-            f"expected WARN about entity_name/canonical mismatch; "
-            f"got {warn_messages!r}"
-        )
+# NOTE: the legacy ``TestOrphanEntity`` class was removed. After the merge,
+# ``term_aliases.term_id`` is a FOREIGN KEY to ``canonical_terms.id`` and
+# FK enforcement is ON (PRAGMA in db.connection.get_conn), so an orphan
+# appearance row referencing a non-existent canonical cannot exist —
+# the SQLite engine refuses the INSERT before the indexer ever runs.
