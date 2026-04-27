@@ -133,8 +133,8 @@ def _seed_alias(
     conn.execute(
         """
         INSERT OR IGNORE INTO term_aliases
-            (term_id, alias, source_paper, source_breadcrumb, match_tier)
-        VALUES (?, ?, ?, '', ?)
+            (term_id, alias, source_paper, match_tier)
+        VALUES (?, ?, ?, ?)
         """,
         (term_id, alias, source_paper, match_tier),
     )
@@ -151,10 +151,15 @@ def _seed_entity(
     source_breadcrumb: str = "# Method",
     description: str = "description",
 ) -> None:
-    """Compatibility shim: seed an entity-typed canonical (if needed) and
-    its appearance row in ``term_aliases``. ``paper_id`` and
-    ``description`` are unused after the entities/term_aliases merge."""
-    del paper_id, description
+    """Compatibility shim: seed an entity-typed canonical (if needed)
+    and ONE synonym row pointing at it. ``paper_id``,
+    ``source_breadcrumb`` and ``description`` are unused after the
+    revert to a synonym index. The seeded synonym is
+    ``f"{entity_name}_alt"`` so it differs from the canonical and
+    respects the synonym-index invariant; index_paper's
+    ``_touched_term_ids`` SQL branch needs at least one row to find
+    when called from the test."""
+    del paper_id, source_breadcrumb, description
     conn.execute(
         """
         INSERT OR IGNORE INTO canonical_terms
@@ -173,10 +178,10 @@ def _seed_entity(
     conn.execute(
         """
         INSERT OR IGNORE INTO term_aliases
-            (term_id, alias, source_paper, source_breadcrumb, match_tier)
-        VALUES (?, ?, ?, ?, 1)
+            (term_id, alias, source_paper, match_tier)
+        VALUES (?, ?, ?, 2)
         """,
-        (term_id, entity_name, paper_name, source_breadcrumb),
+        (term_id, f"{entity_name}_alt", paper_name),
     )
 
 
@@ -433,19 +438,20 @@ class TestTermsFtsScoping:
         ).fetchone()
         assert aliases_row is not None
         parts = aliases_row[0].split()
-        # _seed_entity writes its own appearance row carrying the canonical
-        # name as alias ("BookRAG"). After the entities/term_aliases merge
-        # this is expected: term_aliases is the appearance log, so every
-        # mention contributes a row regardless of whether the surface form
-        # equals the canonical.
+        # Synonym-index regime: ``term_aliases`` carries only non-
+        # canonical surface forms. The shim writes ``BookRAG_alt`` (not
+        # the canonical itself), and the test's seeded aliases stay as
+        # they are.
         assert sorted(parts) == sorted(
-            ["book-rag", "bookragv2", "BR", "BookRAG"]
+            ["book-rag", "bookragv2", "BR", "BookRAG_alt"]
         )
 
     def test_topics_and_collection_also_touch_terms(self, conn):
-        """topic + collection canonicals enter the touched-term set via the
-        ``term_aliases`` appearance log (classify writes alias rows with
-        ``source_breadcrumb=''`` for paper-level concepts)."""
+        """topic + collection canonicals enter the touched-term set via
+        the ``term_aliases`` synonym index. Each seeded alias must be a
+        real synonym (alias != canonical_name) under the synonym-index
+        regime — canonical-as-alias rows would violate the invariant
+        and be filtered by the resolver in real ingestion runs."""
         _seed_domain(conn)
         paper_id = _seed_paper(
             conn, paper_name="paper_name_2024", collection="retrieval",
@@ -468,10 +474,9 @@ class TestTermsFtsScoping:
             entity_name="EntityE",
         )
         _seed_paper_topic(conn, paper_id=paper_id, topic="TopicT")
-        # classify-side appearance rows: topic + collection both record
-        # the paper as a source with breadcrumb=''.
-        _seed_alias(conn, topic_term, "TopicT", source_paper="paper_name_2024")
-        _seed_alias(conn, coll_term, "retrieval", source_paper="paper_name_2024")
+        # Synonym-index rows for topic + collection: alias != canonical.
+        _seed_alias(conn, topic_term, "topicT_alias", source_paper="paper_name_2024")
+        _seed_alias(conn, coll_term, "retrieval_alias", source_paper="paper_name_2024")
 
         index_one(paper_name="paper_name_2024", conn=conn)
 

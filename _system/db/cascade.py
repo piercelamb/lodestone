@@ -3,7 +3,7 @@ path) and ``ingest`` (``--force`` cascade).
 
 Canonical taxonomy rows (``canonical_terms``, ``term_embeddings``,
 ``terms_fts``) are not touched — those are cross-paper. ``term_aliases``
-rows ARE per-paper (they're the appearance log keyed by ``source_paper``)
+rows ARE per-paper (they're the synonym index keyed by ``source_paper``)
 and are deleted alongside the rest of the paper's children.
 """
 from __future__ import annotations

@@ -156,21 +156,21 @@ def test_real_classify_paper_response_json_has_documented_shape():
     props = parsed["schema"]["properties"]
     assert set(props.keys()) == {
         "domain_index",
-        "proposed_new_domain",
-        "proposed_new_domain_description",
+        "new_domain",
+        "new_domain_desc",
         "collection_index",
-        "proposed_new_collection",
-        "proposed_new_collection_description",
+        "new_collection",
+        "new_collection_desc",
         "topics",
     }
     assert parsed["schema"]["additionalProperties"] is False
     assert parsed["schema"]["required"] == [
         "domain_index",
-        "proposed_new_domain",
-        "proposed_new_domain_description",
+        "new_domain",
+        "new_domain_desc",
         "collection_index",
-        "proposed_new_collection",
-        "proposed_new_collection_description",
+        "new_collection",
+        "new_collection_desc",
         "topics",
     ]
     assert props["domain_index"]["enum"] == "DOMAIN_INDEX_ENUM"

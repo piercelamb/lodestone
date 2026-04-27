@@ -85,7 +85,8 @@ def _force_delete_paper(conn: sqlite3.Connection, *, paper_id: int) -> None:
 
 def _summary(conn: sqlite3.Connection, arxiv_id: str) -> dict:
     row = conn.execute(
-        "SELECT id, paper_name, status, needs_review FROM papers WHERE arxiv_id = ?",
+        "SELECT id, paper_name, status, needs_review, entity_count "
+        "  FROM papers WHERE arxiv_id = ?",
         (arxiv_id,),
     ).fetchone()
     if row is None:
@@ -98,19 +99,9 @@ def _summary(conn: sqlite3.Connection, arxiv_id: str) -> dict:
             "entity_count": 0,
             "figure_count": 0,
         }
-    paper_id, paper_name, status, needs_review = row
+    paper_id, paper_name, status, needs_review, entity_count = row
     section_count = conn.execute(
         "SELECT COUNT(*) FROM sections WHERE paper_name = ?", (paper_name,)
-    ).fetchone()[0]
-    entity_count = conn.execute(
-        """
-        SELECT COUNT(DISTINCT ta.term_id)
-          FROM term_aliases ta
-          JOIN canonical_terms ct ON ct.id = ta.term_id
-         WHERE ta.source_paper = ?
-           AND ct.term_type = 'entity'
-        """,
-        (paper_name,),
     ).fetchone()[0]
     figure_count = conn.execute(
         "SELECT COUNT(*) FROM figures WHERE paper_id = ?", (paper_id,)
@@ -121,7 +112,7 @@ def _summary(conn: sqlite3.Connection, arxiv_id: str) -> dict:
         "status": status,
         "needs_review": bool(needs_review),
         "section_count": section_count,
-        "entity_count": entity_count,
+        "entity_count": entity_count or 0,
         "figure_count": figure_count,
     }
 

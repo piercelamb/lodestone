@@ -47,6 +47,7 @@ import sqlite_vec
 from _system.db.connection import get_conn, transaction
 from _system.db.migrations import VIRTUAL_TABLE_BLOCK_RE
 from _system.resolution.embeddings import Embedder
+from _system.resolution.resolver import pending_fts_rebuilds
 from _system.schemas.paper_metadata import PaperStatus, can_run_from
 from _system.utils.logging import get_logger
 from _system.utils.sections import split_sections
@@ -241,15 +242,20 @@ def _touched_term_ids(
 ) -> set[int]:
     """Union of canonical term ids this paper touches.
 
-    Single source: ``term_aliases`` is the appearance log keyed by
-    ``source_paper`` (paper_name TEXT). Joining through ``papers`` to the
-    ``paper_id`` argument yields every canonical the paper touches —
-    entity-typed, topic-typed, and collection-typed alike — without
-    re-deriving the join from each per-stage table separately.
+    Two sources, unioned:
+
+    1. ``term_aliases`` synonym rows scoped by ``source_paper`` — captures
+       canonicals that gained a non-canonical surface form from this
+       paper. Load-bearing for tests that seed ``term_aliases`` directly.
+    2. ``pending_fts_rebuilds(conn)`` — captures every canonical the
+       resolver call sites flagged this run, including tier-1 hits and
+       tier-5 mints (which leave no alias row under the synonym-index
+       regime), plus entity_type flips. Cleared after draining so the
+       queue doesn't leak into the next paper's pipeline run.
 
     The ``paper_topics`` and ``papers.collection`` arguments are no longer
-    needed for the union; we keep ``domain`` / ``collection`` in the
-    signature for caller compatibility but do not use them.
+    needed for the union; ``domain`` / ``collection`` are kept in the
+    signature for caller compatibility but unused.
     """
     del domain, collection  # retained in signature for caller compatibility
     rows = conn.execute(
@@ -261,7 +267,11 @@ def _touched_term_ids(
         """,
         (paper_id,),
     ).fetchall()
-    return {r[0] for r in rows}
+    sql_terms = {r[0] for r in rows}
+    pending = pending_fts_rebuilds(conn)
+    touched = sql_terms | pending
+    pending.clear()
+    return touched
 
 
 def _fetch_canonical_rows(

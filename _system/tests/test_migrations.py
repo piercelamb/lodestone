@@ -118,11 +118,11 @@ def test_canonical_terms_uniqueness(conn):
         )
 
 
-def test_term_aliases_uniqueness_with_breadcrumb(conn):
-    """``term_aliases`` PK is ``(term_id, alias, source_paper, source_breadcrumb)``.
-    Same alias in the same paper but different sections is two rows; same
-    section is a duplicate."""
+def test_term_aliases_uniqueness(conn):
+    """``term_aliases`` PK is ``(term_id, alias, source_paper)``. Same
+    triple is a duplicate; differing on any column is a new row."""
     _seed_paper(conn, paper_id=1)
+    _seed_paper(conn, paper_id=2)
     conn.execute(
         "INSERT INTO canonical_terms "
         " (id, domain, term_type, entity_type, canonical_name, first_seen_in) "
@@ -131,23 +131,23 @@ def test_term_aliases_uniqueness_with_breadcrumb(conn):
     )
     conn.execute(
         "INSERT INTO term_aliases "
-        " (term_id, alias, source_paper, source_breadcrumb, match_tier) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (1, "Transformer", "paper_1", "# Intro", 1),
+        " (term_id, alias, source_paper, match_tier) "
+        "VALUES (?, ?, ?, ?)",
+        (1, "transformer-block", "paper_1", 2),
     )
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(
             "INSERT INTO term_aliases "
-            " (term_id, alias, source_paper, source_breadcrumb, match_tier) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (1, "Transformer", "paper_1", "# Intro", 2),
+            " (term_id, alias, source_paper, match_tier) "
+            "VALUES (?, ?, ?, ?)",
+            (1, "transformer-block", "paper_1", 3),
         )
-    # Different breadcrumb: must succeed.
+    # Different source_paper: must succeed.
     conn.execute(
         "INSERT INTO term_aliases "
-        " (term_id, alias, source_paper, source_breadcrumb, match_tier) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (1, "Transformer", "paper_1", "# Method", 1),
+        " (term_id, alias, source_paper, match_tier) "
+        "VALUES (?, ?, ?, ?)",
+        (1, "transformer-block", "paper_2", 2),
     )
 
 
@@ -160,10 +160,11 @@ def test_entities_table_is_dropped(conn):
 
 
 def test_init_db_migrates_legacy_entities_into_term_aliases(tmp_path):
-    """A DB with the old shape (3-column term_aliases PK + sibling entities
-    table) gets folded into the new term_aliases shape on first init_db
-    run. Both the existing alias rows and the entities rows land as
-    appearance entries."""
+    """Pre-PR-#20 DB shape (3-column term_aliases PK + sibling entities
+    table) folds into the synonym-index shape on first init_db run.
+    Synonym entity rows survive; entities rows whose entity_name matches
+    the canonical are filtered out (canonicals are never synonyms of
+    themselves under Option C)."""
     db_path = tmp_path / "legacy.db"
     legacy = sqlite3.connect(db_path)
     try:
@@ -204,14 +205,22 @@ def test_init_db_migrates_legacy_entities_into_term_aliases(tmp_path):
             " canonical_name, first_seen_in) "
             "VALUES (1, 'rag', 'entity', 'method', 'BookRAG', 'p1')"
         )
+        # A real synonym in the legacy alias table — must survive.
         legacy.execute(
             "INSERT INTO term_aliases (term_id, alias, source_paper, match_tier) "
             "VALUES (1, 'Book-RAG', 'p1', 3)"
         )
+        # entities rows: one matches the canonical (must be filtered),
+        # one is a real synonym (must survive).
         legacy.execute(
             "INSERT INTO entities (paper_id, domain, paper_name, entity_name, "
             " entity_type, source_breadcrumb) "
             "VALUES (7, 'rag', 'p1', 'BookRAG', 'method', '# Intro')"
+        )
+        legacy.execute(
+            "INSERT INTO entities (paper_id, domain, paper_name, entity_name, "
+            " entity_type, source_breadcrumb) "
+            "VALUES (7, 'rag', 'p1', 'Book-RAG', 'method', '# Method')"
         )
         legacy.commit()
     finally:
@@ -222,18 +231,100 @@ def test_init_db_migrates_legacy_entities_into_term_aliases(tmp_path):
     try:
         init_db(conn)
         rows = conn.execute(
-            "SELECT term_id, alias, source_paper, source_breadcrumb, match_tier "
-            "  FROM term_aliases ORDER BY alias, source_breadcrumb"
+            "SELECT term_id, alias, source_paper, match_tier "
+            "  FROM term_aliases ORDER BY alias"
         ).fetchall()
-        # Old alias row landed with breadcrumb=''; entities row landed with
-        # its captured breadcrumb and match_tier=NULL.
-        assert (1, "BookRAG", "p1", "# Intro", None) in rows
-        assert (1, "Book-RAG", "p1", "", 3) in rows
+        # Pre-existing synonym row + entities synonym row collapse via
+        # INSERT OR IGNORE on the new 3-col PK; the canonical-as-alias
+        # entities row is filtered out entirely.
+        assert (1, "Book-RAG", "p1", 3) in rows
+        assert all(r[1] != "BookRAG" for r in rows), rows
         # entities is gone.
         gone = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE name = 'entities'"
         ).fetchone()
         assert gone is None
+    finally:
+        conn.close()
+
+
+def test_init_db_migrates_pr20_shape_to_synonym_index(tmp_path):
+    """Post-PR-#20 appearance-log shape (4-col PK with source_breadcrumb,
+    canonical-as-alias rows present) folds into the 3-col synonym-index
+    PK: synonym rows survive deduped; canonical-as-alias rows are
+    filtered out; the source_breadcrumb column is gone."""
+    db_path = tmp_path / "pr20.db"
+    legacy = sqlite3.connect(db_path)
+    try:
+        legacy.executescript(
+            """
+            CREATE TABLE canonical_terms (
+                id INTEGER PRIMARY KEY,
+                domain TEXT NOT NULL,
+                term_type TEXT NOT NULL,
+                entity_type TEXT NOT NULL DEFAULT '',
+                entity_type_score REAL NOT NULL DEFAULT 0.0,
+                canonical_name TEXT NOT NULL,
+                first_seen_in TEXT NOT NULL,
+                UNIQUE(domain, term_type, canonical_name)
+            );
+            CREATE TABLE term_aliases (
+                term_id INTEGER NOT NULL REFERENCES canonical_terms(id),
+                alias TEXT NOT NULL,
+                source_paper TEXT NOT NULL,
+                source_breadcrumb TEXT NOT NULL DEFAULT '',
+                match_tier INTEGER,
+                PRIMARY KEY(term_id, alias, source_paper, source_breadcrumb)
+            );
+            """
+        )
+        legacy.execute(
+            "INSERT INTO canonical_terms (id, domain, term_type, entity_type, "
+            " canonical_name, first_seen_in) "
+            "VALUES (1, 'rag', 'entity', 'method', 'BookRAG', 'p1')"
+        )
+        # Two canonical-as-alias rows in different sections — both must
+        # be filtered.
+        legacy.execute(
+            "INSERT INTO term_aliases (term_id, alias, source_paper, "
+            " source_breadcrumb, match_tier) "
+            "VALUES (1, 'BookRAG', 'p1', '# Intro', 1)"
+        )
+        legacy.execute(
+            "INSERT INTO term_aliases (term_id, alias, source_paper, "
+            " source_breadcrumb, match_tier) "
+            "VALUES (1, 'BookRAG', 'p1', '# Method', 1)"
+        )
+        # Two breadcrumb-variants of a real synonym — must dedupe to ONE
+        # row on the new 3-col PK.
+        legacy.execute(
+            "INSERT INTO term_aliases (term_id, alias, source_paper, "
+            " source_breadcrumb, match_tier) "
+            "VALUES (1, 'Book-RAG', 'p1', '# Intro', 3)"
+        )
+        legacy.execute(
+            "INSERT INTO term_aliases (term_id, alias, source_paper, "
+            " source_breadcrumb, match_tier) "
+            "VALUES (1, 'Book-RAG', 'p1', '# Method', 3)"
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    from _system.db.connection import get_conn
+    conn = get_conn(db_path)
+    try:
+        init_db(conn)
+        rows = conn.execute(
+            "SELECT term_id, alias, source_paper, match_tier "
+            "  FROM term_aliases ORDER BY alias"
+        ).fetchall()
+        assert rows == [(1, "Book-RAG", "p1", 3)], rows
+        # source_breadcrumb column is gone.
+        cols = [c[1] for c in conn.execute(
+            "PRAGMA table_info(term_aliases)"
+        ).fetchall()]
+        assert "source_breadcrumb" not in cols
     finally:
         conn.close()
 

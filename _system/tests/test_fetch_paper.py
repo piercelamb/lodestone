@@ -639,8 +639,8 @@ def test_force_refetch_preserves_slug_and_clears_children(conn, fast_sleep):
     ).fetchone()[0]
     conn.execute(
         "INSERT INTO term_aliases "
-        " (term_id, alias, source_paper, source_breadcrumb, match_tier) "
-        "VALUES (?, 'Some Entity', ?, 'Abstract', 1)",
+        " (term_id, alias, source_paper, match_tier) "
+        "VALUES (?, 'some_entity_alt', ?, 2)",
         (seeded_term_id, first.paper_name),
     )
     conn.execute(
