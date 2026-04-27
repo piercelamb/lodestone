@@ -920,6 +920,7 @@ class TestModeRead:
     def test_full_markdown(self, seeded_db):
         r = search_mod.mode_read(seeded_db, paper_name="bookrag_2024", section=None)
         assert r["mode"] == "read"
+        assert r["status"] == "ok"
         assert r["paper_name"] == "bookrag_2024"
         assert r["section"] is None
         assert "BookRAG" in r["text"]
@@ -928,6 +929,7 @@ class TestModeRead:
         r = search_mod.mode_read(
             seeded_db, paper_name="bookrag_2024", section="Method"
         )
+        assert r["status"] == "ok"
         assert r["section"] == "Method"
         # Must include the Method header and its Setup child.
         assert "# Method" in r["text"]
@@ -943,18 +945,140 @@ class TestModeRead:
             paper_name="bookrag_2024",
             section="Experiments > Setup",
         )
+        assert r["status"] == "ok"
         assert "Setup inside Experiments." in r["text"]
         assert "Setup inside Method." not in r["text"]
 
-    def test_missing_section_raises(self, seeded_db):
-        with pytest.raises(ValueError):
-            search_mod.mode_read(
-                seeded_db, paper_name="bookrag_2024", section="NoSuchSection"
-            )
+    def test_missing_section_emits_structured_payload(self, seeded_db):
+        """Well-formed --section that doesn't match: structured payload, no raise."""
+        r = search_mod.mode_read(
+            seeded_db, paper_name="bookrag_2024", section="NoSuchSection"
+        )
+        assert r["mode"] == "read"
+        assert r["status"] == "section_not_found"
+        assert r["paper_name"] == "bookrag_2024"
+        assert r["requested_section"] == "NoSuchSection"
+        assert "text" not in r  # Don't leak any partial markdown.
+        # The fallback hint must reference --toc and the whole-paper option
+        # — that's the actionable recovery path for the agent.
+        assert "--toc" in r["hint"]
+        assert "bookrag_2024" in r["hint"]
+
+    def test_missing_section_lists_top_level_titles(self, seeded_db):
+        """The available-sections payload exposes levels 1-2 from the paper."""
+        r = search_mod.mode_read(
+            seeded_db, paper_name="bookrag_2024", section="ZZZ Nope"
+        )
+        assert r["status"] == "section_not_found"
+        avail = r["available_top_level_sections"]
+        # Fixture markdown has Abstract / Introduction / Method / Experiments
+        # plus level-2 Setup duplicated. All level <= 2 titles must surface.
+        assert "Abstract" in avail
+        assert "Introduction" in avail
+        assert "Method" in avail
+        assert "Experiments" in avail
+
+    def test_malformed_section_query_emits_structured_payload(self, seeded_db):
+        """Malformed breadcrumb (empty segment): structured payload with rule message."""
+        r = search_mod.mode_read(
+            seeded_db, paper_name="bookrag_2024", section="A >> B"
+        )
+        assert r["status"] == "malformed_section_query"
+        assert r["paper_name"] == "bookrag_2024"
+        assert r["requested_section"] == "A >> B"
+        # The error string carries the actual rule violated, not just the input.
+        assert "empty segment" in r["error"]
+        # The hint tells Claude the right syntax.
+        assert "Parent > Child" in r["hint"]
+
+    @pytest.mark.parametrize(
+        "bad",
+        ["", "   ", ">", "A >", "> B", "A\nB", "x" * 1000],
+    )
+    def test_malformed_section_query_variants(self, seeded_db, bad):
+        """Every malformed shape gets caught and translated to the structured payload."""
+        r = search_mod.mode_read(
+            seeded_db, paper_name="bookrag_2024", section=bad
+        )
+        assert r["status"] == "malformed_section_query"
 
     def test_unknown_paper_raises(self, seeded_db):
+        """Wrong paper_name is a hard error (not an agent miss) — keep raising."""
         with pytest.raises(ValueError):
             search_mod.mode_read(seeded_db, paper_name="nope_2099", section=None)
+
+
+class TestModeReadFailureRendering:
+    """to_human + main() behavior on the read-mode failure payloads."""
+
+    def test_human_section_not_found_mentions_toc(self, seeded_db):
+        payload = search_mod.mode_read(
+            seeded_db, paper_name="bookrag_2024", section="ZZZ Nope"
+        )
+        out = search_mod.to_human(payload)
+        assert "ZZZ Nope" in out
+        assert "--toc" in out
+
+    def test_human_malformed_query_includes_rule(self, seeded_db):
+        payload = search_mod.mode_read(
+            seeded_db, paper_name="bookrag_2024", section="A >> B"
+        )
+        out = search_mod.to_human(payload)
+        assert "malformed" in out.lower()
+        assert "Parent > Child" in out
+
+    def test_main_exit_code_2_on_section_not_found(
+        self, seeded_db, db_path, capsys
+    ):
+        del seeded_db  # Fixture only needed for its side effect on db_path.
+        rc = search_mod.main(
+            ["--db", str(db_path), "--read", "bookrag_2024", "--section", "ZZZ Nope"]
+        )
+        assert rc == 2
+        captured = capsys.readouterr()
+        # JSON mode (default): payload still goes to stdout — that's the
+        # agent's recovery channel.
+        assert '"status": "section_not_found"' in captured.out
+        assert captured.err == ""
+
+    def test_main_exit_code_2_on_malformed_query(
+        self, seeded_db, db_path, capsys
+    ):
+        del seeded_db
+        rc = search_mod.main(
+            ["--db", str(db_path), "--read", "bookrag_2024", "--section", "A >> B"]
+        )
+        assert rc == 2
+        captured = capsys.readouterr()
+        assert '"status": "malformed_section_query"' in captured.out
+
+    def test_main_exit_code_0_on_happy_read(self, seeded_db, db_path, capsys):
+        del seeded_db
+        rc = search_mod.main(
+            ["--db", str(db_path), "--read", "bookrag_2024", "--section", "Method"]
+        )
+        assert rc == 0
+        captured = capsys.readouterr()
+        assert '"status": "ok"' in captured.out
+
+    def test_main_human_failure_writes_stderr_not_stdout(
+        self, seeded_db, db_path, capsys
+    ):
+        """``--human`` keeps stdout empty on soft failure so shell pipes are clean."""
+        del seeded_db
+        rc = search_mod.main(
+            [
+                "--db", str(db_path),
+                "--read", "bookrag_2024",
+                "--section", "ZZZ Nope",
+                "--human",
+            ]
+        )
+        assert rc == 2
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "ZZZ Nope" in captured.err
+        assert "--toc" in captured.err
 
 
 # ===========================================================================

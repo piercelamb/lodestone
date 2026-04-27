@@ -8,6 +8,7 @@ import pytest
 
 from _system.utils.sections import (
     SectionChunk,
+    SectionQueryError,
     find_hierarchical_section,
     split_sections,
     strip_breadcrumb,
@@ -335,6 +336,64 @@ def test_find_hierarchical_section_end_boundary_excludes_next_top_level(sample_m
     # The next top-level header is Experiments — neither its '#' line nor body may appear.
     assert "# Experiments" not in slice_
     assert "Experiments intro." not in slice_
+
+
+# --- find_hierarchical_section: malformed input rejection ---
+
+
+@pytest.mark.parametrize(
+    "bad_query",
+    [
+        "",
+        "   ",
+        "\t",
+        ">",
+        " > ",
+        ">>",
+        "A >",
+        "> B",
+        "A >> B",
+        "A > > B",
+        "A >>> B",
+    ],
+)
+def test_find_hierarchical_section_malformed_raises(
+    sample_markdown: str, bad_query: str
+) -> None:
+    """Empty/whitespace queries and breadcrumbs with empty segments raise SectionQueryError."""
+    with pytest.raises(SectionQueryError):
+        find_hierarchical_section(sample_markdown, bad_query)
+
+
+@pytest.mark.parametrize("bad_query", ["A\nB", "Method\r\nSetup", "\n", "A > \n"])
+def test_find_hierarchical_section_newline_raises(
+    sample_markdown: str, bad_query: str
+) -> None:
+    """A query containing a newline is rejected (likely a paste accident)."""
+    with pytest.raises(SectionQueryError):
+        find_hierarchical_section(sample_markdown, bad_query)
+
+
+def test_find_hierarchical_section_oversized_query_raises(sample_markdown: str) -> None:
+    """A pathologically long query is rejected before any matching work runs."""
+    with pytest.raises(SectionQueryError):
+        find_hierarchical_section(sample_markdown, "x" * 1000)
+
+
+def test_find_hierarchical_section_well_formed_no_match_returns_none(
+    sample_markdown: str,
+) -> None:
+    """Regression: a well-formed query that doesn't match returns None, not raises.
+
+    The whole point of separating malformed-vs-absent: the caller (mode_read)
+    needs to distinguish "Claude typed wrong" (raise/handle) from "Claude
+    typed a real-looking section that this paper doesn't have" (recoverable).
+    """
+    assert (
+        find_hierarchical_section(sample_markdown, "Nonexistent > Sub > Tree")
+        is None
+    )
+    assert find_hierarchical_section(sample_markdown, "Method > Methodology") is None
 
 
 # --- split_sections edge cases ---
