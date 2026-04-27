@@ -2,13 +2,14 @@
 
 ``resolve(conn, raw, ...)`` canonicalizes a raw term string against
 ``canonical_terms`` scoped by ``(domain, term_type)`` and returns a
-:class:`ResolvedTerm` describing the hit. Every successful resolve also
-writes a ``term_aliases`` row carrying ``(term_id, alias=raw,
-source_paper, source_breadcrumb, match_tier)`` — including tier-1 hits
-(where ``alias == canonical_name``) and tier-5 mints (where the new
-canonical also seeds its first appearance row). ``term_aliases`` is the
-per-(concept, paper, section) appearance log; topic/collection callers
-that have no positional axis pass ``source_breadcrumb=''``.
+:class:`ResolvedTerm` describing the hit. ``term_aliases`` is a
+per-(concept, paper) **synonym index**: rows are written iff the
+resolved surface form differs from the canonical's name after
+normalization. Tier-1 hits and tier-5 mints are silent on the alias
+side — the canonical itself is not a synonym of itself, and an
+``--entity X`` lookup gets the canonical from ``canonical_terms``
+without needing an alias row to confirm. Tier-2/3/4 hits add a row
+when the surface form is a real synonym (different normalized shape).
 
 Tiers, cheapest first, each falling through on miss:
 
@@ -50,8 +51,7 @@ can never trigger one.
 
 The resolved :class:`ResolvedTerm` carries the *currently-stored*
 ``entity_type`` and ``entity_type_score`` back. Callers may pass
-``entity_type=None``; it is coerced to ``""``. ``source_breadcrumb`` defaults
-to ``''`` for callers that don't track section context.
+``entity_type=None``; it is coerced to ``""``.
 """
 from __future__ import annotations
 
@@ -86,7 +86,12 @@ _TIER3_MIN_RATIO = 85
 # K is small (single SQL round-trip with k=10 is cheap on sqlite-vec) and the
 # gradient does the discrimination work; the floor only gates the very-low tail.
 _TIER4_TOP_K = 10
-_TIER4_MIN_TOP1 = 0.70
+# Raised from 0.70 → 0.82 (2026-04-26): on the live vstash_2026 corpus with
+# bge-small-en-v1.5, gradient-walk single-survivor merges in the 0.72–0.80
+# range were collapsing distinct concepts (Mem0↔A-MEM, P95↔P99, full-text
+# search↔hybrid retrieval). Clean tier-4 hits cluster ≥0.82. See
+# .agents/.../handoffs/tier4_overmerge.md for the audit.
+_TIER4_MIN_TOP1 = 0.82
 _TIER4_GRADIENT = 0.88
 
 _MIN_ALIAS_LEN = 3
@@ -126,7 +131,6 @@ def resolve(
     entity_type: str | None = None,
     entity_type_score: float = 0.0,
     source_paper: str,
-    source_breadcrumb: str = "",
     embedder: Embedder | None = None,
 ) -> ResolvedTerm:
     """5-tier canonicalization of ``raw`` in scope ``(domain, term_type)``.
@@ -136,25 +140,18 @@ def resolve(
     derived tables consistent. A non-default ``entity_type_score`` together
     with a non-empty ``entity_type`` also arms the flip check on tier-1-to-4
     hits: see :func:`_maybe_flip_entity_type`. Side effects: writes a
-    ``term_aliases`` row on every successful resolve (tiers 1-5, plus the
-    tier-5-race fallback), may update ``canonical_terms`` on a flip, and
-    inserts into ``canonical_terms`` + ``term_embeddings`` on tier 5. Alias
-    inserts and flips both enqueue a deferred ``terms_fts`` rebuild. All
-    writes happen on the caller-provided ``conn`` without calling
-    ``commit()`` — the orchestrator owns transaction boundaries.
+    ``term_aliases`` row on tier-2/3/4 hits whose normalized surface form
+    differs from the canonical (synonym index — no row for tier-1 hits or
+    tier-5 mints), may update ``canonical_terms`` on a flip, and inserts
+    into ``canonical_terms`` + ``term_embeddings`` on tier 5. Alias inserts
+    and flips both enqueue a deferred ``terms_fts`` rebuild. All writes
+    happen on the caller-provided ``conn`` without calling ``commit()`` —
+    the orchestrator owns transaction boundaries.
     """
     entity_type = entity_type or ""
 
     hit = _tier1(conn, raw, domain=domain, term_type=term_type)
     if hit is not None:
-        _maybe_insert_alias(
-            conn,
-            term_id=hit.term_id,
-            alias=raw,
-            source_paper=source_paper,
-            source_breadcrumb=source_breadcrumb,
-            tier=MatchTier.TIER1,
-        )
         return _apply_flip(
             conn,
             hit,
@@ -176,7 +173,7 @@ def resolve(
     if hit2 is not None:
         return _hit(
             conn, hit2, raw=raw, source_paper=source_paper,
-            source_breadcrumb=source_breadcrumb, tier=MatchTier.TIER2,
+            tier=MatchTier.TIER2,
             domain=domain,
             new_entity_type=entity_type,
             new_entity_type_score=entity_type_score,
@@ -192,7 +189,7 @@ def resolve(
     if hit3 is not None:
         return _hit(
             conn, hit3, raw=raw, source_paper=source_paper,
-            source_breadcrumb=source_breadcrumb, tier=MatchTier.TIER3,
+            tier=MatchTier.TIER3,
             domain=domain,
             new_entity_type=entity_type,
             new_entity_type_score=entity_type_score,
@@ -209,7 +206,7 @@ def resolve(
         if hit4 is not None:
             return _hit(
                 conn, hit4, raw=raw, source_paper=source_paper,
-                source_breadcrumb=source_breadcrumb, tier=MatchTier.TIER4,
+                tier=MatchTier.TIER4,
                 domain=domain,
                 new_entity_type=entity_type,
                 new_entity_type_score=entity_type_score,
@@ -223,7 +220,6 @@ def resolve(
         entity_type=entity_type,
         entity_type_score=entity_type_score,
         source_paper=source_paper,
-        source_breadcrumb=source_breadcrumb,
         embedder=embedder,
     )
 
@@ -425,7 +421,6 @@ def _tier5(
     entity_type: str,
     entity_type_score: float,
     source_paper: str,
-    source_breadcrumb: str,
     embedder: Embedder | None,
 ) -> ResolvedTerm:
     if embedder is None:
@@ -479,17 +474,9 @@ def _tier5(
             raw, fallback.term_id,
         )
         # The sibling inserter's entity_type may differ from ours; run the
-        # same flip check we'd run on any other tier-1 hit. Record the
-        # appearance so the recovered canonical still gets a row from this
-        # paper.
-        _maybe_insert_alias(
-            conn,
-            term_id=fallback.term_id,
-            alias=raw,
-            source_paper=source_paper,
-            source_breadcrumb=source_breadcrumb,
-            tier=MatchTier.TIER1,
-        )
+        # same flip check we'd run on any other tier-1 hit. Under the
+        # synonym-index regime, no alias row is written for the tier-1
+        # fallback either — the canonical itself is not a synonym.
         return _apply_flip(
             conn,
             fallback,
@@ -501,14 +488,6 @@ def _tier5(
         )
 
     conn.execute("RELEASE tier5")
-    _maybe_insert_alias(
-        conn,
-        term_id=term_id,
-        alias=raw,
-        source_paper=source_paper,
-        source_breadcrumb=source_breadcrumb,
-        tier=MatchTier.TIER5,
-    )
     _log.debug(
         "tier5 new canonical: raw=%r scope=(%s,%s,%s) term_id=%s score=%.3f",
         raw, domain, term_type, entity_type, term_id, entity_type_score,
@@ -524,20 +503,19 @@ def _hit(
     *,
     raw: str,
     source_paper: str,
-    source_breadcrumb: str,
     tier: MatchTier,
     domain: str,
     new_entity_type: str,
     new_entity_type_score: float,
 ) -> ResolvedTerm:
-    """Common return path for tiers 2/3/4: alias insert, flip check, return."""
+    """Common return path for tiers 2/3/4: synonym insert, flip check, return."""
     term_id, canonical_name, entity_type, entity_type_score = candidate
     _maybe_insert_alias(
         conn,
         term_id=term_id,
+        canonical_name=canonical_name,
         alias=raw,
         source_paper=source_paper,
-        source_breadcrumb=source_breadcrumb,
         tier=tier,
     )
     _log.debug("resolve %s hit: raw=%r term_id=%s", tier.value, raw, term_id)
@@ -645,24 +623,26 @@ def _maybe_insert_alias(
     conn: sqlite3.Connection,
     *,
     term_id: int,
+    canonical_name: str,
     alias: str,
     source_paper: str,
-    source_breadcrumb: str,
     tier: MatchTier,
 ) -> None:
-    """Insert a ``term_aliases`` appearance row and enqueue a deferred
+    """Insert a ``term_aliases`` synonym row and enqueue a deferred
     ``terms_fts`` rebuild. Idempotent per composite PK
-    ``(term_id, alias, source_paper, source_breadcrumb)``.
+    ``(term_id, alias, source_paper)``.
 
     ``term_aliases.match_tier`` stores ``0`` for :attr:`MatchTier.ACRONYM`
     (paper-native, pre-resolver) and the numeric part of the tier name
-    (1-5) for resolver-discovered rows. Rows where ``alias == canonical_name``
-    are intentional — every mention writes a row, including tier-1 hits and
-    tier-5 mints, so ``term_aliases`` is the complete per-paper appearance
-    log. Aliases shorter than :data:`_MIN_ALIAS_LEN` are silently dropped to
-    avoid noise from one- or two-letter spans.
+    (1-5) for resolver-discovered rows. **Synonym-index invariant**: rows
+    where ``normalize_term(alias) == normalize_term(canonical_name)`` are
+    silently dropped — the canonical is not a synonym of itself.
+    Aliases shorter than :data:`_MIN_ALIAS_LEN` are also dropped to avoid
+    noise from one- or two-letter spans.
     """
     if len(alias) < _MIN_ALIAS_LEN:
+        return
+    if normalize_term(alias) == normalize_term(canonical_name):
         return
     if tier is MatchTier.ACRONYM:
         match_tier = 0
@@ -671,10 +651,10 @@ def _maybe_insert_alias(
     conn.execute(
         """
         INSERT OR IGNORE INTO term_aliases
-            (term_id, alias, source_paper, source_breadcrumb, match_tier)
-        VALUES (?, ?, ?, ?, ?)
+            (term_id, alias, source_paper, match_tier)
+        VALUES (?, ?, ?, ?)
         """,
-        (term_id, alias, source_paper, source_breadcrumb, match_tier),
+        (term_id, alias, source_paper, match_tier),
     )
     pending_fts_rebuilds(conn).add(term_id)
 
@@ -686,22 +666,19 @@ def insert_acronym_alias(
     canonical_name: str,
     alias: str,
     source_paper: str,
-    source_breadcrumb: str = "",
 ) -> None:
     """Public: persist a Schwartz-Hearst short form as a ``term_aliases`` row.
 
     Wrapper around :func:`_maybe_insert_alias` for pre-resolver acronym
-    aliases. Short forms under :data:`_MIN_ALIAS_LEN` are silently skipped.
-    ``canonical_name`` is no longer used as a deduplication key (the
-    appearance log records every mention) but is retained in the signature
-    so call sites that have it in scope don't need refactoring.
+    aliases. Short forms under :data:`_MIN_ALIAS_LEN` are silently skipped,
+    as are forms that normalize to the canonical (the synonym-index
+    invariant).
     """
-    del canonical_name  # kept in signature for caller convenience; unused
     _maybe_insert_alias(
         conn,
         term_id=term_id,
+        canonical_name=canonical_name,
         alias=alias,
         source_paper=source_paper,
-        source_breadcrumb=source_breadcrumb,
         tier=MatchTier.ACRONYM,
     )

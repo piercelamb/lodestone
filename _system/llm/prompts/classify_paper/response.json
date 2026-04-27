@@ -9,11 +9,11 @@
         "description": "Index into existing_domains list. Use -1 to propose a new domain.",
         "enum": "DOMAIN_INDEX_ENUM"
       },
-      "proposed_new_domain": {
+      "new_domain": {
         "type": "string",
         "description": "Empty unless domain_index == -1; otherwise the proposed new domain name."
       },
-      "proposed_new_domain_description": {
+      "new_domain_desc": {
         "type": "string",
         "description": "Empty unless domain_index == -1; otherwise a one-sentence description of the proposed domain (what it covers, not the specific paper). Stored alongside the domain row."
       },
@@ -22,21 +22,21 @@
         "description": "Index of an existing collection within the chosen domain (as shown in the tree). Use -1 to propose a new collection.",
         "enum": "COLLECTION_INDEX_ENUM"
       },
-      "proposed_new_collection": {
+      "new_collection": {
         "type": "string",
         "description": "Empty unless collection_index == -1; otherwise the proposed new collection name."
       },
-      "proposed_new_collection_description": {
+      "new_collection_desc": {
         "type": "string",
         "description": "Empty unless collection_index == -1; otherwise a one-sentence description of the proposed collection (what family of work it groups, not the specific paper). Stored alongside the collection row."
       },
       "topics": {
         "type": "array",
         "items": {"type": "string"},
-        "description": "Short strings naming the paper's most salient topics."
+        "description": "Topics naming the paper's salient semantic concepts. Each topic must be distinct from entities, from the chosen domain/collection, and from structural metadata, and should pass the linking/reusability/specificity tests."
       }
     },
-    "required": ["domain_index", "proposed_new_domain", "proposed_new_domain_description", "collection_index", "proposed_new_collection", "proposed_new_collection_description", "topics"],
+    "required": ["domain_index", "new_domain", "new_domain_desc", "collection_index", "new_collection", "new_collection_desc", "topics"],
     "additionalProperties": false
   }
 }

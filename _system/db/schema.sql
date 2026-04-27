@@ -156,24 +156,24 @@ CREATE TABLE IF NOT EXISTS canonical_terms (
 CREATE INDEX IF NOT EXISTS idx_terms_domain_type ON canonical_terms(domain, term_type);
 CREATE INDEX IF NOT EXISTS idx_terms_name ON canonical_terms(canonical_name);
 
--- term_aliases is the per-(concept, paper, section) appearance log.
--- Every mention writes a row, including ones where alias == canonical_name
--- (tier-1 hits and tier-5 mints). The breadcrumb identifies which section
--- of the paper the mention came from; topic/collection rows from the
--- classify stage carry source_breadcrumb='' (no positional axis).
--- Old DBs with a 3-column PK and a sibling `entities` table are migrated
--- to this shape by `_system.db.migrations._migrate_entities_to_aliases`.
+-- term_aliases is a per-(concept, paper) synonym index — one row per
+-- non-canonical surface form per paper. Tier-1 hits (alias equals the
+-- canonical) and tier-5 mints (the new canonical itself) write nothing;
+-- only tier-2/3/4 hits whose normalized form differs from the canonical's
+-- normalized form land here. Invariant: `alias != canonical_name` for
+-- every row's `term_id` after normalization. Old DBs with the 3-column
+-- (term_id, alias, source_paper) PK + sibling `entities` table, and the
+-- short-lived 4-column appearance-log shape with `source_breadcrumb`,
+-- are both migrated by `_system.db.migrations._migrate_entities_to_aliases`.
 CREATE TABLE IF NOT EXISTS term_aliases (
     term_id INTEGER NOT NULL REFERENCES canonical_terms(id),
     alias TEXT NOT NULL,
     source_paper TEXT NOT NULL,
-    source_breadcrumb TEXT NOT NULL DEFAULT '',
     match_tier INTEGER,
-    PRIMARY KEY(term_id, alias, source_paper, source_breadcrumb)
+    PRIMARY KEY(term_id, alias, source_paper)
 );
 
 CREATE INDEX IF NOT EXISTS idx_aliases_source_paper ON term_aliases(source_paper);
-CREATE INDEX IF NOT EXISTS idx_aliases_term_paper  ON term_aliases(term_id, source_paper);
 
 CREATE VIRTUAL TABLE term_embeddings USING vec0(
     term_id INTEGER PRIMARY KEY,

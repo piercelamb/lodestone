@@ -43,7 +43,6 @@ from _system.scripts.extract_entities import (
 _ENTITY_ROWS_SQL = """
     SELECT ct.canonical_name AS entity_name,
            ct.entity_type    AS entity_type,
-           ta.source_breadcrumb,
            ta.source_paper   AS paper_name
       FROM term_aliases ta
       JOIN canonical_terms ct ON ct.id = ta.term_id
@@ -52,17 +51,22 @@ _ENTITY_ROWS_SQL = """
 
 
 def _entity_rows_for_paper(conn: sqlite3.Connection, paper_name: str) -> list:
-    """Return one row per entity-mention site for ``paper_name``."""
+    """Return one row per entity-typed synonym row for ``paper_name``.
+
+    Under the synonym-index regime ``term_aliases`` only carries non-
+    canonical surface forms, so this surfaces the synonyms claude can
+    use as BM25 keywords — NOT every distinct entity mentioned in the
+    paper. Use the ``papers.entity_count`` column for the latter.
+    """
     return conn.execute(
         _ENTITY_ROWS_SQL + " AND ta.source_paper = ? "
-        " ORDER BY entity_name, ta.source_breadcrumb",
+        " ORDER BY entity_name, ta.alias",
         (paper_name,),
     ).fetchall()
 
 
 def _entity_count_for_paper(conn: sqlite3.Connection, paper_name: str) -> int:
-    """COUNT(*) over the merged appearance log, matching the old
-    ``COUNT(*) FROM entities WHERE paper_name = ?`` semantic."""
+    """Number of entity-typed synonym rows for ``paper_name``."""
     return conn.execute(
         "SELECT COUNT(*) FROM (" + _ENTITY_ROWS_SQL + " AND ta.source_paper = ?)",
         (paper_name,),
@@ -283,8 +287,10 @@ class TestPipelineStatus:
             )
 
     def test_rerun_clears_existing_entities(self, tmp_db_with_paper, fake_embedder):
-        # Seed 3 stale entity-typed alias rows for this paper. Each needs a
-        # canonical to point at, so create those first.
+        # Seed 3 stale entity-typed synonym rows for this paper. Each
+        # row's alias must differ from the canonical's name to honor
+        # the synonym-index invariant — otherwise the row would be
+        # filtered out and the test would prove nothing.
         for i in range(3):
             cur = tmp_db_with_paper.execute(
                 """
@@ -298,22 +304,33 @@ class TestPipelineStatus:
             tmp_db_with_paper.execute(
                 """
                 INSERT INTO term_aliases
-                    (term_id, alias, source_paper, source_breadcrumb, match_tier)
-                VALUES (?, ?, 'paper_name_2024', '# Stale', 1)
+                    (term_id, alias, source_paper, match_tier)
+                VALUES (?, ?, 'paper_name_2024', 2)
                 """,
-                (cur.lastrowid, f"stale_entity_{i}"),
+                (cur.lastrowid, f"stale_entity_{i}_alt"),
             )
 
+        # Resolve a synonym that lands a tier-2 row so the rerun output
+        # also has a recoverable signal in term_aliases (tier-1 hits
+        # are silent under the synonym-index regime).
+        tmp_db_with_paper.execute(
+            "INSERT INTO canonical_terms "
+            " (domain, term_type, entity_type, entity_type_score, "
+            "  canonical_name, first_seen_in) "
+            "VALUES ('rag', 'entity', 'method', 0.0, ?, 'seed')",
+            ("BookRAG",),
+        )
         extract(
             paper_name="paper_name_2024",
             conn=tmp_db_with_paper,
-            run_inference=_static_inference([[_span("BookRAG", "method")]]),
+            run_inference=_static_inference([[_span("book rag", "method")]]),
             embedder=fake_embedder,
         )
         rows = _entity_rows_for_paper(tmp_db_with_paper, "paper_name_2024")
         names = {r[0] for r in rows}
         assert not any(n.startswith("stale_entity_") for n in names)
-        assert len(names) == 1
+        # Re-extracted: BookRAG canonical with one synonym row from this paper.
+        assert names == {"BookRAG"}
 
 
 # ===========================================================================
@@ -366,11 +383,21 @@ class TestSectionSplitterIntegration:
         long_markdown = f"# Method\n\n{body_words}\n"
         _seed_domain(conn)
         _seed_paper(conn, markdown=long_markdown)
+        # Seed canonical so a synonym-shaped span ("book rag") resolves
+        # via tier 2/3 and writes a row we can count. Without this
+        # seed, "book rag" would mint its own canonical and leave no
+        # alias trail under the synonym-index regime.
+        conn.execute(
+            "INSERT INTO canonical_terms "
+            " (domain, term_type, entity_type, entity_type_score, "
+            "  canonical_name, first_seen_in) "
+            "VALUES ('rag', 'entity', 'method', 0.0, 'BookRAG', 'seed')"
+        )
 
         # Every sub-chunk returns the same span; dedup by normalized name
         # should collapse them into one INSERT.
         def _dup_inf(text, labels, threshold):
-            return [_span("BookRAG", "method")]
+            return [_span("book rag", "method")]
 
         extract(
             paper_name="paper_name_2024",
@@ -698,16 +725,6 @@ class TestLabelVoting:
         ).fetchone()
         assert row == ("software", pytest.approx(0.85))
 
-        # Paper 1's mention now reports the post-flip type via the
-        # canonical_terms JOIN (no per-row migration needed; the canonical
-        # is the single source of truth for entity_type).
-        paper_1_type = conn.execute(
-            _ENTITY_ROWS_SQL +
-            "   AND ta.source_paper = 'paper_1' "
-            "   AND ct.canonical_name = 'DPR' "
-        ).fetchone()[1]
-        assert paper_1_type == "software"
-
     def test_bm25_flip_across_papers_with_multi_mention_majority(
         self, conn, fake_embedder
     ):
@@ -776,21 +793,13 @@ class TestLabelVoting:
         )
 
         # Cross-paper flip: paper 2's software@0.85 overturns paper 1's
-        # method@0.70.
+        # method@0.70. The canonical row is the single source of truth
+        # for the label — there's no per-paper row to update.
         row = conn.execute(
             "SELECT entity_type, entity_type_score FROM canonical_terms "
             "WHERE canonical_name = 'BM25'"
         ).fetchone()
         assert row == ("software", pytest.approx(0.85))
-
-        # Paper 1's mention now reports the post-flip type via the
-        # canonical_terms JOIN.
-        paper_1_type = conn.execute(
-            _ENTITY_ROWS_SQL +
-            "   AND ta.source_paper = 'paper_1' "
-            "   AND ct.canonical_name = 'BM25' "
-        ).fetchone()[1]
-        assert paper_1_type == "software"
 
     def test_second_paper_with_lower_score_does_not_flip(
         self, conn, fake_embedder
@@ -1063,70 +1072,6 @@ class TestZeroEntitySafety:
 
 
 # ===========================================================================
-# source_breadcrumb
-# ===========================================================================
-
-
-class TestSourceBreadcrumb:
-    def test_same_entity_different_breadcrumbs_yield_distinct_rows(self, conn, fake_embedder):
-        # Duplicate "Setup" subsection under two different parents.
-        md = (
-            "# Method\n\n"
-            "## Setup\n\n"
-            "The Setup uses BookRAG tree.\n\n"
-            "# Experiments\n\n"
-            "## Setup\n\n"
-            "Experiment Setup also uses BookRAG.\n"
-        )
-        _seed_domain(conn)
-        _seed_paper(conn, markdown=md)
-
-        def _inf(text, labels, threshold):
-            if "BookRAG" in text:
-                return [_span("BookRAG", "method", start=text.index("BookRAG"))]
-            return []
-
-        extract(
-            paper_name="paper_name_2024",
-            conn=conn,
-            run_inference=_inf,
-            embedder=fake_embedder,
-        )
-        rows = _entity_rows_for_paper(conn, "paper_name_2024")
-        # Parent chunks + child chunks both contain BookRAG, so dedup per
-        # section gives one row each with distinct source_breadcrumb values.
-        # _entity_rows_for_paper returns (entity_name, entity_type, breadcrumb, paper_name).
-        breadcrumbs = {r[2] for r in rows}
-        assert len(breadcrumbs) >= 2
-        # Every row holds the same canonical entity_name
-        assert {r[0] for r in rows} == {"BookRAG"}
-
-    def test_source_breadcrumb_populated_with_full_chain(self, conn, fake_embedder):
-        md = (
-            "# Method\n\n"
-            "## Architecture\n\n"
-            "We use BookRAG in this subsection.\n"
-        )
-        _seed_domain(conn)
-        _seed_paper(conn, markdown=md)
-
-        def _inf(text, labels, threshold):
-            if "BookRAG" in text:
-                return [_span("BookRAG", "method", start=text.index("BookRAG"))]
-            return []
-
-        extract(
-            paper_name="paper_name_2024",
-            conn=conn,
-            run_inference=_inf,
-            embedder=fake_embedder,
-        )
-        breadcrumbs = [r[2] for r in _entity_rows_for_paper(conn, "paper_name_2024")]
-        # Child section's breadcrumb is "# Method > ## Architecture".
-        assert any(" > " in bc for bc in breadcrumbs)
-
-
-# ===========================================================================
 # Description extraction
 # ===========================================================================
 
@@ -1249,11 +1194,10 @@ class TestPerLabelThreshold:
             run_inference=inf,
             embedder=fake_embedder,
         )
-        count = tmp_db_with_paper.execute(
-            "SELECT COUNT(*) FROM (" + _ENTITY_ROWS_SQL +
-            "   AND ta.source_paper = 'paper_name_2024')"
-        ).fetchone()[0]
-        assert count == 0
+        # Below-threshold span never resolved → no canonical added.
+        assert tmp_db_with_paper.execute(
+            "SELECT entity_count FROM papers WHERE paper_name = 'paper_name_2024'"
+        ).fetchone()[0] == 0
 
     def test_span_above_per_label_threshold_is_kept(self, tmp_db_with_paper, fake_embedder):
         inf = _static_inference(
@@ -1265,11 +1209,13 @@ class TestPerLabelThreshold:
             run_inference=inf,
             embedder=fake_embedder,
         )
-        count = tmp_db_with_paper.execute(
-            "SELECT COUNT(*) FROM (" + _ENTITY_ROWS_SQL +
-            "   AND ta.source_paper = 'paper_name_2024')"
-        ).fetchone()[0]
-        assert count == 1
+        # Above-threshold span resolved → one distinct canonical
+        # contributed. The count comes from ``papers.entity_count``
+        # (Python-set size) under the synonym-index regime — tier-5
+        # mints leave no alias trail to count.
+        assert tmp_db_with_paper.execute(
+            "SELECT entity_count FROM papers WHERE paper_name = 'paper_name_2024'"
+        ).fetchone()[0] == 1
 
 
 # ===========================================================================
@@ -1325,7 +1271,14 @@ class TestFlattenGlinerOutput:
 
 
 class TestEntityCountUpdate:
-    def test_papers_entity_count_matches_row_count(self, tmp_db_with_paper, fake_embedder):
+    def test_papers_entity_count_reflects_distinct_canonicals(
+        self, tmp_db_with_paper, fake_embedder
+    ):
+        """``papers.entity_count`` is the number of distinct canonicals
+        this paper resolved, computed via a Python set in ``extract``.
+        Under the synonym-index regime tier-1 / tier-5 hits leave no
+        alias trail, so the column is the only authoritative count.
+        """
         inf = _static_inference(
             [
                 [_span("BookRAG", "method"), _span("GraphRAG", "method")],
@@ -1341,11 +1294,6 @@ class TestEntityCountUpdate:
         count_from_row = tmp_db_with_paper.execute(
             "SELECT entity_count FROM papers WHERE paper_name = 'paper_name_2024'"
         ).fetchone()[0]
-        count_from_table = tmp_db_with_paper.execute(
-            "SELECT COUNT(*) FROM (" + _ENTITY_ROWS_SQL +
-            "   AND ta.source_paper = 'paper_name_2024')"
-        ).fetchone()[0]
-        assert count_from_row == count_from_table
         assert count_from_row == 3
 
 
@@ -1481,9 +1429,12 @@ def test_real_gliner_extracts_method_entity(tmp_db_with_paper, fake_embedder):
         conn=tmp_db_with_paper,
         embedder=fake_embedder,
     )
+    # Synonym-index regime: tier-5 mints leave no alias trail, so we
+    # check ``canonical_terms`` for at least one method-typed canonical
+    # contributed by this paper instead of joining ``term_aliases``.
     count = tmp_db_with_paper.execute(
-        "SELECT COUNT(*) FROM (" + _ENTITY_ROWS_SQL +
-        "   AND ta.source_paper = 'paper_name_2024' "
-        "   AND ct.entity_type = 'method')"
+        "SELECT COUNT(*) FROM canonical_terms "
+        " WHERE term_type = 'entity' AND entity_type = 'method' "
+        "   AND first_seen_in = 'paper_name_2024'"
     ).fetchone()[0]
     assert count >= 1

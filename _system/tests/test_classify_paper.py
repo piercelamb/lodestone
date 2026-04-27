@@ -321,11 +321,11 @@ def test_classify_passes_resolved_prompt_and_schema_to_call_llm(seeded):
         captured["response_model"] = response_model
         return response_model(
             domain_index=0,
-            proposed_new_domain="",
-            proposed_new_domain_description="",
+            new_domain="",
+            new_domain_desc="",
             collection_index=-1,
-            proposed_new_collection="hierarchical indexing",
-            proposed_new_collection_description="Retrieval methods that build hierarchical indices over long documents.",
+            new_collection="hierarchical indexing",
+            new_collection_desc="Retrieval methods that build hierarchical indices over long documents.",
             topics=["tree retrieval"],
         )
 
@@ -368,11 +368,11 @@ def test_domain_index_out_of_range_raises_llm_error(seeded):
     def _runner(system, user, schema, response_model):
         return response_model(
             domain_index=99,  # outside [-1, 0]
-            proposed_new_domain="",
-            proposed_new_domain_description="",
+            new_domain="",
+            new_domain_desc="",
             collection_index=-1,
-            proposed_new_collection="c",
-            proposed_new_collection_description="",
+            new_collection="c",
+            new_collection_desc="",
             topics=["t"],
         )
 
@@ -384,68 +384,68 @@ def test_collection_index_minus_one_with_empty_proposal_raises(seeded):
     def _runner(system, user, schema, response_model):
         return response_model(
             domain_index=0,
-            proposed_new_domain="",
-            proposed_new_domain_description="",
+            new_domain="",
+            new_domain_desc="",
             collection_index=-1,
-            proposed_new_collection="",  # invalid: both signal "new" but name is empty
-            proposed_new_collection_description="A dummy cluster.",
+            new_collection="",  # invalid: both signal "new" but name is empty
+            new_collection_desc="A dummy cluster.",
             topics=["t"],
         )
 
     with pytest.raises(ClassifyLLMError) as exc_info:
         classify(paper_name="paper_name_2024", conn=seeded, call_llm=_runner)
-    assert "proposed_new_collection" in str(exc_info.value)
+    assert "new_collection" in str(exc_info.value)
 
 
 def test_new_domain_with_empty_description_raises(seeded):
     def _runner(system, user, schema, response_model):
         return response_model(
             domain_index=-1,
-            proposed_new_domain="new_dom",
-            proposed_new_domain_description="   ",  # whitespace-only → empty
+            new_domain="new_dom",
+            new_domain_desc="   ",  # whitespace-only → empty
             collection_index=-1,
-            proposed_new_collection="c",
-            proposed_new_collection_description="A dummy cluster.",
+            new_collection="c",
+            new_collection_desc="A dummy cluster.",
             topics=["t"],
         )
 
     with pytest.raises(ClassifyLLMError) as exc_info:
         classify(paper_name="paper_name_2024", conn=seeded, call_llm=_runner)
-    assert "proposed_new_domain_description" in str(exc_info.value)
+    assert "new_domain_desc" in str(exc_info.value)
 
 
 def test_existing_domain_with_description_raises(seeded):
     def _runner(system, user, schema, response_model):
         return response_model(
             domain_index=0,
-            proposed_new_domain="",
-            proposed_new_domain_description="should not be set",
+            new_domain="",
+            new_domain_desc="should not be set",
             collection_index=-1,
-            proposed_new_collection="c",
-            proposed_new_collection_description="A dummy cluster.",
+            new_collection="c",
+            new_collection_desc="A dummy cluster.",
             topics=["t"],
         )
 
     with pytest.raises(ClassifyLLMError) as exc_info:
         classify(paper_name="paper_name_2024", conn=seeded, call_llm=_runner)
-    assert "proposed_new_domain_description" in str(exc_info.value)
+    assert "new_domain_desc" in str(exc_info.value)
 
 
 def test_new_collection_with_empty_description_raises(seeded):
     def _runner(system, user, schema, response_model):
         return response_model(
             domain_index=0,
-            proposed_new_domain="",
-            proposed_new_domain_description="",
+            new_domain="",
+            new_domain_desc="",
             collection_index=-1,
-            proposed_new_collection="some new cluster",
-            proposed_new_collection_description="   ",  # whitespace-only → empty
+            new_collection="some new cluster",
+            new_collection_desc="   ",  # whitespace-only → empty
             topics=["t"],
         )
 
     with pytest.raises(ClassifyLLMError) as exc_info:
         classify(paper_name="paper_name_2024", conn=seeded, call_llm=_runner)
-    assert "proposed_new_collection_description" in str(exc_info.value)
+    assert "new_collection_desc" in str(exc_info.value)
 
 
 def test_existing_collection_with_description_raises(tmp_db_with_domain):
@@ -462,11 +462,11 @@ def test_existing_collection_with_description_raises(tmp_db_with_domain):
     def _runner(system, user, schema, response_model):
         return response_model(
             domain_index=0,
-            proposed_new_domain="",
-            proposed_new_domain_description="",
+            new_domain="",
+            new_domain_desc="",
             collection_index=0,  # existing "hybrid search"
-            proposed_new_collection="",
-            proposed_new_collection_description="should not be set",
+            new_collection="",
+            new_collection_desc="should not be set",
             topics=["t"],
         )
 
@@ -476,18 +476,18 @@ def test_existing_collection_with_description_raises(tmp_db_with_domain):
             conn=tmp_db_with_domain,
             call_llm=_runner,
         )
-    assert "proposed_new_collection_description" in str(exc_info.value)
+    assert "new_collection_desc" in str(exc_info.value)
 
 
 def test_new_domain_with_existing_collection_index_raises(seeded):
     def _runner(system, user, schema, response_model):
         return response_model(
             domain_index=-1,
-            proposed_new_domain="new_dom",
-            proposed_new_domain_description="A new research area about something.",
+            new_domain="new_dom",
+            new_domain_desc="A new research area about something.",
             collection_index=0,  # invalid: new domain has no collections
-            proposed_new_collection="",
-            proposed_new_collection_description="",
+            new_collection="",
+            new_collection_desc="",
             topics=["t"],
         )
 
@@ -512,11 +512,11 @@ def test_existing_collection_index_resolves_to_name(tmp_db_with_domain):
     def _runner(system, user, schema, response_model):
         return response_model(
             domain_index=0,
-            proposed_new_domain="",
-            proposed_new_domain_description="",
+            new_domain="",
+            new_domain_desc="",
             collection_index=0,  # → "hybrid search" (only collection under rag)
-            proposed_new_collection="",
-            proposed_new_collection_description="",
+            new_collection="",
+            new_collection_desc="",
             topics=["tree retrieval"],
         )
 
@@ -539,11 +539,11 @@ def test_collection_index_out_of_range_for_chosen_domain_raises(tmp_db_with_doma
     def _runner(system, user, schema, response_model):
         return response_model(
             domain_index=0,
-            proposed_new_domain="",
-            proposed_new_domain_description="",
+            new_domain="",
+            new_domain_desc="",
             collection_index=1,
-            proposed_new_collection="",
-            proposed_new_collection_description="",
+            new_collection="",
+            new_collection_desc="",
             topics=["t"],
         )
 
@@ -807,11 +807,11 @@ def test_proposed_domain_sanitizing_to_empty_raises(tmp_db_with_domain):
     _seed_paper(tmp_db_with_domain)
     runner = _runner_from_dict({
         "domain_index": -1,
-        "proposed_new_domain": "!!! ???",
-        "proposed_new_domain_description": "A dummy area.",
+        "new_domain": "!!! ???",
+        "new_domain_desc": "A dummy area.",
         "collection_index": -1,
-        "proposed_new_collection": "c",
-        "proposed_new_collection_description": "A dummy cluster.",
+        "new_collection": "c",
+        "new_collection_desc": "A dummy cluster.",
         "topics": ["t1"],
     })
 
@@ -932,11 +932,11 @@ def test_duplicate_topics_dedupe_by_term_id(tmp_db_with_domain):
     )
     runner = _runner_from_dict({
         "domain_index": 0,
-        "proposed_new_domain": "",
-        "proposed_new_domain_description": "",
+        "new_domain": "",
+        "new_domain_desc": "",
         "collection_index": -1,
-        "proposed_new_collection": "hierarchical indexing",
-        "proposed_new_collection_description": "Hierarchical retrieval over long documents.",
+        "new_collection": "hierarchical indexing",
+        "new_collection_desc": "Hierarchical retrieval over long documents.",
         "topics": ["tree retrieval", "tree retrieval"],
     })
 

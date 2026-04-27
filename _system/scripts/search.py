@@ -257,11 +257,13 @@ def _entities_preview_batch(
     if not paper_ids:
         return {}
     placeholders = ",".join("?" * len(paper_ids))
-    # term_aliases keys appearances by paper_name; join through papers
-    # to map back to paper_id. The inner GROUP BY collapses the
-    # per-section duplicates (same canonical mentioned in N sections of
-    # one paper produces N alias rows) before ROW_NUMBER caps the
-    # per-paper preview at _ENTITY_PREVIEW_LIMIT in a single pass.
+    # term_aliases is a synonym index keyed by paper_name; join through
+    # papers to map back to paper_id, then ROW_NUMBER caps the per-paper
+    # preview at _ENTITY_PREVIEW_LIMIT in a single pass. Caveat: the
+    # preview shows entities whose synonyms appeared in this paper, so
+    # canonicals that only ever surface as their canonical name (no
+    # synonym row) are missed. The BM25 hit's snippet is the
+    # authoritative signal — this preview is just a hint.
     rows = conn.execute(
         f"""
         SELECT paper_id, canonical_name, entity_type FROM (
@@ -397,11 +399,10 @@ def mode_taxonomy_lookup(
         resolved_via = "vector"
 
     # ------- Build the result payload ------------------------------------
-    # term_aliases is now an appearance log: rows where alias == canonical_name
-    # are present (and intentional) for tier-1 hits and tier-5 mints. The
-    # SELECT DISTINCT below collapses the per-section duplicates so the
-    # alias trail stays human-readable; the full appearance set is what
-    # drives the per-paper sections payload below.
+    # term_aliases is a synonym index: every row carries a non-canonical
+    # surface form. SELECT DISTINCT collapses the same alias across
+    # multiple papers so the keyword set is the union, with the source
+    # papers kept on each row for provenance.
     aliases_rows = conn.execute(
         "SELECT DISTINCT alias, source_paper FROM term_aliases "
         " WHERE term_id = ? ORDER BY alias, source_paper",
@@ -429,24 +430,19 @@ def mode_taxonomy_lookup(
 
     # Papers per kind
     if kind_enum is TaxonomyKind.ENTITY:
-        # Single pass — rows sorted by (source_paper, source_breadcrumb)
-        # are bucketed into the papers list without per-paper follow-up
-        # queries. Empty breadcrumbs (paper-level mentions, e.g. those
-        # contributed by the classify stage if a name overlaps) are
-        # filtered out to keep the sections payload focused on positional
-        # info.
-        erows = conn.execute(
-            "SELECT DISTINCT source_paper, source_breadcrumb FROM term_aliases "
-            " WHERE term_id = ? AND source_breadcrumb != '' "
-            " ORDER BY source_paper, source_breadcrumb",
+        # No per-paper sections payload under the synonym-index regime —
+        # claude follows up with `--sections "alias1 OR alias2"` to BM25
+        # for the actual hit locations. Papers list is the union of
+        # papers that contributed any synonym for this term; tier-1-only
+        # mentions (canonical-as-surface-form) leave no row and so no
+        # paper here, which is fine — the BM25 query catches them via
+        # the canonical name as one of the OR terms.
+        prows = conn.execute(
+            "SELECT DISTINCT source_paper FROM term_aliases "
+            " WHERE term_id = ? ORDER BY source_paper",
             (term_id,),
         ).fetchall()
-        papers: list[dict[str, Any]] = []
-        for pn, sb in erows:
-            if not papers or papers[-1]["paper_name"] != pn:
-                papers.append({"paper_name": pn, "sections": []})
-            papers[-1]["sections"].append(sb)
-        result["papers"] = papers
+        result["papers"] = [{"paper_name": r[0]} for r in prows]
     elif kind_enum is TaxonomyKind.TOPIC:
         prows = conn.execute(
             "SELECT DISTINCT p.paper_name "
@@ -597,30 +593,23 @@ def mode_browse(
         if not entity_type:
             raise ValueError("mode_browse(which='entity_type') requires "
                              "filters['entity_type']")
-        # Per-canonical paper count is COUNT(DISTINCT source_paper) on
-        # the appearance log so per-section duplicates don't inflate the
-        # number. Canonicals with no appearance rows yet (a transient
-        # state during ingestion) drop out via the inner JOIN, matching
-        # the old entities-keyed semantic.
+        # Pure list of canonicals in the type. Per-paper drilldown
+        # happens via `--entity NAME` once the user picks one.
         sql = (
-            "SELECT ct.canonical_name, COUNT(DISTINCT ta.source_paper) AS n "
-            "  FROM canonical_terms ct "
-            "  JOIN term_aliases ta ON ta.term_id = ct.id "
-            " WHERE ct.term_type = 'entity' "
-            "   AND ct.entity_type = ? "
+            "SELECT canonical_name FROM canonical_terms "
+            " WHERE term_type = 'entity' "
+            "   AND entity_type = ? "
         )
         params = [entity_type]
         if domain:
-            sql += " AND ct.domain = ? "
+            sql += " AND domain = ? "
             params.append(domain)
-        sql += " GROUP BY ct.canonical_name ORDER BY n DESC, ct.canonical_name"
+        sql += " ORDER BY canonical_name"
         rows = conn.execute(sql, params).fetchall()
         return {
             "mode": view,
             "entity_type": entity_type,
-            "results": [
-                {"entity_name": r[0], "paper_count": r[1]} for r in rows
-            ],
+            "results": [{"entity_name": r[0]} for r in rows],
         }
 
     if view is BrowseView.ALIASES:
@@ -916,7 +905,7 @@ def to_human(payload: dict[str, Any]) -> str:
     elif mode == "entity_type":
         lines.append(f"== entity_type: {payload.get('entity_type')!r} ==")
         for row in payload.get("results", []):
-            lines.append(f"  {row['entity_name']}  ({row['paper_count']})")
+            lines.append(f"  {row['entity_name']}")
 
     elif mode == "aliases":
         lines.append(f"== aliases of {payload.get('term')!r} ==")

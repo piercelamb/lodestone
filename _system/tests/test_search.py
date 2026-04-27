@@ -245,11 +245,14 @@ def _insert_entity(
     source_breadcrumb: str,
     description: str = "",
 ) -> None:
-    """Compatibility shim: seed an entity-typed canonical (if needed) and
-    its appearance row in ``term_aliases``. ``paper_id`` is unused now —
-    appearance rows key by paper_name. ``description`` is ignored: the
-    column was dropped in the entities/term_aliases merge."""
-    del paper_id, description
+    """Compatibility shim: seed an entity-typed canonical (if needed)
+    and ONE synonym row pointing at it. ``paper_id``,
+    ``source_breadcrumb``, and ``description`` are unused — the
+    appearance log was reverted to a synonym index. The seeded synonym
+    is ``f"{entity_name.lower()}_alt"`` so it differs from the canonical
+    and respects the synonym-index invariant; tests that need a real
+    synonym for BM25 enrichment / preview have a row to find."""
+    del paper_id, source_breadcrumb, description
     conn.execute(
         """
         INSERT OR IGNORE INTO canonical_terms
@@ -268,10 +271,10 @@ def _insert_entity(
     conn.execute(
         """
         INSERT OR IGNORE INTO term_aliases
-            (term_id, alias, source_paper, source_breadcrumb, match_tier)
-        VALUES (?, ?, ?, ?, 1)
+            (term_id, alias, source_paper, match_tier)
+        VALUES (?, ?, ?, 2)
         """,
-        (term_id, entity_name, paper_name, source_breadcrumb),
+        (term_id, f"{entity_name.lower()}_alt", paper_name),
     )
 
 
@@ -730,13 +733,11 @@ class TestModeTaxonomy:
         assert r["resolved_via"] in ("exact", "alias", "fts")
         assert r["aliases"], r
         assert r["papers"]
-        # The RAPTOR entity in the fixture was flagged in the Introduction
-        # section.
-        assert any(
-            "Introduction" in s
-            for paper in r["papers"]
-            for s in paper.get("sections", [])
-        )
+        # Synonym-index regime: papers list is `[{"paper_name": ...}]`
+        # with no per-paper sections payload (claude follows up with
+        # `--sections "alias1 OR alias2"` BM25 to locate text).
+        for paper in r["papers"]:
+            assert set(paper.keys()) == {"paper_name"}
 
     def test_finds_via_alias(self, seeded_db):
         r = search_mod.mode_taxonomy_lookup(
@@ -842,6 +843,11 @@ class TestModeBrowse:
             seeded_db, which="entity_type", filters={"entity_type": "method"}
         )
         assert r["mode"] == "entity_type"
+        # Each result row is just the canonical name — no `paper_count`
+        # column under the synonym-index regime. Drill into a canonical
+        # via `--entity NAME` for paper-by-paper detail.
+        for row in r["results"]:
+            assert set(row.keys()) == {"entity_name"}
         names = [row["entity_name"] for row in r["results"]]
         assert "BookRAG" in names
 

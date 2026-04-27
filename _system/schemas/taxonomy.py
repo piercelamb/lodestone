@@ -24,33 +24,33 @@ class ClassificationLLMOutput(BaseModel):
 
     - ``domain_index`` is the zero-based index into the runtime
       ``existing_domains`` list, or ``-1`` to propose a new domain. When
-      ``-1``, ``proposed_new_domain`` carries the new name and
-      ``proposed_new_domain_description`` carries a short human-readable
+      ``-1``, ``new_domain`` carries the new name and
+      ``new_domain_desc`` carries a short human-readable
       sentence that will be stored alongside the domain row.
     - ``collection_index`` is the zero-based index into the chosen domain's
       collection list (as shown beneath that domain in the rendered tree),
       or ``-1`` to propose a new collection. When ``-1``,
-      ``proposed_new_collection`` carries the new name and
-      ``proposed_new_collection_description`` carries a short sentence
+      ``new_collection`` carries the new name and
+      ``new_collection_desc`` carries a short sentence
       that will be stored alongside the collection row.
 
     Post-validation in :func:`classify_paper._resolve_raw` enforces the
     cross-field rules the strict-mode enum cannot (the chosen collection
     must be in range for the chosen domain; a new domain forces
-    ``collection_index == -1``; ``proposed_new_domain_description`` must
+    ``collection_index == -1``; ``new_domain_desc`` must
     be non-empty iff ``domain_index == -1``;
-    ``proposed_new_collection_description`` must be non-empty iff
+    ``new_collection_desc`` must be non-empty iff
     ``collection_index == -1``).
     """
 
     model_config = ConfigDict(extra="forbid")
 
     domain_index: int
-    proposed_new_domain: str
-    proposed_new_domain_description: str
+    new_domain: str
+    new_domain_desc: str
     collection_index: int
-    proposed_new_collection: str
-    proposed_new_collection_description: str
+    new_collection: str
+    new_collection_desc: str
     topics: list[str]
 
 

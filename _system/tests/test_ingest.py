@@ -315,10 +315,11 @@ def _seed_full_paper(conn: sqlite3.Connection, arxiv_id: str, paper_name: str,
         "VALUES (?, ?, ?, ?, ?)",
         (paper_id, 1, "Fig 1", b"\x89PNG\r\n\x1a\n", "image/png"),
     )
-    # Canonical taxonomy + term_aliases (the appearance log replaces the
-    # old `entities` table). The Widget canonical is shared across all
-    # callers — INSERT OR IGNORE so multiple papers can seed the same
-    # canonical without UNIQUE violations.
+    # Canonical taxonomy + a synonym row in term_aliases. The Widget
+    # canonical is shared across all callers — INSERT OR IGNORE so
+    # multiple papers can seed the same canonical without UNIQUE
+    # violations. Under the synonym-index regime the alias must differ
+    # from the canonical, so we seed ``Widget_alt``.
     conn.execute(
         "INSERT OR IGNORE INTO canonical_terms (domain, term_type, entity_type, "
         " canonical_name, first_seen_in) VALUES (?, ?, ?, ?, ?)",
@@ -330,9 +331,16 @@ def _seed_full_paper(conn: sqlite3.Connection, arxiv_id: str, paper_name: str,
     ).fetchone()[0]
     conn.execute(
         "INSERT INTO term_aliases "
-        " (term_id, alias, source_paper, source_breadcrumb, match_tier) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (term_id, "Widget", paper_name, "Abstract", 1),
+        " (term_id, alias, source_paper, match_tier) "
+        "VALUES (?, ?, ?, ?)",
+        (term_id, "Widget_alt", paper_name, 2),
+    )
+    # ``ingest._summary`` reads ``papers.entity_count`` directly under
+    # the synonym-index regime (no JOIN against term_aliases). Every
+    # seeded paper carries one canonical, so set the column to 1.
+    conn.execute(
+        "UPDATE papers SET entity_count = 1 WHERE id = ?",
+        (paper_id,),
     )
     # term_embeddings PK is term_id; only the first seed inserts.
     existing_emb = conn.execute(
@@ -494,20 +502,12 @@ def test_summary_needs_review_reflects_flag(conn, patched_stages):
 def test_summary_counts_match_db(conn, patched_stages):
     # Seed a paper that's already INDEXED so the no-op path takes counts.
     paper_id = _seed_full_paper(conn, "2301.67777", "counts_paper")
-    # Add a second canonical + appearance row for entity_count.
+    # ``papers.entity_count`` is the authoritative count under the
+    # synonym-index regime; bump the seed's count to 2 to model a
+    # second distinct canonical for this paper.
     conn.execute(
-        "INSERT INTO canonical_terms (domain, term_type, entity_type, "
-        " canonical_name, first_seen_in) VALUES (?, ?, ?, ?, ?)",
-        ("rag", "entity", "method", "SecondWidget", "counts_paper"),
-    )
-    second_term_id = conn.execute(
-        "SELECT id FROM canonical_terms WHERE canonical_name = 'SecondWidget'"
-    ).fetchone()[0]
-    conn.execute(
-        "INSERT INTO term_aliases "
-        " (term_id, alias, source_paper, source_breadcrumb, match_tier) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (second_term_id, "SecondWidget", "counts_paper", "Abstract", 1),
+        "UPDATE papers SET entity_count = 2 WHERE id = ?",
+        (paper_id,),
     )
     conn.execute(
         "INSERT INTO figures (paper_id, figure_number, caption, image, mime_type) "
@@ -524,7 +524,7 @@ def test_summary_counts_match_db(conn, patched_stages):
 
     # section_count: seed added 1; extra 1 = 2
     assert summary["section_count"] == 2
-    # entity_count: seed added 1 distinct entity; extra 1 distinct = 2
+    # entity_count comes from papers.entity_count directly.
     assert summary["entity_count"] == 2
     # figure_count: seed added 1; extra 1 = 2
     assert summary["figure_count"] == 2

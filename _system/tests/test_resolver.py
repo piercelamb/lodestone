@@ -64,12 +64,14 @@ def _seed_entity_row(
     entity_type: str,
     term_id: int,
 ) -> int:
-    """Insert one ``term_aliases`` appearance row tied to an existing
-    canonical and a freshly-created ``papers`` row.
+    """Insert a synonym ``term_aliases`` row for an existing canonical
+    plus a freshly-created ``papers`` row.
 
     Used by flip tests to model a historical mention that predates the
-    flip. ``entity_type`` is unused (entity_type lives on the canonical
-    after the merge) but kept in the signature for caller readability.
+    flip. The seeded alias is ``f"{entity_name}_alt"`` so it differs
+    from the canonical and respects the synonym-index invariant.
+    ``entity_type`` is unused (entity_type lives on the canonical) but
+    kept in the signature for caller readability.
     """
     del entity_type  # kept in signature for caller readability; unused
     cur = conn.execute(
@@ -96,10 +98,10 @@ def _seed_entity_row(
     conn.execute(
         """
         INSERT OR IGNORE INTO term_aliases
-            (term_id, alias, source_paper, source_breadcrumb, match_tier)
-        VALUES (?, ?, ?, '# Section', 1)
+            (term_id, alias, source_paper, match_tier)
+        VALUES (?, ?, ?, 1)
         """,
-        (term_id, entity_name, paper_name),
+        (term_id, f"{entity_name}_alt", paper_name),
     )
     return paper_id
 
@@ -125,9 +127,9 @@ def _seed_embedding(
 
 def _alias_rows(conn: sqlite3.Connection) -> list[tuple]:
     return conn.execute(
-        "SELECT term_id, alias, source_paper, source_breadcrumb, match_tier "
+        "SELECT term_id, alias, source_paper, match_tier "
         "  FROM term_aliases "
-        " ORDER BY term_id, alias, source_paper, source_breadcrumb"
+        " ORDER BY term_id, alias, source_paper"
     ).fetchall()
 
 
@@ -185,7 +187,11 @@ def _clear_pending(conn):
 
 
 class TestTier1Exact:
-    def test_hit_writes_appearance_alias(self, conn, fake_embedder):
+    def test_hit_silent(self, conn, fake_embedder):
+        """Tier 1 (exact canonical) writes no alias row — the canonical
+        is not a synonym of itself under the synonym-index regime — and
+        no flip means nothing lands in the pending-rebuild queue either.
+        """
         term_id = _seed_canonical(conn, canonical_name="BookRAG")
         result = resolve(
             conn,
@@ -194,7 +200,6 @@ class TestTier1Exact:
             term_type="entity",
             entity_type="method",
             source_paper="p1",
-            source_breadcrumb="# Method",
             embedder=fake_embedder,
         )
         assert isinstance(result, ResolvedTerm)
@@ -202,10 +207,8 @@ class TestTier1Exact:
         assert result.canonical_name == "BookRAG"
         assert result.matched_via == "tier1"
         assert result.created_new is False
-        # Tier-1 hits write an appearance row with alias == canonical_name
-        # so term_aliases is the complete per-paper appearance log.
-        assert _alias_rows(conn) == [(term_id, "BookRAG", "p1", "# Method", 1)]
-        assert resolver_mod.pending_fts_rebuilds(conn) == {term_id}
+        assert _alias_rows(conn) == []
+        assert resolver_mod.pending_fts_rebuilds(conn) == set()
 
 
 # ---------------------------------------------------------------------------
@@ -214,16 +217,16 @@ class TestTier1Exact:
 
 
 class TestTier2Normalized:
-    def test_canonical_normalize_hit_writes_appearance_row(self, conn, fake_embedder):
-        """Tier 2 via canonical normalize-match writes an appearance row
-        carrying the raw form (case preserved) — even when normalize(raw)
-        equals normalize(canonical). The appearance log records every
-        mention regardless of whether the surface form coincides with the
-        canonical.
+    def test_canonical_normalize_hit_skips_alias_when_equal_to_canonical(
+        self, conn, fake_embedder
+    ):
+        """Tier 2 via canonical normalize-match writes NO row when the
+        surface form normalizes to the canonical's normalized shape —
+        the canonical-equality guard restored under the synonym-index
+        regime. ``BookRAG`` and ``bookrag`` collapse to the same
+        normalized token, so the row is suppressed.
         """
         term_id = _seed_canonical(conn, canonical_name="bookrag")
-        # "BookRAG" normalizes to "bookrag", same as the canonical — tier 1
-        # misses on case, tier 2 catches it via the normalize pool.
         result = resolve(
             conn,
             "BookRAG",
@@ -231,27 +234,26 @@ class TestTier2Normalized:
             term_type="entity",
             entity_type="method",
             source_paper="p1",
-            source_breadcrumb="# Body",
             embedder=fake_embedder,
         )
         assert result.term_id == term_id
         assert result.matched_via == "tier2"
         assert result.created_new is False
-        assert _alias_rows(conn) == [(term_id, "BookRAG", "p1", "# Body", 2)]
+        assert _alias_rows(conn) == []
 
     def test_existing_alias_normalize_hit_inserts_new_alias(self, conn, fake_embedder):
         """Tier 2 can also match via a previously-inserted alias row whose
         normalized form differs from the canonical. The new raw form lands
-        as its own appearance row.
+        as its own synonym row.
         """
         term_id = _seed_canonical(conn, canonical_name="Hierarchical Indexing")
         # Pre-seed an alias whose normalize form ("tree retrieval") differs
         # from the canonical's normalize form ("hierarchical indexing").
         conn.execute(
             "INSERT INTO term_aliases "
-            "  (term_id, alias, source_paper, source_breadcrumb, match_tier) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (term_id, "tree-retrieval", "pX", "", 2),
+            "  (term_id, alias, source_paper, match_tier) "
+            "VALUES (?, ?, ?, ?)",
+            (term_id, "tree-retrieval", "pX", 2),
         )
         result = resolve(
             conn,
@@ -266,8 +268,8 @@ class TestTier2Normalized:
         assert result.canonical_name == "Hierarchical Indexing"
         assert result.matched_via == "tier2"
         rows = _alias_rows(conn)
-        assert (term_id, "tree-retrieval", "pX", "", 2) in rows
-        assert (term_id, "Tree Retrieval", "p1", "", 2) in rows
+        assert (term_id, "tree-retrieval", "pX", 2) in rows
+        assert (term_id, "Tree Retrieval", "p1", 2) in rows
         assert term_id in resolver_mod.pending_fts_rebuilds(conn)
 
 
@@ -291,7 +293,7 @@ class TestTier3Fuzzy:
         assert result.term_id == term_id
         assert result.matched_via == "tier3"
         rows = _alias_rows(conn)
-        assert rows == [(term_id, "BookRAGs", "p1", "", 3)]
+        assert rows == [(term_id, "BookRAGs", "p1", 3)]
 
     def test_hyphenated_variant_matches_via_tier3(self, conn, fake_embedder):
         """``Book-RAG`` normalizes to ``book rag`` (not ``bookrag``), so tier 2
@@ -310,7 +312,7 @@ class TestTier3Fuzzy:
         assert result.term_id == term_id
         assert result.matched_via == "tier3"
         rows = _alias_rows(conn)
-        assert rows == [(term_id, "Book-RAG", "p1", "", 3)]
+        assert rows == [(term_id, "Book-RAG", "p1", 3)]
 
     def test_prefilter_narrows_candidate_pool(self, conn, fake_embedder, monkeypatch):
         """Tier 3 must pre-filter in SQL, not score all 5000 rows in Python.
@@ -420,7 +422,7 @@ class TestTier4Embedding:
         assert result.term_id == a_id
         assert result.canonical_name == "hierarchical indexing"
         rows = _alias_rows(conn)
-        assert rows == [(a_id, "tree retrieval", "p1", "", 4)]
+        assert rows == [(a_id, "tree retrieval", "p1", 4)]
 
     def test_two_close_candidates_fall_through_to_tier5(self, conn, fake_embedder):
         """Top-1 cos≈0.999, top-2 cos≈0.998 → ratio ≈ 1.0 → 2 survivors → tier 5."""
@@ -448,11 +450,11 @@ class TestTier4Embedding:
         assert result.term_id != a_id and result.term_id != b_id
         assert _canonical_count(conn) == before_canon + 1
         # Neither pre-existing canonical absorbed an alias.
-        for tid, _alias, _src, _bc, _tier in _alias_rows(conn):
+        for tid, _alias, _src, _tier in _alias_rows(conn):
             assert tid not in (a_id, b_id)
 
     def test_top1_below_floor_falls_through_to_tier5(self, conn, fake_embedder):
-        """Top-1 cos≈0.643 < 0.70 floor → no merge, even with no other candidates."""
+        """Top-1 cos≈0.643 < 0.82 floor → no merge, even with no other candidates."""
         a_id = _seed_canonical(conn, canonical_name="hierarchical indexing")
         _seed_embedding(conn, term_id=a_id, vector=_unit_vec_with_dot(1.0, axis=1))
 
@@ -473,14 +475,14 @@ class TestTier4Embedding:
         assert result.matched_via == "tier5"
         assert result.created_new is True
         # The original canonical should not have absorbed this raw form.
-        assert (a_id, "unrelated thing", "p1", "", 4) not in _alias_rows(conn)
+        assert (a_id, "unrelated thing", "p1", 4) not in _alias_rows(conn)
 
     def test_uniform_decline_all_survive_falls_through_to_tier5(self, conn, fake_embedder):
         """K=10 candidates with every consecutive ratio ≥ 0.88 → all survive →
         no sharp drop → tier 5. 'Everything is mildly similar' isn't a merge.
         """
         # Hand-picked ramp where every adjacent ratio ≥ 0.88. Only the first
-        # value is above the 0.70 floor — but the floor only gates top-1; the
+        # value is above the 0.82 floor — but the floor only gates top-1; the
         # walk continues regardless.
         ramp = [0.99, 0.92, 0.86, 0.80, 0.75, 0.70, 0.66, 0.62, 0.58, 0.55]
         ids: list[int] = []
@@ -507,7 +509,7 @@ class TestTier4Embedding:
         assert result.created_new is True
         assert _canonical_count(conn) == before_canon + 1
         # No aliases attached to any ramp canonical.
-        for tid, _alias, _src, _bc, _tier in _alias_rows(conn):
+        for tid, _alias, _src, _tier in _alias_rows(conn):
             assert tid not in ids
 
     def test_just_above_gradient_single_survivor_merges(self, conn, fake_embedder):
@@ -556,7 +558,7 @@ class TestTier4Embedding:
         assert result.matched_via == "tier5"
         assert result.created_new is True
         # Neither pre-existing canonical should have absorbed an alias.
-        for tid, _alias, _src, _bc, _tier in _alias_rows(conn):
+        for tid, _alias, _src, _tier in _alias_rows(conn):
             assert tid not in (a_id, b_id)
 
     def test_single_candidate_above_floor_merges(self, conn, fake_embedder):
@@ -605,7 +607,6 @@ class TestTier5NewCanonical:
             term_type="entity",
             entity_type="method",
             source_paper="p1",
-            source_breadcrumb="# Method",
             embedder=fake_embedder,
         )
         assert result.matched_via == "tier5"
@@ -614,16 +615,12 @@ class TestTier5NewCanonical:
 
         assert _canonical_count(conn) == before_canon + 1
         assert _embedding_count(conn) == before_emb + 1
-        # Tier 5 mints the canonical AND seeds its first appearance row
-        # so a paper that introduces a brand-new term still has a
-        # term_aliases entry recording the mention site.
-        assert _alias_rows(conn) == [
-            (result.term_id, "NovelMethodXYZ", "p1", "# Method", 5)
-        ]
-        # Enqueued by the alias insert path (the canonical row itself
-        # is brand-new and will be picked up by the indexer's first
-        # rebuild over this term).
-        assert resolver_mod.pending_fts_rebuilds(conn) == {result.term_id}
+        # Tier 5 mints the canonical and is silent on the alias side —
+        # the canonical itself is not a synonym of itself. Callers that
+        # need index_paper to pick up the new canonical seed
+        # ``pending_fts_rebuilds`` themselves (extract / classify do).
+        assert _alias_rows(conn) == []
+        assert resolver_mod.pending_fts_rebuilds(conn) == set()
 
     def test_integrity_error_falls_back_to_tier1(self, conn, db_path, fake_embedder):
         """Simulate a concurrent writer by committing the sibling row on a
@@ -709,16 +706,13 @@ class TestAliasAcceptance:
         assert result.matched_via == "tier2"
         assert _alias_rows(conn) == []
 
-    def test_accepts_alias_identical_to_canonical_after_normalize(self, conn, fake_embedder):
-        """Surface form whose normalized shape matches the canonical (e.g.
-        case-only difference) still writes an appearance row — the log
-        records every mention regardless of whether the surface form
-        coincides with the canonical after normalization. The previous
-        equality guard was removed when ``term_aliases`` became the
-        appearance log.
+    def test_rejects_alias_normalized_equal_to_canonical(self, conn, fake_embedder):
+        """Surface form whose normalized shape matches the canonical
+        (e.g. case-only difference) writes NO row under the synonym-
+        index regime — the canonical-equality guard is restored, so
+        the canonical is never a synonym of itself.
         """
         term_id = _seed_canonical(conn, canonical_name="BookRAG")
-        # Raw is "bookrag" — differs only in case from canonical; normalize collapses both.
         result = resolve(
             conn,
             "bookrag",
@@ -726,12 +720,11 @@ class TestAliasAcceptance:
             term_type="entity",
             entity_type="method",
             source_paper="p1",
-            source_breadcrumb="# Body",
             embedder=fake_embedder,
         )
         assert result.term_id == term_id
         assert result.matched_via == "tier2"
-        assert _alias_rows(conn) == [(term_id, "bookrag", "p1", "# Body", 2)]
+        assert _alias_rows(conn) == []
 
 
 # ---------------------------------------------------------------------------
@@ -804,8 +797,8 @@ class TestMultiPaperProvenance:
         assert r1.matched_via == "tier3"
         assert r2.matched_via == "tier2"
         rows = _alias_rows(conn)
-        assert (term_id, "Book-RAG", "p1", "", 3) in rows
-        assert (term_id, "Book-RAG", "p2", "", 2) in rows
+        assert (term_id, "Book-RAG", "p1", 3) in rows
+        assert (term_id, "Book-RAG", "p2", 2) in rows
         assert len(rows) == 2
 
     def test_repeated_same_alias_same_paper_is_noop(self, conn, fake_embedder):
@@ -816,9 +809,8 @@ class TestMultiPaperProvenance:
                 entity_type="method", source_paper="p1", embedder=fake_embedder)
         rows = _alias_rows(conn)
         # Second call hits tier 2 via existing alias, but the composite PK
-        # (term_id, alias, source_paper, source_breadcrumb) makes INSERT
-        # OR IGNORE a no-op. Both calls share source_breadcrumb=''.
-        assert rows == [(term_id, "Book-RAG", "p1", "", 3)]
+        # (term_id, alias, source_paper) makes INSERT OR IGNORE a no-op.
+        assert rows == [(term_id, "Book-RAG", "p1", 3)]
 
 
 # ---------------------------------------------------------------------------
@@ -860,49 +852,55 @@ class TestPendingFtsRebuilds:
                 entity_type="method", source_paper="p1", embedder=fake_embedder)
         assert resolver_mod.pending_fts_rebuilds(conn) == {term_id}
 
-    def test_tier1_enqueues_via_appearance_alias(self, conn, fake_embedder):
-        term_id = _seed_canonical(conn, canonical_name="BookRAG")
+    def test_tier1_no_alias_no_enqueue(self, conn, fake_embedder):
+        """Tier-1 (no flip) writes no alias and enqueues nothing under
+        the synonym-index regime — the canonical is not a synonym of
+        itself, and an unflipped tier-1 hit needs no terms_fts rebuild
+        because nothing about the canonical row changed.
+        """
+        _seed_canonical(conn, canonical_name="BookRAG")
         resolve(conn, "BookRAG", domain="rag", term_type="entity",
                 entity_type="method", source_paper="p1", embedder=fake_embedder)
-        # Tier-1 hits write an alias row (the appearance log) and that
-        # path enqueues the FTS rebuild like every other tier.
-        assert resolver_mod.pending_fts_rebuilds(conn) == {term_id}
+        assert resolver_mod.pending_fts_rebuilds(conn) == set()
 
-    def test_tier5_enqueues_via_appearance_alias(self, conn, fake_embedder):
+    def test_tier5_silent_no_enqueue(self, conn, fake_embedder):
+        """Tier-5 mints a brand-new canonical and writes no alias row
+        (synonym-index invariant). The pending-rebuild queue is the
+        caller's responsibility — extract / classify call sites flag the
+        term explicitly so index_paper picks it up.
+        """
         v = [0.0] * 384
         v[2] = 1.0
         fake_embedder.preset("NovelX", v)
-        result = resolve(conn, "NovelX", domain="rag", term_type="entity",
-                         entity_type="method", source_paper="p1",
-                         embedder=fake_embedder)
-        # Tier-5 mints the canonical and writes its first appearance row;
-        # the alias-insert path enqueues an FTS rebuild for the new term.
-        assert resolver_mod.pending_fts_rebuilds(conn) == {result.term_id}
+        resolve(conn, "NovelX", domain="rag", term_type="entity",
+                entity_type="method", source_paper="p1",
+                embedder=fake_embedder)
+        assert resolver_mod.pending_fts_rebuilds(conn) == set()
 
     def test_flip_enqueues_even_when_alias_is_idempotent(
         self, conn, fake_embedder
     ):
-        """A tier-1 hit that flips entity_type but writes an alias row
-        identical to a pre-existing one (INSERT OR IGNORE no-op) must
-        still queue the FTS rebuild — terms_fts.entity_type mirrors
+        """A tier-1 hit that flips entity_type writes no alias row
+        under the synonym-index regime, but the flip path itself
+        enqueues the rebuild — terms_fts.entity_type mirrors
         canonical_terms.entity_type and would otherwise stay stale.
         """
         term_id = _seed_canonical(
             conn, canonical_name="DPR", entity_type="method",
             entity_type_score=0.3,
         )
-        # First resolve seeds the appearance row and enqueues normally.
+        # First resolve is silent (tier-1 hit, no flip).
         resolve(conn, "DPR", domain="rag", term_type="entity",
                 entity_type="method", entity_type_score=0.3,
-                source_paper="p1", source_breadcrumb="# S",
+                source_paper="p1",
                 embedder=fake_embedder)
-        resolver_mod.pending_fts_rebuilds(conn).clear()
+        assert resolver_mod.pending_fts_rebuilds(conn) == set()
 
-        # Second resolve repeats the same alias (PK collision → no-op
-        # insert) but flips on a higher-score 'software' label.
+        # Second resolve hits tier-1 again but flips on a higher-score
+        # 'software' label. The flip enqueues the rebuild.
         resolve(conn, "DPR", domain="rag", term_type="entity",
                 entity_type="software", entity_type_score=0.9,
-                source_paper="p1", source_breadcrumb="# S",
+                source_paper="p1",
                 embedder=fake_embedder)
         assert term_id in resolver_mod.pending_fts_rebuilds(conn)
 

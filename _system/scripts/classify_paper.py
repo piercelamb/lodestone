@@ -40,7 +40,7 @@ from typing import Iterable, NamedTuple
 from _system.db.connection import get_conn, transaction
 from _system.llm import call_structured, load_prompt
 from _system.resolution.embeddings import Embedder
-from _system.resolution.resolver import resolve
+from _system.resolution.resolver import pending_fts_rebuilds, resolve
 from _system.schemas.paper_metadata import PaperStatus, can_run_from
 from _system.schemas.taxonomy import ClassificationLLMOutput, ClassificationOutput
 from _system.utils.logging import get_logger
@@ -216,6 +216,13 @@ def classify(
 
         conn.execute("DELETE FROM paper_topics WHERE paper_id = ?", (paper_id,))
 
+        # Track every canonical this stage resolves so index_paper can
+        # rebuild terms_fts for them. Under the synonym-index revert,
+        # tier-1 / tier-5 hits leave no alias trail, so the deferred
+        # rebuild queue is the only signal for unchanged collection /
+        # topic canonicals.
+        touched_term_ids: set[int] = set()
+
         collection_hit = resolve(
             conn,
             output.collection,
@@ -224,6 +231,7 @@ def classify(
             source_paper=paper_name,
             embedder=embedder,
         )
+        touched_term_ids.add(collection_hit.term_id)
 
         # Register the (domain, collection) pair in the first-class table.
         # INSERT OR IGNORE is a no-op when the resolver canonicalized to an
@@ -254,6 +262,7 @@ def classify(
                 source_paper=paper_name,
                 embedder=embedder,
             )
+            touched_term_ids.add(topic_hit.term_id)
             if topic_hit.term_id in seen_term_ids:
                 continue
             seen_term_ids.add(topic_hit.term_id)
@@ -283,6 +292,8 @@ def classify(
                 paper_id,
             ),
         )
+
+        pending_fts_rebuilds(conn).update(touched_term_ids)
 
     _LOG.info(
         "classified paper_id=%s paper_name=%s domain=%s collection=%s "
@@ -342,33 +353,33 @@ def _resolve_raw(
     Cross-field rules the schema enum cannot express are enforced here:
 
     - domain_index out of ``[-1, N-1]`` → :class:`ClassifyLLMError`
-    - domain_index == -1 but proposed_new_domain_description empty → raise
-    - domain_index >= 0 but proposed_new_domain_description non-empty → raise
+    - domain_index == -1 but new_domain_desc empty → raise
+    - domain_index >= 0 but new_domain_desc non-empty → raise
       (LLM is writing a description for a domain it didn't propose)
     - collection_index >= 0 while domain_index == -1 (new domain has no
       existing collections) → raise
     - collection_index >= 0 but out of range for the chosen domain's
       collections → raise
-    - collection_index == -1 but proposed_new_collection empty → raise
+    - collection_index == -1 but new_collection empty → raise
     """
     if raw.domain_index == -1:
-        domain_name = raw.proposed_new_domain
+        domain_name = raw.new_domain
         domain_is_new = True
-        domain_description: str | None = raw.proposed_new_domain_description.strip()
+        domain_description: str | None = raw.new_domain_desc.strip()
         if not domain_description:
             raise ClassifyLLMError(
                 "LLM returned domain_index=-1 but "
-                "proposed_new_domain_description is empty; new domains "
+                "new_domain_desc is empty; new domains "
                 "must include a one-sentence description of the research area"
             )
     elif 0 <= raw.domain_index < len(existing_domains):
         domain_name = existing_domains[raw.domain_index][0]
         domain_is_new = False
-        if raw.proposed_new_domain_description.strip():
+        if raw.new_domain_desc.strip():
             raise ClassifyLLMError(
                 f"LLM picked existing domain_index={raw.domain_index} but "
-                f"also set proposed_new_domain_description="
-                f"{raw.proposed_new_domain_description!r}; description "
+                f"also set new_domain_desc="
+                f"{raw.new_domain_desc!r}; description "
                 f"must be empty unless domain_index == -1"
             )
         domain_description = None
@@ -380,20 +391,20 @@ def _resolve_raw(
         )
 
     if raw.collection_index == -1:
-        proposed = raw.proposed_new_collection.strip()
+        proposed = raw.new_collection.strip()
         if not proposed:
             raise ClassifyLLMError(
                 "LLM returned collection_index=-1 but "
-                "proposed_new_collection is empty"
+                "new_collection is empty"
             )
         collection_name = proposed
         collection_description: str | None = (
-            raw.proposed_new_collection_description.strip()
+            raw.new_collection_desc.strip()
         )
         if not collection_description:
             raise ClassifyLLMError(
                 "LLM returned collection_index=-1 but "
-                "proposed_new_collection_description is empty; new "
+                "new_collection_desc is empty; new "
                 "collections must include a one-sentence description"
             )
     elif raw.collection_index >= 0:
@@ -411,11 +422,11 @@ def _resolve_raw(
                 f"{len(domain_colls)} collection(s) — index out of range"
             )
         collection_name = domain_colls[raw.collection_index][0]
-        if raw.proposed_new_collection_description.strip():
+        if raw.new_collection_desc.strip():
             raise ClassifyLLMError(
                 f"LLM picked existing collection_index={raw.collection_index} "
-                f"but also set proposed_new_collection_description="
-                f"{raw.proposed_new_collection_description!r}; description "
+                f"but also set new_collection_desc="
+                f"{raw.new_collection_desc!r}; description "
                 f"must be empty unless collection_index == -1"
             )
         collection_description = None

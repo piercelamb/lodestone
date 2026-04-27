@@ -5,12 +5,13 @@ paper's markdown, splits into sections via the shared section splitter, sub-
 chunks each section under GLiNER2's 384-token ceiling, runs labels-with-
 descriptions inference, applies the garbage gate, and resolves every surviving
 entity name through the shared 5-tier resolver. The resolver writes a
-``term_aliases`` appearance row per surviving mention with the chunk's
-breadcrumb so downstream queries can locate the section the entity came
-from. Sets ``papers.status = 'extracted'`` and updates
-``papers.entity_count`` on success. Re-running the stage on a paper wipes
-its entity-typed alias rows first; topic/collection aliases written by
-the classify stage are preserved.
+``term_aliases`` synonym row only for tier-2/3/4 hits whose surface form
+differs from the canonical's name; tier-1 hits and tier-5 mints are silent
+on the alias side. Sets ``papers.status = 'extracted'`` and updates
+``papers.entity_count`` to the number of distinct canonicals this paper
+resolved (counted via a Python set, not the alias table). Re-running the
+stage on a paper wipes its entity-typed alias rows first; topic/collection
+aliases written by the classify stage are preserved.
 
 The GLiNER2 model is loaded once per process via a module-level singleton.
 Callers never load GLiNER2 at import time — the model is pulled in lazily from
@@ -34,7 +35,11 @@ from _system.db.connection import get_conn, transaction
 from _system.resolution.acronyms import extract_acronym_pairs
 from _system.resolution.embeddings import Embedder
 from _system.resolution.normalize import normalize_term
-from _system.resolution.resolver import insert_acronym_alias, resolve
+from _system.resolution.resolver import (
+    insert_acronym_alias,
+    pending_fts_rebuilds,
+    resolve,
+)
 from _system.schemas.entities import EntityType
 from _system.schemas.paper_metadata import PaperStatus, can_run_from
 from _system.utils.config import load_gliner_config
@@ -452,12 +457,17 @@ def extract(
         winning_type[norm] = (winner, winner_score)
 
     # ------------------------------------------------------------------
-    # Pass 2 (transactional): dedup per section, resolve (which writes
-    # the term_aliases appearance row), and update papers.entity_count.
+    # Pass 2 (transactional): dedup per section, resolve (which writes a
+    # synonym row only for tier-2/3/4 hits with a non-canonical surface
+    # form), track every distinct canonical this paper resolves so we
+    # can update papers.entity_count and seed the deferred FTS rebuild
+    # queue (tier-1/tier-5 paths leave no alias trail under the synonym-
+    # index regime, so the rebuild queue is the only signal index_paper
+    # has for those terms).
     # ------------------------------------------------------------------
     with transaction(conn):
         # Wipe entity-typed alias rows for this paper so re-extraction
-        # doesn't accumulate stale appearance records. Topic/collection
+        # doesn't accumulate stale synonym records. Topic/collection
         # aliases (term_type != 'entity') are left untouched — classify
         # owns those and won't re-run as part of this stage.
         conn.execute(
@@ -471,9 +481,16 @@ def extract(
             (paper_name,),
         )
 
-        # Track canonicals already created in this paper so we only
-        # insert the Schwartz-Hearst short form as an alias once per
-        # canonical per paper.
+        # Track canonicals resolved this run so (a) entity_count counts
+        # distinct entity canonicals from this paper without needing a
+        # post-hoc COUNT against term_aliases (which under-counts after
+        # the synonym-index revert — tier-1 / tier-5 leave no rows), and
+        # (b) we can flag every touched term for the deferred terms_fts
+        # rebuild that index_paper drains.
+        touched_term_ids: set[int] = set()
+        # Schwartz-Hearst short form bookkeeping: only insert the alias
+        # once per canonical per paper. Alias insertion is itself
+        # idempotent per composite PK.
         aliased_term_ids: set[int] = set()
 
         for chunk, sub_chunks_list, chunk_valid_spans in per_chunk:
@@ -510,14 +527,11 @@ def extract(
                     entity_type=etype.value,
                     entity_type_score=etype_score,
                     source_paper=paper_name,
-                    source_breadcrumb=chunk.breadcrumb,
                     embedder=_get_embedder(),
                 )
+                touched_term_ids.add(resolved.term_id)
 
                 # Persist the Schwartz-Hearst short form(s) as aliases.
-                # Alias insertion is idempotent per composite PK;
-                # guarding on ``aliased_term_ids`` is purely to avoid
-                # redundant INSERT OR IGNOREs per paper.
                 if (
                     resolved.term_id not in aliased_term_ids
                     and norm in observed_short_forms
@@ -529,20 +543,10 @@ def extract(
                             canonical_name=resolved.canonical_name,
                             alias=short,
                             source_paper=paper_name,
-                            source_breadcrumb=chunk.breadcrumb,
                         )
                     aliased_term_ids.add(resolved.term_id)
 
-        entity_count = conn.execute(
-            """
-            SELECT COUNT(DISTINCT ta.term_id)
-              FROM term_aliases ta
-              JOIN canonical_terms ct ON ct.id = ta.term_id
-             WHERE ta.source_paper = ?
-               AND ct.term_type = 'entity'
-            """,
-            (paper_name,),
-        ).fetchone()[0]
+        entity_count = len(touched_term_ids)
 
         conn.execute(
             """
@@ -553,6 +557,10 @@ def extract(
             """,
             (entity_count, PaperStatus.EXTRACTED.value, paper_id),
         )
+
+        # Make sure index_paper rebuilds terms_fts for every canonical we
+        # touched, including tier-1 / tier-5 hits that wrote no alias row.
+        pending_fts_rebuilds(conn).update(touched_term_ids)
 
     _LOG.info(
         "garbage gate: rejected %d/%d entities for paper_name=%s",
