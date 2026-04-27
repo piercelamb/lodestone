@@ -15,6 +15,18 @@ _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 _BREADCRUMB_LEAD_RE = re.compile(r"^#{1,3}\s+\S")
 _WHITESPACE_TOKEN_RE = re.compile(r"\S+")
 
+_SECTION_QUERY_MAX_LEN = 500
+
+
+class SectionQueryError(ValueError):
+    """Raised when a ``--section`` query is syntactically malformed.
+
+    Distinguishes "Claude typed something wrong" (raise) from "Claude typed
+    something well-formed that doesn't match this paper" (returns ``None``).
+    The CLI surface translates this into a structured ``malformed_section_query``
+    payload so the agent has an actionable recovery path.
+    """
+
 
 class SectionChunk(NamedTuple):
     level: int
@@ -174,6 +186,51 @@ def sub_chunk(
     return chunks
 
 
+def _validate_section_query(section_query: str) -> tuple[str, ...]:
+    """Validate a raw ``--section`` query and return its lowercased parts.
+
+    Raises :class:`SectionQueryError` for malformed input — empty/whitespace
+    string, segments with no content (catches ``">"``, ``"A >> B"``,
+    ``"> B"``, ``"A >"``), embedded newlines, or excessive length. Well-
+    formed queries that simply don't match any section in a given paper
+    are NOT this function's concern; the caller signals that with ``None``.
+    """
+    if not isinstance(section_query, str):
+        raise SectionQueryError(
+            f"section query must be a string, got {type(section_query).__name__}"
+        )
+
+    if "\n" in section_query or "\r" in section_query:
+        raise SectionQueryError(
+            f"section query contains a newline: {section_query!r}. "
+            f"Pass a single-line title or 'Parent > Child' breadcrumb."
+        )
+
+    if len(section_query) > _SECTION_QUERY_MAX_LEN:
+        raise SectionQueryError(
+            f"section query exceeds {_SECTION_QUERY_MAX_LEN} characters "
+            f"(got {len(section_query)}). Check for accidental input."
+        )
+
+    if not section_query.strip():
+        raise SectionQueryError(
+            "section query is empty. "
+            "Pass a title like 'Method' or a breadcrumb like 'Experiments > Setup'."
+        )
+
+    raw_parts = section_query.split(">")
+    parts: list[str] = []
+    for raw in raw_parts:
+        stripped = raw.strip()
+        if not stripped:
+            raise SectionQueryError(
+                f"empty segment in breadcrumb {section_query!r}. "
+                f"Use 'Parent > Child' with non-empty segments separated by ' > '."
+            )
+        parts.append(stripped.lower())
+    return tuple(parts)
+
+
 def find_hierarchical_section(markdown: str, section_query: str) -> Optional[str]:
     """Return the raw markdown slice for the section matching ``section_query``.
 
@@ -182,13 +239,16 @@ def find_hierarchical_section(markdown: str, section_query: str) -> Optional[str
     (lowercased) *end with* the query parts (lowercased). The returned slice
     starts at the matched header line and ends before the next chunk of
     same-or-higher level — so descendants are included.
+
+    Raises :class:`SectionQueryError` if ``section_query`` is syntactically
+    malformed. Returns ``None`` for a well-formed query that finds no match.
     """
+    query_parts = _validate_section_query(section_query)
+    q_len = len(query_parts)
+
     chunks = split_sections(markdown)
     if not chunks:
         return None
-
-    query_parts = tuple(p.strip().lower() for p in section_query.split(">"))
-    q_len = len(query_parts)
 
     for idx, chunk in enumerate(chunks):
         if len(chunk.title_path) < q_len:

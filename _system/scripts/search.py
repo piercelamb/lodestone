@@ -42,7 +42,11 @@ from typing import Any
 # function that needs it.
 from _system.db.connection import get_conn
 from _system.utils.logging import get_logger
-from _system.utils.sections import find_hierarchical_section, split_sections
+from _system.utils.sections import (
+    SectionQueryError,
+    find_hierarchical_section,
+    split_sections,
+)
 from _system.utils.slug import _SLUG_RE
 
 _LOG = get_logger("scripts.search")
@@ -695,7 +699,20 @@ def mode_read(
     paper_name: str,
     section: str | None,
 ) -> dict[str, Any]:
-    """Return the full markdown or a hierarchical section slice."""
+    """Return the full markdown or a hierarchical section slice.
+
+    Failures of the section slice are NOT raised — they're emitted as
+    structured payloads so the agent can recover. ``status`` is one of:
+
+    - missing: ``"section_not_found"`` — well-formed query, no matching
+      header in this paper. Payload includes the actual top-level section
+      titles + a hint pointing at ``--toc`` and the whole-paper fallback.
+    - malformed: ``"malformed_section_query"`` — Claude's query violates
+      breadcrumb syntax. Payload echoes the bad query and the rule message.
+
+    A non-existent paper still raises ``ValueError`` — that's a hard error
+    (the caller picked the wrong arg), not a recoverable agent miss.
+    """
     row = conn.execute(
         "SELECT markdown FROM papers WHERE paper_name = ?", (paper_name,)
     ).fetchone()
@@ -704,16 +721,48 @@ def mode_read(
     markdown = row[0] or ""
 
     if section is None:
-        text = markdown
-    else:
+        return {
+            "mode": "read",
+            "status": "ok",
+            "paper_name": paper_name,
+            "section": None,
+            "text": markdown,
+        }
+
+    try:
         text = find_hierarchical_section(markdown, section)
-        if text is None:
-            raise ValueError(
-                f"section not found in paper {paper_name!r}: {section!r}"
-            )
+    except SectionQueryError as e:
+        return {
+            "mode": "read",
+            "status": "malformed_section_query",
+            "paper_name": paper_name,
+            "requested_section": section,
+            "error": str(e),
+            "hint": (
+                "Use a single title like 'Method' or a breadcrumb like "
+                "'Parent > Child' with non-empty segments separated by ' > '."
+            ),
+        }
+
+    if text is None:
+        available = [
+            c.title for c in split_sections(markdown) if c.level <= 2
+        ]
+        return {
+            "mode": "read",
+            "status": "section_not_found",
+            "paper_name": paper_name,
+            "requested_section": section,
+            "available_top_level_sections": available,
+            "hint": (
+                f"Run --toc {paper_name} for the full hierarchy, or drop "
+                f"--section to read the whole paper."
+            ),
+        }
 
     return {
         "mode": "read",
+        "status": "ok",
         "paper_name": paper_name,
         "section": section,
         "text": text,
@@ -930,14 +979,38 @@ def to_human(payload: dict[str, Any]) -> str:
             lines.append(f"{indent}{'#' * entry['level']} {entry['title']}")
 
     elif mode == "read":
+        status = payload.get("status", "ok")
         paper = payload.get("paper_name")
-        sec = payload.get("section")
-        header = f"== {paper}"
-        if sec:
-            header += f" § {sec}"
-        header += " =="
-        lines.append(header)
-        lines.append(payload.get("text", ""))
+        if status == "section_not_found":
+            lines.append(
+                f"section not found in {paper}: "
+                f"{payload.get('requested_section')!r}"
+            )
+            avail = payload.get("available_top_level_sections") or []
+            if avail:
+                lines.append(f"available top-level sections: {', '.join(avail)}")
+            hint = payload.get("hint")
+            if hint:
+                lines.append(hint)
+        elif status == "malformed_section_query":
+            lines.append(
+                f"malformed --section query for {paper}: "
+                f"{payload.get('requested_section')!r}"
+            )
+            err = payload.get("error")
+            if err:
+                lines.append(err)
+            hint = payload.get("hint")
+            if hint:
+                lines.append(hint)
+        else:
+            sec = payload.get("section")
+            header = f"== {paper}"
+            if sec:
+                header += f" § {sec}"
+            header += " =="
+            lines.append(header)
+            lines.append(payload.get("text", ""))
 
     elif mode == "figure":
         lines.append(
@@ -1138,6 +1211,9 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
     )
 
 
+_SOFT_FAILURE_STATUSES = frozenset({"section_not_found", "malformed_section_query"})
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
@@ -1152,11 +1228,25 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         conn.close()
 
+    # Soft failures: agent-recoverable misses (e.g. --section not found,
+    # malformed breadcrumb). Payload still carries the diagnostic; exit
+    # code 2 signals "you asked for something that didn't work" without
+    # the caller having to parse the JSON to find out.
+    is_soft_failure = result.get("status") in _SOFT_FAILURE_STATUSES
+
     if args.human:
-        sys.stdout.write(to_human(result) + "\n")
+        # Keep stdout empty on soft failure so shell pipes don't see partial
+        # output. The diagnostic still goes to the user via stderr.
+        if is_soft_failure:
+            sys.stderr.write(to_human(result) + "\n")
+        else:
+            sys.stdout.write(to_human(result) + "\n")
     else:
+        # JSON mode: payload always lands on stdout (the agent reads it to
+        # recover), regardless of success/failure.
         sys.stdout.write(to_json(result) + "\n")
-    return 0
+
+    return 2 if is_soft_failure else 0
 
 
 if __name__ == "__main__":
