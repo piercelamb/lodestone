@@ -72,15 +72,32 @@ def test_breadcrumb_prepended_to_body(sample_chunks: list[SectionChunk]) -> None
     assert "Scaling discussion." in scaling.body
 
 
-def test_body_ends_before_next_same_or_higher_header(sample_chunks: list[SectionChunk]) -> None:
-    """A chunk's body stops at the next header of same-or-higher level; deeper headers stay inside."""
+def test_body_ends_before_next_header_of_any_level(sample_chunks: list[SectionChunk]) -> None:
+    """A chunk's body stops at the very next header of ANY level. Descendant content
+    lives in the descendants' own chunks, not duplicated into the parent. Hierarchy
+    is recoverable from breadcrumb / find_hierarchical_section, not from chunk bodies.
+    """
     method = next(c for c in sample_chunks if c.title == "Method" and c.level == 1)
-    # Method body includes its children because they are deeper.
-    assert "## Gradient-based Entity Resolution" in method.body
-    assert "## Scaling" in method.body
-    # Body must NOT reach the next top-level section.
+    # Method body owns only its own intro paragraph; descendants get their own chunks.
+    assert "Method intro." in method.body
+    assert "## Gradient-based Entity Resolution" not in method.body
+    assert "## Scaling" not in method.body
+    # And of course it doesn't reach into siblings.
     assert "# Experiments" not in method.body
     assert "# Discussion" not in method.body
+
+    # The H2 child is its own chunk and contains its own body, but not its H3 grandchild.
+    ger = next(
+        c for c in sample_chunks
+        if c.title == "Gradient-based Entity Resolution"
+    )
+    assert "GER main description." in ger.body
+    assert "### Optimization" not in ger.body
+    assert "Optimization details for GER." not in ger.body
+
+    # The H3 leaf owns its own paragraph.
+    opt = next(c for c in sample_chunks if c.title == "Optimization")
+    assert "Optimization details for GER." in opt.body
 
 
 def test_fenced_backtick_code_blocks_ignored(sample_chunks: list[SectionChunk]) -> None:
