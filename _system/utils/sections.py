@@ -44,9 +44,13 @@ def split_sections(markdown: str) -> list[SectionChunk]:
       never treated as headers.
     - Non-whitespace content before the first header emits a synthetic
       ``# Abstract`` chunk at index 0 (start_offset=0).
-    - A chunk's body ends before the next header whose level is <= its own.
-      Deeper children remain inside the parent's body (and also emit their
-      own chunks). ``body`` has the breadcrumb prepended: ``breadcrumb\\n\\n<raw>``.
+    - A chunk's body ends before the very next header of any level. Each
+      chunk owns only its own paragraphs; descendant content lives in the
+      descendants' own chunks. The hierarchy is recoverable at read time
+      via ``find_hierarchical_section``, which slices the source markdown
+      using ``start_offset`` — it does not depend on parent bodies
+      containing descendant text. ``body`` has the breadcrumb prepended:
+      ``breadcrumb\\n\\n<raw>``.
     """
     lines = markdown.splitlines(keepends=True)
     offsets: list[int] = []
@@ -92,11 +96,11 @@ def split_sections(markdown: str) -> list[SectionChunk]:
         title_path = tuple(t for _, t in stack)
         breadcrumb = " > ".join(f"{'#' * lvl} {t}" for lvl, t in stack)
 
-        end_line_idx = len(lines)
-        for later_idx in range(idx + 1, len(header_events)):
-            if header_events[later_idx][1] <= level:
-                end_line_idx = header_events[later_idx][0]
-                break
+        end_line_idx = (
+            header_events[idx + 1][0]
+            if idx + 1 < len(header_events)
+            else len(lines)
+        )
 
         raw_body = "".join(lines[line_idx + 1 : end_line_idx])
         chunks.append(
