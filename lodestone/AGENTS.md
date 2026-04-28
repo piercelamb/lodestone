@@ -17,9 +17,13 @@ read-only via `search.py`.
 
 Five modes, all emit JSON by default. Add `--human` for pretty text.
 
-1. **BM25 free-text** — `search.py "query"` runs BM25 over
-   `abstracts` and `sections`. Filter with `--domain <slug>` or
-   `--collection <name>`. Returns paper + section hits ranked by rank.
+1. **BM25 free-text** — `search.py "query"` runs BM25 over the
+   `sections` FTS5 index (paper abstracts ride along as the
+   `# Abstract` chunk). Filter with `--domain <slug>` or
+   `--collection <name>`. Hits are grouped by paper. The query is
+   sanitized into a quoted-token phrase query, so punctuation in
+   queries (`tree-sitter`, `BAAI/bge-small`, `O(1)`) is treated as
+   phrase content rather than as FTS5 operators.
 2. **Taxonomy lookup** — `--entity <name>`, `--topic <name>`,
    `--collection-lookup <name>` resolve through FTS5 first, then fall
    back to sqlite-vec KNN when no FTS match is found. Tier info and
@@ -50,10 +54,11 @@ uv run _system/scripts/ingest.py --url <arxiv_url_or_id> [--force] [--domain <sl
 - **Resumable** (by design — see below). Rerunning on the same
   `arxiv_id` picks up at the last completed stage, driven by
   `papers.status`. No duplicate work. `ingest.py` is fully resumable.
-- `--force` cascade-deletes the paper (abstracts, sections, entities,
-  paper_topics, figures, papers) inside one transaction, then re-ingests.
-  Preserves global taxonomy (`canonical_terms`, `term_aliases`,
-  `term_embeddings`) so reuse across papers isn't lost.
+- `--force` cascade-deletes the paper (sections, term_aliases,
+  paper_topics, figures, paper_references, papers) inside one
+  transaction, then re-ingests. Preserves global taxonomy
+  (`canonical_terms`, `term_embeddings`) so reuse across papers isn't
+  lost.
 - `--domain <slug>` overrides the classifier's domain choice and
   threads through to both fetch and classify.
 

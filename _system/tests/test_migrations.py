@@ -14,7 +14,6 @@ EXPECTED_TABLES = {
     "papers",
     "figures",
     "paper_references",
-    "abstracts",
     "sections",
     "terms_fts",
     "canonical_terms",
@@ -24,7 +23,7 @@ EXPECTED_TABLES = {
 }
 
 # Virtual tables (FTS5, vec0) create auxiliary shadow tables; filter by prefix.
-_SHADOW_PREFIXES = ("abstracts_", "sections_", "terms_fts_", "term_embeddings_")
+_SHADOW_PREFIXES = ("sections_", "terms_fts_", "term_embeddings_")
 
 
 def _user_tables(conn: sqlite3.Connection) -> set[str]:
@@ -361,6 +360,47 @@ def test_init_db_backfills_collections_from_legacy_papers(conn):
     ).fetchone()
     assert row is not None
     assert row[2] is None  # legacy rows land with NULL description
+
+
+def test_init_db_drops_legacy_abstracts_fts5(tmp_path):
+    """abstracts FTS5 virtual table was retired (the # Abstract chunk in
+    ``sections`` covers the same text). init_db must DROP the virtual
+    table on any DB that predates the removal so the schema converges,
+    and the implicit DROP must take its shadow tables with it.
+    """
+    db_path = tmp_path / "legacy_abs.db"
+    legacy = sqlite3.connect(db_path)
+    try:
+        legacy.execute(
+            "CREATE VIRTUAL TABLE abstracts USING fts5("
+            "  paper_id UNINDEXED, domain, paper_name, collection, title, body,"
+            "  tokenize='porter unicode61'"
+            ")"
+        )
+        legacy.execute(
+            "INSERT INTO abstracts (paper_id, domain, paper_name, collection, "
+            "title, body) VALUES (1, 'rag', 'p1', 'c1', 't', 'body text')"
+        )
+        legacy.commit()
+    finally:
+        legacy.close()
+
+    from _system.db.connection import get_conn
+    conn = get_conn(db_path)
+    try:
+        init_db(conn)
+        # Virtual table is gone.
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'abstracts'"
+        ).fetchone()
+        assert row is None
+        # Shadow tables drop with the parent virtual table — none should remain.
+        shadows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE name LIKE 'abstracts\\_%' ESCAPE '\\'"
+        ).fetchall()
+        assert shadows == []
+    finally:
+        conn.close()
 
 
 def test_init_db_drops_legacy_page_images(conn):

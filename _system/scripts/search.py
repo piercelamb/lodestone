@@ -2,9 +2,12 @@
 
 Five modes dispatched by argparse:
 
-1. **BM25** — positional ``QUERY`` runs against ``abstracts`` (default) or
-   ``sections`` (``--sections``). Enriches each hit with an entity preview,
-   figure count, and topics.
+1. **BM25** — positional ``QUERY`` runs against the ``sections`` FTS5 table
+   (paper abstracts ride along as the ``# Abstract`` chunk). Hits are
+   grouped by ``paper_name`` and enriched with an entity preview, figure
+   count, and topics. User input is sanitized into a quoted-token phrase
+   query so punctuation (``-``, ``/``, ``:``, parens, etc.) cannot escape
+   into FTS5 operator territory.
 2. **Taxonomy lookup** — ``--entity`` / ``--topic`` / bare ``--collection``
    (without a positional query) resolves a term against ``terms_fts`` with
    a vec0 KNN fallback at cosine ≥ 0.80.
@@ -61,11 +64,6 @@ _TAXONOMY_VEC_MIN_COSINE = 0.80
 _ENTITY_PREVIEW_LIMIT = 5
 
 
-class BM25Scope(StrEnum):
-    ABSTRACTS = "abstracts"
-    SECTIONS = "sections"
-
-
 class TaxonomyKind(StrEnum):
     ENTITY = "entity"
     TOPIC = "topic"
@@ -85,82 +83,81 @@ class BrowseView(StrEnum):
 # ---------------------------------------------------------------------------
 
 
+# Matches a single Unicode word character — used to drop tokens that hold no
+# searchable content (e.g. a bare ``-`` or ``/``) after the per-token quote
+# wrap. Without this filter, FTS5 raises a syntax error on the empty phrase.
+_FTS5_TOKEN_HAS_WORD_CHAR = re.compile(r"\w", re.UNICODE)
+
+
+class FTS5QueryError(ValueError):
+    """The user's BM25 query has no searchable tokens after sanitization."""
+
+
+def _sanitize_fts5_match(query: str) -> str:
+    """Wrap each whitespace-delimited token in double quotes for safe MATCH.
+
+    The FTS5 query parser treats ``-``, ``+``, ``:``, ``(``, ``)``, ``*`` as
+    syntactic operators, so a bare ``tree-sitter`` parses as ``tree NOT sitter``
+    with ``sitter`` read as a column name (the failure mode that motivated this
+    helper). Wrapping each token in ``"..."`` reduces it to a phrase query
+    whose contents are tokenized but never reinterpreted as operators —
+    ``"tree-sitter"`` becomes a 2-token phrase requiring ``tree`` adjacent to
+    ``sitter``.
+
+    Internal ``"`` characters are escaped by doubling. Tokens that carry no
+    word characters (e.g. a stray ``--``) are dropped; if every token drops
+    out, raises :class:`FTS5QueryError` so the caller can surface a clean
+    error instead of a SQLite syntax exception.
+    """
+    parts: list[str] = []
+    for tok in query.split():
+        if not _FTS5_TOKEN_HAS_WORD_CHAR.search(tok):
+            continue
+        parts.append('"' + tok.replace('"', '""') + '"')
+    if not parts:
+        raise FTS5QueryError(
+            f"query has no searchable tokens after sanitization: {query!r}"
+        )
+    return " ".join(parts)
+
+
 def mode_bm25(
     conn: sqlite3.Connection,
     *,
     query: str,
-    scope: str,
     filters: dict[str, Any],
     limit: int,
 ) -> dict[str, Any]:
-    """BM25 text search against ``abstracts`` or ``sections``.
+    """BM25 text search against the ``sections`` FTS5 table.
 
-    ``scope`` must be a :class:`BM25Scope` value. Returns a dict with
-    ``mode`` = scope and a ``results`` list. ``abstracts`` returns paper-level
-    hits; ``sections`` groups hits by paper_name and preserves the underlying
-    row count in ``hit_count``.
+    Returns a dict with ``mode='sections'`` and a ``results`` list grouped by
+    ``paper_name``. Each group preserves the underlying row count in
+    ``hit_count``. The paper's abstract is indexed as the ``# Abstract``
+    chunk inside ``sections``, so a query that previously hit the dropped
+    ``abstracts`` virtual table still surfaces those hits here — under the
+    paper's ``Abstract`` section title.
+
+    A query whose tokens all drop out under sanitization (e.g. pure
+    punctuation like ``---``) emits ``status='empty_query'`` — agent-
+    recoverable, not a crash.
     """
-    try:
-        scope_enum = BM25Scope(scope)
-    except ValueError as exc:
-        raise ValueError(f"invalid BM25 scope: {scope!r}") from exc
-
     domain = filters.get("domain")
     collection = filters.get("collection")
-
-    if scope_enum is BM25Scope.ABSTRACTS:
-        return _bm25_abstracts(conn, query=query, domain=domain,
-                               collection=collection, limit=limit)
-    return _bm25_sections(conn, query=query, domain=domain,
-                          collection=collection, limit=limit)
-
-
-def _bm25_abstracts(
-    conn: sqlite3.Connection,
-    *,
-    query: str,
-    domain: str | None,
-    collection: str | None,
-    limit: int,
-) -> dict[str, Any]:
-    # abstracts columns: (paper_id, domain, paper_name, collection, title, body)
-    # column index for 'body' (where the match usually lives) is 5.
-    sql = (
-        "SELECT paper_id, domain, paper_name, collection, title, "
-        "       snippet(abstracts, 5, '[', ']', '…', 10) AS snip "
-        "  FROM abstracts "
-        " WHERE abstracts MATCH ? "
-    )
-    params: list[Any] = [query]
-    if domain:
-        sql += " AND domain = ? "
-        params.append(domain)
-    if collection:
-        sql += " AND collection = ? "
-        params.append(collection)
-    sql += " ORDER BY rank LIMIT ?"
-    params.append(limit)
-
-    rows = conn.execute(sql, params).fetchall()
-    paper_ids = [r[0] for r in rows]
-    topics_by_pid = _topics_batch(conn, paper_ids)
-    entities_by_pid = _entities_preview_batch(conn, paper_ids)
-    figures_by_pid = _figures_preview_batch(conn, paper_ids)
-    results: list[dict[str, Any]] = []
-    for paper_id, dom, paper_name, coll, title, snip in rows:
-        results.append({
-            "paper_name": paper_name,
-            "domain": dom,
-            "collection": coll,
-            "title": title,
-            "topics": topics_by_pid.get(paper_id, []),
-            "entities_preview": entities_by_pid.get(paper_id, []),
-            "figures": figures_by_pid.get(
-                paper_id, {"count": 0, "first_caption": None}
+    try:
+        return _bm25_sections(conn, query=query, domain=domain,
+                              collection=collection, limit=limit)
+    except FTS5QueryError as e:
+        return {
+            "mode": "sections",
+            "status": "empty_query",
+            "query": query,
+            "error": str(e),
+            "hint": (
+                "BM25 query had no searchable tokens after sanitization. "
+                "Pass at least one word; punctuation-only queries match "
+                "nothing."
             ),
-            "snippet": snip,
-        })
-    return {"mode": BM25Scope.ABSTRACTS, "query": query, "results": results}
+        }
 
 
 def _bm25_sections(
@@ -173,6 +170,7 @@ def _bm25_sections(
 ) -> dict[str, Any]:
     # sections columns: (paper_id, domain, paper_name, section_title, section_level, body)
     # snippet() against 'body' = column index 5.
+    match_query = _sanitize_fts5_match(query)
     sql = (
         "SELECT s.paper_id, s.domain, s.paper_name, s.section_title, "
         "       s.section_level, "
@@ -180,7 +178,7 @@ def _bm25_sections(
         "  FROM sections s"
     )
     wheres = ["sections MATCH ?"]
-    params: list[Any] = [query]
+    params: list[Any] = [match_query]
     if domain:
         wheres.append("s.domain = ?")
         params.append(domain)
@@ -231,7 +229,7 @@ def _bm25_sections(
         )
 
     return {
-        "mode": BM25Scope.SECTIONS,
+        "mode": "sections",
         "query": query,
         "results": list(grouped.values()),
     }
@@ -435,8 +433,9 @@ def mode_taxonomy_lookup(
     # Papers per kind
     if kind_enum is TaxonomyKind.ENTITY:
         # No per-paper sections payload under the synonym-index regime —
-        # claude follows up with `--sections "alias1 OR alias2"` to BM25
-        # for the actual hit locations. Papers list is the union of
+        # claude follows up with a positional BM25 query (e.g.
+        # ``"alias1 alias2"``) to locate hit positions; sections is the
+        # only BM25 path. Papers list is the union of
         # papers that contributed any synonym for this term; tier-1-only
         # mentions (canonical-as-surface-form) leave no row and so no
         # paper here, which is fine — the BM25 query catches them via
@@ -892,30 +891,24 @@ def to_human(payload: dict[str, Any]) -> str:
     mode = payload.get("mode", "?")
     lines: list[str] = []
 
-    if mode == "abstracts":
-        lines.append(f"== BM25 abstracts: {payload.get('query')!r} ==")
-        for hit in payload.get("results", []):
-            lines.append(f"- {hit['paper_name']} — {hit.get('title', '')}")
-            if hit.get("snippet"):
-                lines.append(f"    {hit['snippet']}")
-            if hit.get("topics"):
-                lines.append(f"    topics: {', '.join(hit['topics'])}")
-            if hit.get("entities_preview"):
-                ents = ", ".join(
-                    f"{e['name']}({e['type']})" for e in hit["entities_preview"]
-                )
-                lines.append(f"    entities: {ents}")
-
-    elif mode == "sections":
-        lines.append(f"== BM25 sections: {payload.get('query')!r} ==")
-        for hit in payload.get("results", []):
+    if mode == "sections":
+        if payload.get("status") == "empty_query":
             lines.append(
-                f"- {hit['paper_name']} (hits={hit['hit_count']})"
+                f"empty BM25 query: {payload.get('query')!r}"
             )
-            for s in hit.get("sections", []):
+            hint = payload.get("hint")
+            if hint:
+                lines.append(hint)
+        else:
+            lines.append(f"== BM25 sections: {payload.get('query')!r} ==")
+            for hit in payload.get("results", []):
                 lines.append(
-                    f"    §{s['section_level']} {s['section_title']}: {s.get('snippet', '')}"
+                    f"- {hit['paper_name']} (hits={hit['hit_count']})"
                 )
+                for s in hit.get("sections", []):
+                    lines.append(
+                        f"    §{s['section_level']} {s['section_title']}: {s.get('snippet', '')}"
+                    )
 
     elif mode in ("entity", "topic", "collection"):
         if payload.get("error"):
@@ -1036,7 +1029,7 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="search.py",
         description=(
             "Lodestone search CLI. Five modes routed via argparse:\n"
-            "  1. BM25 (positional QUERY; --sections to search section bodies)\n"
+            "  1. BM25 (positional QUERY; searches the sections FTS5 index)\n"
             "  2. Taxonomy lookup (--entity/--topic/--collection without QUERY)\n"
             "  3. Browse (--collections/--topics/--entity-type/--aliases/--needs-review)\n"
             "  4. ToC (--toc PAPER)\n"
@@ -1046,8 +1039,6 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("query", nargs="?", default=None,
                    help="BM25 query string (mode 1)")
-    p.add_argument("--sections", action="store_true",
-                   help="BM25 against sections instead of abstracts")
     p.add_argument("--domain", default=None, help="filter by papers.domain")
     p.add_argument("--collection", default=None,
                    help="collection name — filter when QUERY is set, "
@@ -1094,9 +1085,9 @@ def _check_mode_conflicts(
     The plan's routing table is "first match wins," but silent first-match
     resolution hides user mistakes (``QUERY --entity FOO`` would drop the
     positional query without warning). We enforce exclusivity explicitly:
-    exactly one mode must be selected. Mode-1 filters (``--sections``,
-    ``--domain``, ``--limit``, and ``--collection`` when QUERY is present)
-    are NOT counted as a mode.
+    exactly one mode must be selected. Mode-1 filters (``--domain``,
+    ``--limit``, and ``--collection`` when QUERY is present) are NOT
+    counted as a mode.
     """
     modes: list[str] = []
     if args.query is not None:
@@ -1187,9 +1178,10 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
             conn, term=value, kind=kind, filters=domain_filter,
         )
 
-    # Mode 1: BM25
+    # Mode 1: BM25 — sections is the only path now (the legacy abstracts
+    # FTS5 index was dropped; the abstract rides along as the # Abstract
+    # chunk inside sections).
     if args.query is not None:
-        scope = BM25Scope.SECTIONS if args.sections else BM25Scope.ABSTRACTS
         filters: dict[str, Any] = {}
         if args.domain:
             filters["domain"] = args.domain
@@ -1198,7 +1190,6 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
         return mode_bm25(
             conn,
             query=args.query,
-            scope=scope,
             filters=filters,
             limit=args.limit,
         )
@@ -1211,7 +1202,11 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
     )
 
 
-_SOFT_FAILURE_STATUSES = frozenset({"section_not_found", "malformed_section_query"})
+_SOFT_FAILURE_STATUSES = frozenset({
+    "section_not_found",
+    "malformed_section_query",
+    "empty_query",
+})
 
 
 def main(argv: list[str] | None = None) -> int:

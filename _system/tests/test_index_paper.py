@@ -213,16 +213,6 @@ class TestIndexOneBasics:
         assert result.status == PaperStatus.INDEXED.value
         assert result.section_count >= 1
 
-    def test_index_one_creates_exactly_one_abstracts_row(self, conn):
-        _seed_domain(conn)
-        _seed_paper(conn)
-        index_one(paper_name="paper_name_2024", conn=conn)
-        n = conn.execute(
-            "SELECT COUNT(*) FROM abstracts WHERE paper_name = ?",
-            ("paper_name_2024",),
-        ).fetchone()[0]
-        assert n == 1
-
     def test_index_one_populates_sections_equal_to_paper_section_count(self, conn):
         md = (
             "# Intro\n\nIntro body.\n\n"
@@ -245,27 +235,6 @@ class TestIndexOneBasics:
         assert n_sections == expected
         assert section_count_col == expected
 
-    def test_bm25_match_against_fresh_abstract_returns_paper(self, conn):
-        _seed_domain(conn)
-        _seed_paper(conn, abstract="We propose BookRAG, a novel retrieval technique.")
-        index_one(paper_name="paper_name_2024", conn=conn)
-        rows = conn.execute(
-            "SELECT paper_name FROM abstracts WHERE abstracts MATCH ?",
-            ("BookRAG",),
-        ).fetchall()
-        assert any(r[0] == "paper_name_2024" for r in rows)
-
-    def test_abstract_porter_tokenizer_stems(self, conn):
-        """abstracts uses porter — a query for 'retrieving' hits 'retrieval'."""
-        _seed_domain(conn)
-        _seed_paper(conn, abstract="We propose a retrieval technique.")
-        index_one(paper_name="paper_name_2024", conn=conn)
-        rows = conn.execute(
-            "SELECT paper_name FROM abstracts WHERE abstracts MATCH ?",
-            ("retrieving",),
-        ).fetchall()
-        assert any(r[0] == "paper_name_2024" for r in rows)
-
     def test_reindex_same_paper_replaces_rather_than_appends(self, conn):
         md = "# A\n\ntext\n\n# B\n\nmore\n"
         _seed_domain(conn)
@@ -274,33 +243,30 @@ class TestIndexOneBasics:
         index_one(paper_name="paper_name_2024", conn=conn)
         # Second pass must replace, not append.
         index_one(paper_name="paper_name_2024", conn=conn)
-        n_abs = conn.execute(
-            "SELECT COUNT(*) FROM abstracts WHERE paper_name = ?",
-            ("paper_name_2024",),
-        ).fetchone()[0]
         n_sec = conn.execute(
             "SELECT COUNT(*) FROM sections WHERE paper_name = ?",
             ("paper_name_2024",),
         ).fetchone()[0]
-        assert n_abs == 1
         assert n_sec == expected_sections
 
-    def test_markdown_missing_still_indexes_abstract(self, conn):
-        """A paper with NULL markdown can still be indexed — we get an
-        abstracts row and zero sections."""
+    def test_markdown_missing_still_advances_status(self, conn):
+        """A paper with NULL markdown still advances to INDEXED — we just
+        write zero sections rows. The abstract isn't indexed separately
+        anymore (it rides along inside ``sections`` as the # Abstract
+        chunk; without markdown there is no chunk to write)."""
         _seed_domain(conn)
         _seed_paper(conn, markdown=None)
         index_one(paper_name="paper_name_2024", conn=conn)
-        n_abs = conn.execute(
-            "SELECT COUNT(*) FROM abstracts WHERE paper_name = ?",
-            ("paper_name_2024",),
-        ).fetchone()[0]
         n_sec = conn.execute(
             "SELECT COUNT(*) FROM sections WHERE paper_name = ?",
             ("paper_name_2024",),
         ).fetchone()[0]
-        assert n_abs == 1
+        status = conn.execute(
+            "SELECT status FROM papers WHERE paper_name = ?",
+            ("paper_name_2024",),
+        ).fetchone()[0]
         assert n_sec == 0
+        assert status == PaperStatus.INDEXED.value
 
 
 # ===========================================================================
@@ -523,20 +489,15 @@ class TestBreadcrumbInclusion:
 
 
 class TestRebuildAll:
-    def test_rebuild_all_drops_and_recreates_all_four_derived_tables(
+    def test_rebuild_all_drops_and_recreates_all_three_derived_tables(
         self, conn, fake_embedder
     ):
-        """Seed stale rows in all four derived tables, then rebuild and
+        """Seed stale rows in all three derived tables, then rebuild and
         assert the stale rows are gone."""
         _seed_domain(conn)
         _seed_paper(conn, markdown=None)
         term_id = _seed_canonical(conn, canonical_name="term1")
 
-        conn.execute(
-            "INSERT INTO abstracts "
-            "(paper_id, domain, paper_name, collection, title, body) "
-            "VALUES (99, 'rag', 'ghost', 'ca', 'title', 'body')"
-        )
         conn.execute(
             "INSERT INTO sections "
             "(paper_id, domain, paper_name, section_title, section_level, body) "
@@ -558,9 +519,6 @@ class TestRebuildAll:
         rebuild_all(conn, embedder=fake_embedder)
 
         # Stale ghost rows gone
-        assert conn.execute(
-            "SELECT COUNT(*) FROM abstracts WHERE paper_name = 'ghost'"
-        ).fetchone()[0] == 0
         assert conn.execute(
             "SELECT COUNT(*) FROM sections WHERE paper_name = 'ghost'"
         ).fetchone()[0] == 0
@@ -592,7 +550,7 @@ class TestRebuildAll:
         # Every canonical term covered exactly once.
         assert sum(fake_embedder.embed_batch_calls) == 150
 
-    def test_rebuild_all_repopulates_abstracts_and_sections(
+    def test_rebuild_all_repopulates_sections(
         self, conn, fake_embedder
     ):
         _seed_domain(conn)
@@ -608,9 +566,6 @@ class TestRebuildAll:
         )
         rebuild_all(conn, embedder=fake_embedder)
 
-        assert conn.execute(
-            "SELECT COUNT(*) FROM abstracts"
-        ).fetchone()[0] == 2
         expected_sections = len(split_sections(md_1)) + len(split_sections(md_2))
         assert conn.execute(
             "SELECT COUNT(*) FROM sections"
@@ -618,9 +573,9 @@ class TestRebuildAll:
 
     def test_rebuild_all_empty_db_is_safe(self, conn, fake_embedder):
         """Empty DB: no papers, no canonical_terms. rebuild_all must not raise
-        and must leave all four derived tables empty."""
+        and must leave all three derived tables empty."""
         rebuild_all(conn, embedder=fake_embedder)
-        for table in ("abstracts", "sections", "terms_fts", "term_embeddings"):
+        for table in ("sections", "terms_fts", "term_embeddings"):
             assert conn.execute(
                 f"SELECT COUNT(*) FROM {table}"
             ).fetchone()[0] == 0
@@ -644,8 +599,7 @@ class TestRebuildAll:
         self, conn, fake_embedder
     ):
         """Two back-to-back rebuilds on the same DB must yield identical row
-        counts — no duplicated abstracts/sections/terms_fts/term_embeddings
-        rows."""
+        counts — no duplicated sections/terms_fts/term_embeddings rows."""
         _seed_domain(conn)
         _seed_paper(
             conn, paper_name="pA", arxiv_id="2401.0901",
@@ -659,14 +613,14 @@ class TestRebuildAll:
         rebuild_all(conn, embedder=fake_embedder)
         counts_a = {
             t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-            for t in ("abstracts", "sections", "terms_fts", "term_embeddings")
+            for t in ("sections", "terms_fts", "term_embeddings")
         }
 
         second = _FakeEmbedder()
         rebuild_all(conn, embedder=second)
         counts_b = {
             t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-            for t in ("abstracts", "sections", "terms_fts", "term_embeddings")
+            for t in ("sections", "terms_fts", "term_embeddings")
         }
 
         assert counts_a == counts_b
