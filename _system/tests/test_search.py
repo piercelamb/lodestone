@@ -754,12 +754,12 @@ class TestModeTaxonomy:
         assert r["resolved_via"] in ("exact", "alias", "fts")
         assert r["aliases"], r
         assert r["papers"]
-        # Synonym-index regime: papers list is `[{"paper_name": ...}]`
-        # with no per-paper sections payload (claude follows up with a
-        # positional BM25 query to locate text — sections is the only
-        # BM25 path).
+        # Synonym-index regime: papers list is keyed by paper_name (no
+        # per-paper sections payload). The taxonomy enrichment also
+        # decorates each paper entry with a `code_repo` envelope (None
+        # when the paper has no repo URL).
         for paper in r["papers"]:
-            assert set(paper.keys()) == {"paper_name"}
+            assert set(paper.keys()) == {"paper_name", "code_repo"}
 
     def test_finds_via_alias(self, seeded_db):
         r = search_mod.mode_taxonomy_lookup(

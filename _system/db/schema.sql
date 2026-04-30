@@ -115,6 +115,36 @@ CREATE VIRTUAL TABLE sections USING fts5(
     tokenize='unicode61 remove_diacritics 2'
 );
 
+-- One row per source file in a paper's code repo. Navigated by path
+-- (`--repo-tree PAPER` lists all rows; `--read-code PAPER --path X`
+-- fetches one). Binary blobs / vendored deps / model weights are
+-- filtered out by `fetch_repo.py` before insert; surviving content is
+-- guaranteed UTF-8 decodable text. `.ipynb` files are flattened to
+-- code+markdown cell text and stored under their original path.
+CREATE TABLE IF NOT EXISTS code_files (
+    id INTEGER PRIMARY KEY,
+    paper_id INTEGER NOT NULL REFERENCES papers(id),
+    path TEXT NOT NULL,
+    language TEXT,
+    size_bytes INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    UNIQUE(paper_id, path)
+);
+CREATE INDEX IF NOT EXISTS idx_code_files_paper ON code_files(paper_id);
+
+-- Parallel FTS5 surface over each repo's top-level README. One row per
+-- paper at most. README content is also present in `code_files` under
+-- its real path; `readmes_fts` is the searchable copy. Tokenizer
+-- matches `sections` so `--scope both` query behavior is uniform.
+CREATE VIRTUAL TABLE readmes_fts USING fts5(
+    paper_id UNINDEXED,
+    domain,
+    paper_name,
+    path,
+    content,
+    tokenize='unicode61 remove_diacritics 2'
+);
+
 CREATE VIRTUAL TABLE terms_fts USING fts5(
     term_id UNINDEXED,
     domain,

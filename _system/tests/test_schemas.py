@@ -17,15 +17,17 @@ from _system.schemas.taxonomy import ClassificationOutput
 
 
 class TestPaperStatus:
-    def test_has_six_members(self):
+    def test_has_eight_members(self):
         members = list(PaperStatus)
-        assert len(members) == 6
+        assert len(members) == 8
         assert PaperStatus.FETCHED in members
         assert PaperStatus.CONVERTED in members
         assert PaperStatus.CLASSIFIED in members
         assert PaperStatus.EXTRACTED in members
         assert PaperStatus.INDEXED in members
+        assert PaperStatus.REPO_FETCHED in members
         assert PaperStatus.FAILED_HTML in members
+        assert PaperStatus.FAILED_REPO in members
 
     def test_values_are_lowercase_strings(self):
         assert PaperStatus.FETCHED.value == "fetched"
@@ -33,17 +35,27 @@ class TestPaperStatus:
         assert PaperStatus.CLASSIFIED.value == "classified"
         assert PaperStatus.EXTRACTED.value == "extracted"
         assert PaperStatus.INDEXED.value == "indexed"
+        assert PaperStatus.REPO_FETCHED.value == "repo_fetched"
         assert PaperStatus.FAILED_HTML.value == "failed_html"
+        assert PaperStatus.FAILED_REPO.value == "failed_repo"
 
 
 class TestStatusOrder:
-    def test_distinct_ordinal_for_each_status(self):
-        ordinals = list(STATUS_ORDER.values())
-        assert len(ordinals) == 6
-        assert len(set(ordinals)) == 6
+    def test_distinct_ordinal_for_real_stages(self):
+        # Six real stages have distinct ordinals 0..5; both terminal
+        # sentinels share -1.
+        real_ordinals = [
+            STATUS_ORDER[s] for s in PaperStatus
+            if STATUS_ORDER[s] >= 0
+        ]
+        assert sorted(real_ordinals) == [0, 1, 2, 3, 4, 5]
+        assert len(set(real_ordinals)) == 6
 
     def test_failed_html_is_minus_one(self):
         assert STATUS_ORDER[PaperStatus.FAILED_HTML] == -1
+
+    def test_failed_repo_is_minus_one(self):
+        assert STATUS_ORDER[PaperStatus.FAILED_REPO] == -1
 
     def test_real_stages_ascend_from_zero(self):
         assert STATUS_ORDER[PaperStatus.FETCHED] == 0
@@ -51,6 +63,7 @@ class TestStatusOrder:
         assert STATUS_ORDER[PaperStatus.CLASSIFIED] == 2
         assert STATUS_ORDER[PaperStatus.EXTRACTED] == 3
         assert STATUS_ORDER[PaperStatus.INDEXED] == 4
+        assert STATUS_ORDER[PaperStatus.REPO_FETCHED] == 5
 
 
 class TestCanRunFrom:

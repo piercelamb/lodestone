@@ -20,10 +20,14 @@ EXPECTED_TABLES = {
     "term_aliases",
     "term_embeddings",
     "paper_topics",
+    "code_files",
+    "readmes_fts",
 }
 
 # Virtual tables (FTS5, vec0) create auxiliary shadow tables; filter by prefix.
-_SHADOW_PREFIXES = ("sections_", "terms_fts_", "term_embeddings_")
+_SHADOW_PREFIXES = (
+    "sections_", "terms_fts_", "term_embeddings_", "readmes_fts_",
+)
 
 
 def _user_tables(conn: sqlite3.Connection) -> set[str]:
@@ -42,6 +46,7 @@ _PLAIN_TABLES = {
     "domains", "collections", "papers", "figures",
     "paper_references",
     "canonical_terms", "term_aliases", "paper_topics",
+    "code_files",
 }
 
 
@@ -442,6 +447,64 @@ def test_papers_raw_html_accepts_large_payload(conn):
         "SELECT length(raw_html) FROM papers WHERE paper_name = 'big_paper'"
     ).fetchone()
     assert row[0] == len(big)
+
+
+def test_code_files_table_exists_with_unique_constraint(conn):
+    """``code_files`` is a plain table with UNIQUE(paper_id, path)."""
+    cols = {c[1] for c in conn.execute("PRAGMA table_info(code_files)").fetchall()}
+    assert {"paper_id", "path", "language", "size_bytes", "content"} <= cols
+
+    conn.execute("INSERT OR IGNORE INTO domains (name) VALUES ('rag')")
+    conn.execute(
+        "INSERT INTO papers (arxiv_id, paper_name, title, authors, date, "
+        "  abstract, domain, content_hash, pdf_url, ingested_at, status) "
+        "VALUES ('a/1', 'p1', 't', '[]', '2024', 'a', 'rag', 'h', 'u', 'd', 'fetched')"
+    )
+    pid = conn.execute("SELECT id FROM papers WHERE paper_name='p1'").fetchone()[0]
+    conn.execute(
+        "INSERT INTO code_files (paper_id, path, language, size_bytes, content) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (pid, "main.py", "python", 5, "x=1\n"),
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO code_files (paper_id, path, language, size_bytes, content) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (pid, "main.py", "python", 6, "y=2\n"),
+        )
+
+
+def test_readmes_fts_virtual_table_exists(conn):
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = 'readmes_fts' AND type = 'table'"
+    ).fetchone()
+    assert row is not None
+    # FTS5 must accept inserts and tokenize MATCH queries.
+    conn.execute(
+        "INSERT INTO readmes_fts (paper_id, domain, paper_name, path, content) "
+        "VALUES (1, 'rag', 'paperX', 'README.md', 'mixture-of-experts training')"
+    )
+    n = conn.execute(
+        "SELECT COUNT(*) FROM readmes_fts WHERE readmes_fts MATCH ?",
+        ('"mixture-of-experts"',),
+    ).fetchone()[0]
+    assert n == 1
+
+
+def test_papers_code_repo_columns_added(conn):
+    cols = {c[1] for c in conn.execute("PRAGMA table_info(papers)").fetchall()}
+    assert "code_repo_commit" in cols
+    assert "code_repo_fetched_at" in cols
+
+
+def test_add_column_if_missing_is_idempotent(conn):
+    """Repeated init_db calls don't re-add columns or error."""
+    cols1 = {c[1] for c in conn.execute("PRAGMA table_info(papers)").fetchall()}
+    init_db(conn)
+    cols2 = {c[1] for c in conn.execute("PRAGMA table_info(papers)").fetchall()}
+    assert cols1 == cols2
+    assert "code_repo_commit" in cols1
+    assert "code_repo_fetched_at" in cols1
 
 
 def test_term_embeddings_metadata_filters(conn):

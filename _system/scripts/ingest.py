@@ -30,6 +30,7 @@ from _system.db.connection import get_conn, transaction
 from _system.db.migrations import init_db
 from _system.schemas.paper_metadata import PaperStatus, can_run_from
 from _system.scripts.fetch_paper import fetch as fetch_stage
+from _system.scripts.fetch_repo import fetch_repo as fetch_repo_stage
 from _system.scripts.convert_paper import convert as convert_stage
 from _system.scripts.classify_paper import classify as classify_stage
 from _system.scripts.extract_entities import extract as extract_stage
@@ -47,6 +48,7 @@ class Stage(StrEnum):
     CLASSIFY = "classify"
     EXTRACT = "extract"
     INDEX = "index"
+    FETCH_REPO = "fetch_repo"
 
 
 class _PaperRow(NamedTuple):
@@ -123,7 +125,15 @@ _PIPELINE: tuple[tuple[Stage, PaperStatus], ...] = (
     (Stage.CLASSIFY, PaperStatus.CLASSIFIED),
     (Stage.EXTRACT, PaperStatus.EXTRACTED),
     (Stage.INDEX, PaperStatus.INDEXED),
+    (Stage.FETCH_REPO, PaperStatus.REPO_FETCHED),
 )
+
+
+_TERMINAL_STATUSES: frozenset[PaperStatus] = frozenset({
+    PaperStatus.REPO_FETCHED,
+    PaperStatus.FAILED_HTML,
+    PaperStatus.FAILED_REPO,
+})
 
 
 def _remaining_stages(current: PaperStatus | None) -> list[Stage]:
@@ -195,8 +205,11 @@ def ingest(
             )
             return _summary(conn, arxiv_id)
 
-        if current is PaperStatus.INDEXED:
-            _LOG.info("paper %s already indexed, skipping", arxiv_id)
+        if current in _TERMINAL_STATUSES:
+            _LOG.info(
+                "paper %s already terminal (status=%s), skipping",
+                arxiv_id, current.value,
+            )
             return _summary(conn, arxiv_id)
 
     stages_to_run = _remaining_stages(current)
@@ -242,6 +255,8 @@ def ingest(
         extract_stage(conn=conn, paper_name=paper_name, force=force)
     if Stage.INDEX in stages_to_run:
         index_stage(conn=conn, paper_name=paper_name, force=force)
+    if Stage.FETCH_REPO in stages_to_run:
+        fetch_repo_stage(conn=conn, paper_name=paper_name, force=force)
 
     return _summary(conn, arxiv_id)
 
