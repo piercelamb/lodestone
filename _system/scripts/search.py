@@ -44,6 +44,7 @@ from typing import Any
 # that pulls torch / sentence_transformers / gliner must live inside the
 # function that needs it.
 from _system.db.connection import get_conn
+from _system.schemas.paper_metadata import PaperStatus
 from _system.utils.logging import get_logger
 from _system.utils.sections import (
     SectionQueryError,
@@ -76,6 +77,12 @@ class BrowseView(StrEnum):
     ENTITY_TYPE = "entity_type"
     ALIASES = "aliases"
     NEEDS_REVIEW = "needs_review"
+
+
+class Scope(StrEnum):
+    SECTIONS = "sections"
+    READMES = "readmes"
+    BOTH = "both"
 
 
 # ---------------------------------------------------------------------------
@@ -127,15 +134,14 @@ def mode_bm25(
     query: str,
     filters: dict[str, Any],
     limit: int,
+    scope: Scope = Scope.SECTIONS,
 ) -> dict[str, Any]:
-    """BM25 text search against the ``sections`` FTS5 table.
+    """BM25 text search across ``sections`` and/or ``readmes_fts``.
 
-    Returns a dict with ``mode='sections'`` and a ``results`` list grouped by
-    ``paper_name``. Each group preserves the underlying row count in
-    ``hit_count``. The paper's abstract is indexed as the ``# Abstract``
-    chunk inside ``sections``, so a query that previously hit the dropped
-    ``abstracts`` virtual table still surfaces those hits here — under the
-    paper's ``Abstract`` section title.
+    ``scope`` selects the surface(s) to query: SECTIONS (default — fully
+    backwards-compatible), READMES (paper-anchored README index), or
+    BOTH (union, merged by paper_name with `readme_hit` field on
+    README-only matches).
 
     A query whose tokens all drop out under sanitization (e.g. pure
     punctuation like ``---``) emits ``status='empty_query'`` — agent-
@@ -144,8 +150,14 @@ def mode_bm25(
     domain = filters.get("domain")
     collection = filters.get("collection")
     try:
-        return _bm25_sections(conn, query=query, domain=domain,
-                              collection=collection, limit=limit)
+        if scope is Scope.SECTIONS:
+            return _bm25_sections(conn, query=query, domain=domain,
+                                  collection=collection, limit=limit)
+        if scope is Scope.READMES:
+            return _bm25_readmes(conn, query=query, domain=domain,
+                                 collection=collection, limit=limit)
+        return _bm25_both(conn, query=query, domain=domain,
+                          collection=collection, limit=limit)
     except FTS5QueryError as e:
         return {
             "mode": "sections",
@@ -220,6 +232,7 @@ def _bm25_sections(
     topics_by_pid = _topics_batch(conn, pid_order)
     entities_by_pid = _entities_preview_batch(conn, pid_order)
     figures_by_pid = _figures_preview_batch(conn, pid_order)
+    code_repo_by_pid = _code_repo_envelope_batch(conn, pid_order)
     for group in grouped.values():
         pid = group.pop("_paper_id")
         group["topics"] = topics_by_pid.get(pid, [])
@@ -227,12 +240,150 @@ def _bm25_sections(
         group["figures"] = figures_by_pid.get(
             pid, {"count": 0, "first_caption": None}
         )
+        group["code_repo"] = code_repo_by_pid.get(pid)
 
     return {
         "mode": "sections",
         "query": query,
         "results": list(grouped.values()),
     }
+
+
+def _bm25_readmes(
+    conn: sqlite3.Connection,
+    *,
+    query: str,
+    domain: str | None,
+    collection: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    """BM25 against ``readmes_fts``. Same envelope shape as ``_bm25_sections``
+    so ``to_human`` / enrichment branches treat both uniformly."""
+    match_query = _sanitize_fts5_match(query)
+    sql = (
+        "SELECT r.paper_id, r.domain, r.paper_name, r.path, "
+        "       snippet(readmes_fts, 4, '[', ']', '…', 10) AS snip "
+        "  FROM readmes_fts r"
+    )
+    wheres = ["readmes_fts MATCH ?"]
+    params: list[Any] = [match_query]
+    if domain:
+        wheres.append("r.domain = ?")
+        params.append(domain)
+    if collection:
+        sql += " JOIN papers p ON p.id = r.paper_id"
+        wheres.append("p.collection = ?")
+        params.append(collection)
+    sql += " WHERE " + " AND ".join(wheres)
+    sql += " ORDER BY rank LIMIT ?"
+    params.append(limit)
+
+    rows = conn.execute(sql, params).fetchall()
+
+    grouped: dict[str, dict[str, Any]] = {}
+    pid_order: list[int] = []
+    for paper_id, dom, paper_name, path, snip in rows:
+        # readmes_fts has at most one row per paper, but we still group
+        # to preserve envelope symmetry with `_bm25_sections`.
+        group = grouped.get(paper_name)
+        if group is None:
+            group = {
+                "paper_name": paper_name,
+                "domain": dom,
+                "_paper_id": paper_id,
+                "hit_count": 0,
+                "sections": [],
+                "readme_hit": None,
+            }
+            grouped[paper_name] = group
+            pid_order.append(paper_id)
+        group["hit_count"] += 1
+        group["readme_hit"] = {"path": path, "snippet": snip}
+
+    topics_by_pid = _topics_batch(conn, pid_order)
+    entities_by_pid = _entities_preview_batch(conn, pid_order)
+    figures_by_pid = _figures_preview_batch(conn, pid_order)
+    code_repo_by_pid = _code_repo_envelope_batch(conn, pid_order)
+    for group in grouped.values():
+        pid = group.pop("_paper_id")
+        group["topics"] = topics_by_pid.get(pid, [])
+        group["entities_preview"] = entities_by_pid.get(pid, [])
+        group["figures"] = figures_by_pid.get(
+            pid, {"count": 0, "first_caption": None}
+        )
+        group["code_repo"] = code_repo_by_pid.get(pid)
+
+    return {
+        "mode": "sections",
+        "query": query,
+        "scope": Scope.READMES.value,
+        "results": list(grouped.values()),
+    }
+
+
+def _bm25_both(
+    conn: sqlite3.Connection,
+    *,
+    query: str,
+    domain: str | None,
+    collection: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    """Union of sections + READMES hits, merged by paper_name."""
+    sec = _bm25_sections(conn, query=query, domain=domain,
+                         collection=collection, limit=limit)
+    rdm = _bm25_readmes(conn, query=query, domain=domain,
+                        collection=collection, limit=limit)
+
+    by_name: dict[str, dict[str, Any]] = {}
+    for group in sec.get("results", []):
+        by_name[group["paper_name"]] = group
+        group.setdefault("readme_hit", None)
+
+    for group in rdm.get("results", []):
+        existing = by_name.get(group["paper_name"])
+        if existing is None:
+            by_name[group["paper_name"]] = group
+            continue
+        existing["hit_count"] = existing.get("hit_count", 0) + group.get("hit_count", 0)
+        if group.get("readme_hit") is not None:
+            existing["readme_hit"] = group["readme_hit"]
+
+    return {
+        "mode": "sections",
+        "query": query,
+        "scope": Scope.BOTH.value,
+        "results": list(by_name.values()),
+    }
+
+
+def _code_repo_envelope_batch(
+    conn: sqlite3.Connection, paper_ids: list[int]
+) -> dict[int, dict[str, Any] | None]:
+    """One small SELECT per BM25 hit batch — never a fan-out per result."""
+    if not paper_ids:
+        return {}
+    placeholders = ",".join("?" * len(paper_ids))
+    rows = conn.execute(
+        f"""
+        SELECT p.id, p.code_repo, p.status,
+               (SELECT COUNT(*) FROM code_files cf WHERE cf.paper_id = p.id) AS file_count
+          FROM papers p
+         WHERE p.id IN ({placeholders})
+        """,
+        paper_ids,
+    ).fetchall()
+    result: dict[int, dict[str, Any] | None] = {}
+    for pid, code_repo, status, file_count in rows:
+        if not code_repo:
+            result[pid] = None
+            continue
+        result[pid] = {
+            "url": code_repo,
+            "status": status,
+            "file_count": int(file_count or 0),
+        }
+    return result
 
 
 def _topics_batch(
@@ -463,7 +614,46 @@ def mode_taxonomy_lookup(
         ).fetchall()
         result["papers"] = [{"paper_name": r[0]} for r in prows]
 
+    _attach_code_repo_to_papers(conn, result["papers"])
     return result
+
+
+def _attach_code_repo_to_papers(
+    conn: sqlite3.Connection, papers: list[dict[str, Any]]
+) -> None:
+    """Decorate each paper entry with a small ``code_repo`` envelope.
+
+    Mirrors the BM25 enrichment so an agent who lands on a taxonomy hit
+    has the same "you can ground this in code" signal without an extra
+    follow-up.
+    """
+    if not papers:
+        return
+    names = [p["paper_name"] for p in papers if p.get("paper_name")]
+    if not names:
+        return
+    placeholders = ",".join("?" * len(names))
+    rows = conn.execute(
+        f"""
+        SELECT p.paper_name, p.code_repo, p.status,
+               (SELECT COUNT(*) FROM code_files cf WHERE cf.paper_id = p.id) AS file_count
+          FROM papers p
+         WHERE p.paper_name IN ({placeholders})
+        """,
+        names,
+    ).fetchall()
+    by_name: dict[str, dict[str, Any] | None] = {}
+    for name, code_repo, status, file_count in rows:
+        if not code_repo:
+            by_name[name] = None
+            continue
+        by_name[name] = {
+            "url": code_repo,
+            "status": status,
+            "file_count": int(file_count or 0),
+        }
+    for entry in papers:
+        entry["code_repo"] = by_name.get(entry.get("paper_name"))
 
 
 def _taxonomy_tier_a(
@@ -769,6 +959,163 @@ def mode_read(
 
 
 # ---------------------------------------------------------------------------
+# Mode 6 — Repo tree / read code file
+# ---------------------------------------------------------------------------
+
+
+_LINES_RE = re.compile(r"^(\d+)-(\d+)$")
+
+
+def mode_repo_tree(
+    conn: sqlite3.Connection, *, paper_name: str
+) -> dict[str, Any]:
+    """List every ``code_files`` path for ``paper_name``.
+
+    Soft statuses on missing data:
+    - ``no_repo`` — paper has no ``code_repo`` URL.
+    - ``failed_repo`` — clone failed previously; URL kept for reference.
+    """
+    row = conn.execute(
+        "SELECT id, code_repo, code_repo_commit, code_repo_fetched_at, status "
+        "  FROM papers WHERE paper_name = ?",
+        (paper_name,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"paper not found: paper_name={paper_name!r}")
+    paper_id, code_repo, commit, fetched_at, status = row
+
+    if not code_repo:
+        return {
+            "mode": "repo_tree",
+            "status": "no_repo",
+            "paper_name": paper_name,
+            "hint": (
+                f"papers.code_repo is NULL for {paper_name}. No repo "
+                f"discovery hit during fetch — nothing to list."
+            ),
+        }
+
+    if status == PaperStatus.FAILED_REPO.value:
+        return {
+            "mode": "repo_tree",
+            "status": "failed_repo",
+            "paper_name": paper_name,
+            "code_repo": code_repo,
+            "hint": (
+                f"git clone {code_repo} failed during ingest. Re-run "
+                f"`ingest --url <id> --force` to retry."
+            ),
+        }
+
+    file_rows = conn.execute(
+        "SELECT path, language, size_bytes FROM code_files "
+        " WHERE paper_id = ? ORDER BY path",
+        (paper_id,),
+    ).fetchall()
+
+    files = [
+        {"path": p, "language": lang, "size_bytes": int(sz)}
+        for p, lang, sz in file_rows
+    ]
+    total = sum(f["size_bytes"] for f in files)
+
+    return {
+        "mode": "repo_tree",
+        "status": "ok",
+        "paper_name": paper_name,
+        "code_repo": code_repo,
+        "commit": commit,
+        "fetched_at": fetched_at,
+        "file_count": len(files),
+        "total_bytes": total,
+        "files": files,
+    }
+
+
+def mode_read_code(
+    conn: sqlite3.Connection,
+    *,
+    paper_name: str,
+    path: str,
+    lines: str | None = None,
+) -> dict[str, Any]:
+    """Read one ``code_files`` row, optionally sliced by 1-based line range.
+
+    Soft statuses (mirror ``mode_read``):
+    - ``file_not_found``
+    - ``malformed_lines``
+    """
+    paper_row = conn.execute(
+        "SELECT id FROM papers WHERE paper_name = ?", (paper_name,)
+    ).fetchone()
+    if paper_row is None:
+        raise ValueError(f"paper not found: paper_name={paper_name!r}")
+    paper_id = paper_row[0]
+
+    file_row = conn.execute(
+        "SELECT path, language, size_bytes, content "
+        "  FROM code_files WHERE paper_id = ? AND path = ?",
+        (paper_id, path),
+    ).fetchone()
+    if file_row is None:
+        return {
+            "mode": "read_code",
+            "status": "file_not_found",
+            "paper_name": paper_name,
+            "path": path,
+            "hint": f"Run --repo-tree {paper_name} for the available paths.",
+        }
+
+    stored_path, language, size_bytes, content = file_row
+
+    if lines is None:
+        return {
+            "mode": "read_code",
+            "status": "ok",
+            "paper_name": paper_name,
+            "path": stored_path,
+            "language": language,
+            "size_bytes": int(size_bytes),
+            "content": content,
+        }
+
+    m = _LINES_RE.match(lines)
+    if m is None:
+        return {
+            "mode": "read_code",
+            "status": "malformed_lines",
+            "paper_name": paper_name,
+            "path": stored_path,
+            "requested_lines": lines,
+            "error": f"--lines must be A-B with 1-based positive ints; got {lines!r}",
+            "hint": "Example: --lines 100-200 reads lines 100..200 inclusive.",
+        }
+    a, b = int(m.group(1)), int(m.group(2))
+    if a < 1 or b < a:
+        return {
+            "mode": "read_code",
+            "status": "malformed_lines",
+            "paper_name": paper_name,
+            "path": stored_path,
+            "requested_lines": lines,
+            "error": f"--lines requires 1 <= A <= B; got A={a}, B={b}",
+            "hint": "Example: --lines 100-200 reads lines 100..200 inclusive.",
+        }
+
+    sliced = "".join(content.splitlines(keepends=True)[a - 1:b])
+    return {
+        "mode": "read_code",
+        "status": "ok",
+        "paper_name": paper_name,
+        "path": stored_path,
+        "language": language,
+        "size_bytes": int(size_bytes),
+        "lines": [a, b],
+        "content": sliced,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Mode 5b — Figure BLOB extraction
 # ---------------------------------------------------------------------------
 
@@ -900,7 +1247,10 @@ def to_human(payload: dict[str, Any]) -> str:
             if hint:
                 lines.append(hint)
         else:
-            lines.append(f"== BM25 sections: {payload.get('query')!r} ==")
+            scope_label = payload.get("scope") or "sections"
+            lines.append(
+                f"== BM25 {scope_label}: {payload.get('query')!r} =="
+            )
             for hit in payload.get("results", []):
                 lines.append(
                     f"- {hit['paper_name']} (hits={hit['hit_count']})"
@@ -908,6 +1258,17 @@ def to_human(payload: dict[str, Any]) -> str:
                 for s in hit.get("sections", []):
                     lines.append(
                         f"    §{s['section_level']} {s['section_title']}: {s.get('snippet', '')}"
+                    )
+                rh = hit.get("readme_hit")
+                if rh:
+                    lines.append(
+                        f"    via README: {rh.get('path')}: {rh.get('snippet', '')}"
+                    )
+                cr = hit.get("code_repo")
+                if cr:
+                    lines.append(
+                        f"    code_repo: {cr.get('url')} "
+                        f"(status={cr.get('status')}, files={cr.get('file_count')})"
                     )
 
     elif mode in ("entity", "topic", "collection"):
@@ -1012,6 +1373,62 @@ def to_human(payload: dict[str, Any]) -> str:
             f"({payload.get('mime_type')})"
         )
 
+    elif mode == "repo_tree":
+        status = payload.get("status", "ok")
+        paper = payload.get("paper_name")
+        if status == "no_repo":
+            lines.append(f"no code_repo for {paper}")
+            hint = payload.get("hint")
+            if hint:
+                lines.append(hint)
+        elif status == "failed_repo":
+            lines.append(
+                f"clone failed for {paper}: {payload.get('code_repo')}"
+            )
+            hint = payload.get("hint")
+            if hint:
+                lines.append(hint)
+        else:
+            lines.append(
+                f"== {paper} repo: {payload.get('code_repo')} "
+                f"({payload.get('file_count')} files, "
+                f"{payload.get('total_bytes')} bytes) =="
+            )
+            for f in payload.get("files", []):
+                lang = f.get("language") or "?"
+                lines.append(
+                    f"  {f['path']}  [{lang}]  ({f['size_bytes']} B)"
+                )
+
+    elif mode == "read_code":
+        status = payload.get("status", "ok")
+        paper = payload.get("paper_name")
+        path = payload.get("path")
+        if status == "file_not_found":
+            lines.append(f"file not found in {paper}: {path!r}")
+            hint = payload.get("hint")
+            if hint:
+                lines.append(hint)
+        elif status == "malformed_lines":
+            lines.append(
+                f"malformed --lines for {paper} {path!r}: "
+                f"{payload.get('requested_lines')!r}"
+            )
+            err = payload.get("error")
+            if err:
+                lines.append(err)
+            hint = payload.get("hint")
+            if hint:
+                lines.append(hint)
+        else:
+            header = f"== {paper} :: {path}"
+            ln = payload.get("lines")
+            if ln:
+                header += f" [lines {ln[0]}-{ln[1]}]"
+            header += " =="
+            lines.append(header)
+            lines.append(payload.get("content", ""))
+
     else:
         lines.append(f"(unknown mode: {mode!r})")
         lines.append(json.dumps(payload, indent=2))
@@ -1071,6 +1488,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--figure", nargs=2, metavar=("PAPER", "N"), default=None,
                    help="extract figure N from PAPER to a tempfile")
 
+    p.add_argument(
+        "--scope",
+        default=Scope.SECTIONS.value,
+        choices=tuple(s.value for s in Scope),
+        help=("BM25 scope for the positional QUERY: sections (default), "
+              "readmes, or both."),
+    )
+    p.add_argument("--repo-tree", dest="repo_tree", default=None,
+                   help="list paths in PAPER's code repo")
+    p.add_argument("--read-code", dest="read_code", default=None,
+                   help="read a file from PAPER's code repo")
+    p.add_argument("--path", default=None,
+                   help="repo-relative file path for --read-code")
+    p.add_argument("--lines", default=None,
+                   help="line range A-B (1-based, inclusive) for --read-code")
+
     p.add_argument("--human", action="store_true",
                    help="emit plaintext instead of JSON")
     p.add_argument("--db", default="lodestone.db", help="sqlite db path")
@@ -1111,13 +1544,17 @@ def _check_mode_conflicts(
         modes.append("--aliases")
     if args.needs_review:
         modes.append("--needs-review")
-    # Mode 4 / 5
+    # Mode 4 / 5 / 6
     if args.toc is not None:
         modes.append("--toc")
     if args.read is not None:
         modes.append("--read")
     if args.figure is not None:
         modes.append("--figure")
+    if args.repo_tree is not None:
+        modes.append("--repo-tree")
+    if args.read_code is not None:
+        modes.append("--read-code")
 
     if len(modes) > 1:
         parser.error(
@@ -1125,8 +1562,35 @@ def _check_mode_conflicts(
             f"Pick exactly one."
         )
 
+    # `--scope` is a Mode-1 modifier, not a mode. It MUST NOT count above,
+    # but a non-default value without a positional QUERY is a user
+    # mistake — fail fast rather than silently dropping the flag.
+    if args.scope != Scope.SECTIONS.value and args.query is None:
+        parser.error(
+            "--scope requires a positional QUERY (Mode 1 BM25). "
+            "It is ignored by every other mode."
+        )
+
+    # `--read-code` requires `--path`; `--lines` is only meaningful with
+    # `--read-code`.
+    if args.read_code is not None and not args.path:
+        parser.error("--read-code requires --path REPO_RELATIVE_PATH.")
+    if args.lines is not None and args.read_code is None:
+        parser.error("--lines is only valid with --read-code.")
+
 
 def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, Any]:
+    # Mode 6: repo tree / read code
+    if args.repo_tree is not None:
+        return mode_repo_tree(conn, paper_name=args.repo_tree)
+    if args.read_code is not None:
+        return mode_read_code(
+            conn,
+            paper_name=args.read_code,
+            path=args.path,
+            lines=args.lines,
+        )
+
     # Mode 5b: figure
     if args.figure is not None:
         paper, n = args.figure
@@ -1178,9 +1642,8 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
             conn, term=value, kind=kind, filters=domain_filter,
         )
 
-    # Mode 1: BM25 — sections is the only path now (the legacy abstracts
-    # FTS5 index was dropped; the abstract rides along as the # Abstract
-    # chunk inside sections).
+    # Mode 1: BM25 — defaults to `sections`; `--scope` switches to
+    # `readmes` or `both`.
     if args.query is not None:
         filters: dict[str, Any] = {}
         if args.domain:
@@ -1192,6 +1655,7 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
             query=args.query,
             filters=filters,
             limit=args.limit,
+            scope=Scope(args.scope),
         )
 
     raise SystemExit(
@@ -1206,6 +1670,10 @@ _SOFT_FAILURE_STATUSES = frozenset({
     "section_not_found",
     "malformed_section_query",
     "empty_query",
+    "no_repo",
+    "failed_repo",
+    "file_not_found",
+    "malformed_lines",
 })
 
 

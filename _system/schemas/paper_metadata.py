@@ -13,7 +13,9 @@ class PaperStatus(StrEnum):
     CLASSIFIED = "classified"
     EXTRACTED = "extracted"
     INDEXED = "indexed"
+    REPO_FETCHED = "repo_fetched"
     FAILED_HTML = "failed_html"
+    FAILED_REPO = "failed_repo"
 
 
 class HtmlSource(StrEnum):
@@ -27,7 +29,9 @@ STATUS_ORDER: dict[PaperStatus, int] = {
     PaperStatus.CLASSIFIED: 2,
     PaperStatus.EXTRACTED: 3,
     PaperStatus.INDEXED: 4,
+    PaperStatus.REPO_FETCHED: 5,
     PaperStatus.FAILED_HTML: -1,
+    PaperStatus.FAILED_REPO: -1,
 }
 
 
@@ -37,12 +41,12 @@ def can_run_from(
     """True iff running `target_stage` is meaningful given `current`.
 
     You may rerun the current stage or advance one step past it. You may
-    not skip ahead or go backwards. FAILED_HTML is terminal. Callers use
-    --force to bypass this check.
+    not skip ahead or go backwards. Terminal sentinels (FAILED_HTML,
+    FAILED_REPO) short-circuit. Callers use --force to bypass this check.
     """
     if current is None:
         return True
-    if current is PaperStatus.FAILED_HTML:
+    if STATUS_ORDER[current] < 0:
         return False
     delta = STATUS_ORDER[target_stage] - STATUS_ORDER[current]
     return 0 <= delta <= 1

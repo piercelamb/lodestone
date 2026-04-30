@@ -176,11 +176,22 @@ def rec():
 @pytest.fixture
 def patched_stages(rec):
     """Patch every stage function on the ingest module."""
+
+    def _fetch_repo(**kwargs):
+        rec._record("fetch_repo", **kwargs)
+        conn = kwargs["conn"]
+        conn.execute(
+            "UPDATE papers SET status = ? WHERE paper_name = ?",
+            (PaperStatus.REPO_FETCHED.value, kwargs["paper_name"]),
+        )
+        return None
+
     with patch.object(ingest, "fetch_stage", side_effect=rec.fetch), \
          patch.object(ingest, "convert_stage", side_effect=rec.convert), \
          patch.object(ingest, "classify_stage", side_effect=rec.classify), \
          patch.object(ingest, "extract_stage", side_effect=rec.extract), \
-         patch.object(ingest, "index_stage", side_effect=rec.index):
+         patch.object(ingest, "index_stage", side_effect=rec.index), \
+         patch.object(ingest, "fetch_repo_stage", side_effect=_fetch_repo):
         yield rec
 
 
@@ -189,10 +200,12 @@ def patched_stages(rec):
 # ---------------------------------------------------------------------------
 
 
-def test_fresh_db_runs_all_five_stages(conn, patched_stages):
+def test_fresh_db_runs_all_six_stages(conn, patched_stages):
     ingest.ingest(conn=conn, arxiv_id="2301.00001", force=False, domain=None)
     stages = [c[0] for c in patched_stages.calls]
-    assert stages == ["fetch", "convert", "classify", "extract", "index"]
+    assert stages == [
+        "fetch", "convert", "classify", "extract", "index", "fetch_repo",
+    ]
 
 
 def test_resume_from_fetched_skips_fetch(conn, patched_stages):
@@ -200,7 +213,7 @@ def test_resume_from_fetched_skips_fetch(conn, patched_stages):
                 status=PaperStatus.FETCHED)
     ingest.ingest(conn=conn, arxiv_id="2301.00002", force=False, domain=None)
     stages = [c[0] for c in patched_stages.calls]
-    assert stages == ["convert", "classify", "extract", "index"]
+    assert stages == ["convert", "classify", "extract", "index", "fetch_repo"]
 
 
 def test_resume_from_converted_skips_fetch_convert(conn, patched_stages):
@@ -208,7 +221,7 @@ def test_resume_from_converted_skips_fetch_convert(conn, patched_stages):
                 status=PaperStatus.CONVERTED)
     ingest.ingest(conn=conn, arxiv_id="2301.00003", force=False, domain=None)
     stages = [c[0] for c in patched_stages.calls]
-    assert stages == ["classify", "extract", "index"]
+    assert stages == ["classify", "extract", "index", "fetch_repo"]
 
 
 def test_resume_from_classified_runs_extract_index(conn, patched_stages):
@@ -216,7 +229,7 @@ def test_resume_from_classified_runs_extract_index(conn, patched_stages):
                 status=PaperStatus.CLASSIFIED)
     ingest.ingest(conn=conn, arxiv_id="2301.00004", force=False, domain=None)
     stages = [c[0] for c in patched_stages.calls]
-    assert stages == ["extract", "index"]
+    assert stages == ["extract", "index", "fetch_repo"]
 
 
 def test_resume_from_extracted_runs_index_only(conn, patched_stages):
@@ -224,15 +237,37 @@ def test_resume_from_extracted_runs_index_only(conn, patched_stages):
                 status=PaperStatus.EXTRACTED)
     ingest.ingest(conn=conn, arxiv_id="2301.00005", force=False, domain=None)
     stages = [c[0] for c in patched_stages.calls]
-    assert stages == ["index"]
+    assert stages == ["index", "fetch_repo"]
 
 
-def test_already_indexed_no_force_is_noop(conn, patched_stages):
+def test_resume_from_indexed_runs_fetch_repo_only(conn, patched_stages):
+    """Previously-INDEXED papers advance to fetch_repo on next ingest run —
+    natural backfill, intended side effect of adding the new stage."""
     _seed_paper(conn, arxiv_id="2301.00006", paper_name="slug_2301.00006",
                 status=PaperStatus.INDEXED)
-    summary = ingest.ingest(conn=conn, arxiv_id="2301.00006", force=False, domain=None)
+    ingest.ingest(conn=conn, arxiv_id="2301.00006", force=False, domain=None)
+    stages = [c[0] for c in patched_stages.calls]
+    assert stages == ["fetch_repo"]
+
+
+def test_repo_fetched_no_force_is_noop(conn, patched_stages):
+    _seed_paper(conn, arxiv_id="2301.00006b", paper_name="slug_2301.00006b",
+                status=PaperStatus.REPO_FETCHED)
+    summary = ingest.ingest(
+        conn=conn, arxiv_id="2301.00006b", force=False, domain=None
+    )
     assert patched_stages.calls == []
-    assert summary["status"] == "indexed"
+    assert summary["status"] == "repo_fetched"
+
+
+def test_failed_repo_no_force_is_noop(conn, patched_stages):
+    _seed_paper(conn, arxiv_id="2301.00006c", paper_name="slug_2301.00006c",
+                status=PaperStatus.FAILED_REPO)
+    summary = ingest.ingest(
+        conn=conn, arxiv_id="2301.00006c", force=False, domain=None
+    )
+    assert patched_stages.calls == []
+    assert summary["status"] == "failed_repo"
 
 
 def test_failed_html_no_force_is_noop_with_hint(conn, patched_stages, caplog):
@@ -261,7 +296,9 @@ def test_failed_html_with_force_cascades_then_fetches(conn, patched_stages):
     ingest.ingest(conn=conn, arxiv_id="2301.00008", force=True, domain=None)
     # Cascade wiped the row; fetch saw no existing arxiv_id and ran the pipeline.
     stages = [c[0] for c in patched_stages.calls]
-    assert stages == ["fetch", "convert", "classify", "extract", "index"]
+    assert stages == [
+        "fetch", "convert", "classify", "extract", "index", "fetch_repo",
+    ]
 
 
 def test_force_on_indexed_cascades_then_runs_all(conn, patched_stages):
@@ -269,7 +306,9 @@ def test_force_on_indexed_cascades_then_runs_all(conn, patched_stages):
                 status=PaperStatus.INDEXED)
     ingest.ingest(conn=conn, arxiv_id="2301.00009", force=True, domain=None)
     stages = [c[0] for c in patched_stages.calls]
-    assert stages == ["fetch", "convert", "classify", "extract", "index"]
+    assert stages == [
+        "fetch", "convert", "classify", "extract", "index", "fetch_repo",
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +393,18 @@ def _seed_full_paper(conn: sqlite3.Connection, arxiv_id: str, paper_name: str,
 
 def test_force_cascade_deletes_paper_and_children(conn):
     paper_id = _seed_full_paper(conn, "2301.11111", "paper_to_wipe")
+    # Seed code_files and readmes_fts rows so the cascade has something
+    # to clean up.
+    conn.execute(
+        "INSERT INTO code_files (paper_id, path, language, size_bytes, content) "
+        "VALUES (?, 'README.md', 'markdown', 5, 'hi\n')",
+        (paper_id,),
+    )
+    conn.execute(
+        "INSERT INTO readmes_fts (paper_id, domain, paper_name, path, content) "
+        "VALUES (?, 'rag', 'paper_to_wipe', 'README.md', 'hi')",
+        (paper_id,),
+    )
     ingest._force_delete_paper(conn, paper_id=paper_id)
     assert conn.execute(
         "SELECT COUNT(*) FROM papers WHERE id = ?", (paper_id,)
@@ -361,10 +412,13 @@ def test_force_cascade_deletes_paper_and_children(conn):
     assert conn.execute(
         "SELECT COUNT(*) FROM sections WHERE paper_name = ?", ("paper_to_wipe",)
     ).fetchone()[0] == 0
-    for tbl in ("paper_topics", "figures"):
+    for tbl in ("paper_topics", "figures", "code_files"):
         assert conn.execute(
             f"SELECT COUNT(*) FROM {tbl} WHERE paper_id = ?", (paper_id,)
         ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM readmes_fts WHERE paper_id = ?", (paper_id,)
+    ).fetchone()[0] == 0
     # term_aliases keys by paper_name (TEXT) — the cascade wipes per-paper
     # appearance rows alongside the paper.
     assert conn.execute(
