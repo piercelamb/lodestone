@@ -504,10 +504,10 @@ def _persist(
     """Phase 2: single transaction writing papers + figures.
 
     Idempotency: on a forced re-fetch, any existing papers row (and every
-    dependent row across ``figures``, ``entities``, ``paper_topics``, and
-    the FTS ``abstracts`` / ``sections`` virtual tables) is deleted inside
-    the same transaction before the fresh INSERT. Callers that want
-    paper_name / ingested_at preservation must set those on the incoming
+    dependent row across ``figures``, ``term_aliases``, ``paper_topics``,
+    and the FTS ``sections`` virtual table) is deleted inside the same
+    transaction before the fresh INSERT. Callers that want paper_name /
+    ingested_at preservation must set those on the incoming
     PaperMetadata — ``fetch()`` does this.
     """
     with transaction(conn):

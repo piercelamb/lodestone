@@ -2,8 +2,12 @@
 
 Fifth (and final) pipeline stage: after ``extract_entities.py`` has written
 canonical entity rows, this script walks ``papers``/``entities``/``paper_topics``
-and builds the three FTS5 tables (``abstracts``, ``sections``, ``terms_fts``)
-plus the vec0 ``term_embeddings`` table that the search layer reads.
+and builds the two FTS5 tables (``sections``, ``terms_fts``) plus the vec0
+``term_embeddings`` table that the search layer reads. The paper's abstract
+flows into ``sections`` as the ``# Abstract`` chunk produced by
+:func:`_system.utils.sections.split_sections` — there is no separate
+``abstracts`` index; paper-level rollups happen via ``GROUP BY paper_name``
+in the query layer.
 
 Two modes:
 
@@ -14,17 +18,17 @@ Two modes:
   its ``collection`` canonical. Indexing paper A MUST NOT touch term rows
   whose only producer is paper B.
 
-- ``rebuild_all()`` — offline full rebuild. Drops and recreates all four
-  derived tables, then re-populates every paper's ``abstracts``/``sections``
-  rows, every canonical term's ``terms_fts`` row, and every canonical term's
+- ``rebuild_all()`` — offline full rebuild. Drops and recreates the three
+  derived tables, then re-populates every paper's ``sections`` rows, every
+  canonical term's ``terms_fts`` row, and every canonical term's
   ``term_embeddings`` vector (via ``Embedder.embed_batch`` in windows of 64).
   Intended for schema / corpus migrations; corruption recovery path. Not
   concurrency-safe with live search queries.
 
 Invariants worth keeping straight:
 
-- ``abstracts`` / ``sections`` FTS5 tables have no FK to ``papers``; the
-  ``DELETE FROM <tbl> WHERE paper_name = ?`` calls in ``index_one`` are
+- The ``sections`` FTS5 table has no FK to ``papers``; the
+  ``DELETE FROM sections WHERE paper_name = ?`` call in ``index_one`` is
   load-bearing for re-index idempotency.
 - ``sections.body`` = the ``SectionChunk.body`` returned by
   :func:`_system.utils.sections.split_sections`, which already contains the
@@ -61,7 +65,6 @@ _TERMS_BATCH_SIZE = 500
 _SCHEMA_FILE = Path(__file__).resolve().parent.parent / "db" / "schema.sql"
 
 _DERIVED_VIRTUAL_TABLES: tuple[str, ...] = (
-    "abstracts",
     "sections",
     "terms_fts",
     "term_embeddings",
@@ -106,24 +109,24 @@ def index_one(
     conn: sqlite3.Connection,
     force: bool = False,
 ) -> IndexResult:
-    """Populate abstracts/sections/terms_fts for one paper; advance to INDEXED.
+    """Populate sections/terms_fts for one paper; advance to INDEXED.
 
-    Replace-all semantics: deletes any prior ``abstracts`` / ``sections`` rows
-    for ``paper_name`` before inserting. The ``terms_fts`` rebuild is scoped to
+    Replace-all semantics: deletes any prior ``sections`` rows for
+    ``paper_name`` before inserting. The ``terms_fts`` rebuild is scoped to
     the touched-term set (entities this paper produced, topics it was tagged
     with, and the canonical row of its ``collection``). Commits in a single
     transaction so a mid-stage raise leaves ``papers.status`` unchanged.
     """
     row = conn.execute(
         """
-        SELECT id, domain, collection, title, abstract, markdown, status
+        SELECT id, domain, markdown, status
           FROM papers WHERE paper_name = ?
         """,
         (paper_name,),
     ).fetchone()
     if row is None:
         raise PaperNotFound(f"paper_name={paper_name!r} not found in papers table")
-    paper_id, domain, collection, title, abstract, markdown, status_str = row
+    paper_id, domain, markdown, status_str = row
 
     try:
         current = PaperStatus(status_str) if status_str else None
@@ -144,19 +147,9 @@ def index_one(
         )
 
     with transaction(conn):
-        # Rerun cleanup. FTS5 tables don't honor FK CASCADE — skipping these
+        # Rerun cleanup. FTS5 tables don't honor FK CASCADE — skipping this
         # produces duplicate hits on re-index.
-        conn.execute("DELETE FROM abstracts WHERE paper_name = ?", (paper_name,))
         conn.execute("DELETE FROM sections WHERE paper_name = ?", (paper_name,))
-
-        conn.execute(
-            """
-            INSERT INTO abstracts
-                (paper_id, domain, paper_name, collection, title, body)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (paper_id, domain, paper_name, collection, title, abstract or ""),
-        )
 
         new_section_count = 0
         if markdown:
@@ -168,9 +161,7 @@ def index_one(
                 markdown=markdown,
             )
 
-        touched = _touched_term_ids(
-            conn, paper_id=paper_id, domain=domain, collection=collection,
-        )
+        touched = _touched_term_ids(conn, paper_id=paper_id)
         if not touched:
             _LOG.debug(
                 "paper_id=%s paper_name=%s: no touched canonical terms "
@@ -237,8 +228,6 @@ def _touched_term_ids(
     conn: sqlite3.Connection,
     *,
     paper_id: int,
-    domain: str | None,
-    collection: str | None,
 ) -> set[int]:
     """Union of canonical term ids this paper touches.
 
@@ -252,12 +241,7 @@ def _touched_term_ids(
        tier-5 mints (which leave no alias row under the synonym-index
        regime), plus entity_type flips. Cleared after draining so the
        queue doesn't leak into the next paper's pipeline run.
-
-    The ``paper_topics`` and ``papers.collection`` arguments are no longer
-    needed for the union; ``domain`` / ``collection`` are kept in the
-    signature for caller compatibility but unused.
     """
-    del domain, collection  # retained in signature for caller compatibility
     rows = conn.execute(
         """
         SELECT DISTINCT ta.term_id
@@ -348,7 +332,7 @@ def rebuild_all(
     *,
     embedder: Embedder | None = None,
 ) -> None:
-    """Offline rebuild of all four derived tables. See module docstring.
+    """Offline rebuild of the three derived tables. See module docstring.
 
     ``embedder`` is a test seam — production passes None and the real
     BGE embedder is instantiated lazily (only if there are canonicals to
@@ -358,7 +342,7 @@ def rebuild_all(
 
     paper_rows = conn.execute(
         """
-        SELECT id, domain, paper_name, collection, title, abstract, markdown
+        SELECT id, domain, paper_name, markdown
           FROM papers ORDER BY id
         """
     ).fetchall()
@@ -367,7 +351,7 @@ def rebuild_all(
         batch = paper_rows[i : i + _PAPERS_BATCH_SIZE]
         with transaction(conn):
             for row in batch:
-                _insert_abstract_and_sections_for_row(conn, row)
+                _insert_sections_for_row(conn, row)
 
     canonical_rows = conn.execute(
         """
@@ -420,24 +404,16 @@ def rebuild_all(
     )
 
 
-def _insert_abstract_and_sections_for_row(
+def _insert_sections_for_row(
     conn: sqlite3.Connection,
-    paper_row: tuple[int, str | None, str, str | None, str | None, str | None, str | None],
+    paper_row: tuple[int, str | None, str, str | None],
 ) -> None:
     """Per-paper insert helper used by ``rebuild_all``.
 
     Skips the DELETE step (we already DROP+CREATE'd the parent virtual
     tables) and the status flip (not a status-changing operation).
     """
-    paper_id, domain, paper_name, collection, title, abstract, markdown = paper_row
-    conn.execute(
-        """
-        INSERT INTO abstracts
-            (paper_id, domain, paper_name, collection, title, body)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (paper_id, domain, paper_name, collection, title, abstract or ""),
-    )
+    paper_id, domain, paper_name, markdown = paper_row
     if markdown:
         _insert_sections_for_paper(
             conn,
@@ -449,12 +425,12 @@ def _insert_abstract_and_sections_for_row(
 
 
 def _drop_and_recreate_derived_virtual_tables(conn: sqlite3.Connection) -> None:
-    """DROP+CREATE the four derived virtual tables using DDL from schema.sql.
+    """DROP+CREATE the three derived virtual tables using DDL from schema.sql.
 
     Avoids duplicating the CREATE VIRTUAL TABLE statements in code — schema.sql
     stays the single source of truth for derived-table DDL.
 
-    The four DROP+CREATE pairs run in a single transaction so a process crash
+    The three DROP+CREATE pairs run in a single transaction so a process crash
     or CREATE failure cannot leave the schema half-destroyed (connection.py
     runs in autocommit mode; without the wrapper each DROP would commit on its
     own).

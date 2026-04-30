@@ -290,13 +290,6 @@ def _seed_full_paper(conn: sqlite3.Connection, arxiv_id: str, paper_name: str,
         "UPDATE papers SET domain = ?, collection = ? WHERE id = ?",
         (domain, "tree-search", paper_id),
     )
-    # abstracts (FTS5)
-    conn.execute(
-        "INSERT INTO abstracts (paper_id, domain, paper_name, collection, title, body) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (paper_id, domain, paper_name, "tree-search", "Title",
-         "distinctive_abstract_marker_xyz"),
-    )
     # sections (FTS5)
     conn.execute(
         "INSERT INTO sections (paper_id, domain, paper_name, section_title, section_level, body) "
@@ -365,10 +358,9 @@ def test_force_cascade_deletes_paper_and_children(conn):
     assert conn.execute(
         "SELECT COUNT(*) FROM papers WHERE id = ?", (paper_id,)
     ).fetchone()[0] == 0
-    for tbl in ("abstracts", "sections"):
-        assert conn.execute(
-            f"SELECT COUNT(*) FROM {tbl} WHERE paper_name = ?", ("paper_to_wipe",)
-        ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM sections WHERE paper_name = ?", ("paper_to_wipe",)
+    ).fetchone()[0] == 0
     for tbl in ("paper_topics", "figures"):
         assert conn.execute(
             f"SELECT COUNT(*) FROM {tbl} WHERE paper_id = ?", (paper_id,)
@@ -387,16 +379,6 @@ def test_force_cascade_clears_sections_fts_for_paper(conn):
     rows = conn.execute(
         "SELECT COUNT(*) FROM sections WHERE sections MATCH ?",
         ("distinctive_section_marker_abc",),
-    ).fetchone()[0]
-    assert rows == 0
-
-
-def test_force_cascade_clears_abstracts_fts_for_paper(conn):
-    paper_id = _seed_full_paper(conn, "2301.33333", "paper_abc")
-    ingest._force_delete_paper(conn, paper_id=paper_id)
-    rows = conn.execute(
-        "SELECT COUNT(*) FROM abstracts WHERE abstracts MATCH ?",
-        ("distinctive_abstract_marker_xyz",),
     ).fetchone()[0]
     assert rows == 0
 

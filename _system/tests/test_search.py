@@ -5,9 +5,9 @@ extraction), the argparse routing, lazy-import discipline, and the dual
 JSON / human output formatters.
 
 The seeded DB fixture builds a small, self-consistent corpus — two papers
-with matching ``abstracts`` / ``sections`` / ``terms_fts`` rows, a
-canonical ``RAPTOR`` term with aliases + embedding, and a figure BLOB
-keyed on both ``figure_number`` and ``display_number``.
+with matching ``sections`` / ``terms_fts`` rows, a canonical ``RAPTOR``
+term with aliases + embedding, and a figure BLOB keyed on both
+``figure_number`` and ``display_number``.
 """
 from __future__ import annotations
 
@@ -109,26 +109,6 @@ def _insert_paper(
         ),
     )
     return cur.lastrowid
-
-
-def _insert_abstract(
-    conn: sqlite3.Connection,
-    *,
-    paper_id: int,
-    domain: str,
-    paper_name: str,
-    collection: str | None,
-    title: str,
-    abstract: str,
-) -> None:
-    conn.execute(
-        """
-        INSERT INTO abstracts
-            (paper_id, domain, paper_name, collection, title, body)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (paper_id, domain, paper_name, collection, title, abstract),
-    )
 
 
 def _insert_sections_for_md(
@@ -349,18 +329,6 @@ def seeded_db(conn: sqlite3.Connection) -> sqlite3.Connection:
         needs_review=0,
         ingested_at="2024-01-01T00:00:00+00:00",
     )
-    _insert_abstract(
-        conn,
-        paper_id=p1_id,
-        domain="rag",
-        paper_name="bookrag_2024",
-        collection="hierarchical indexing",
-        title="BookRAG: Hierarchical Indexing for Retrieval",
-        abstract=(
-            "We introduce BookRAG, a hierarchical indexing approach for "
-            "document retrieval."
-        ),
-    )
     _insert_sections_for_md(
         conn,
         paper_id=p1_id,
@@ -382,16 +350,6 @@ def seeded_db(conn: sqlite3.Connection) -> sqlite3.Connection:
         needs_review=1,
         ingested_at="2024-02-01T00:00:00+00:00",
     )
-    _insert_abstract(
-        conn,
-        paper_id=p2_id,
-        domain="other",
-        paper_name="stale_2024",
-        collection=None,
-        title="Stale Paper",
-        abstract="A paper that needs review.",
-    )
-
     # Canonical term: RAPTOR (entity/method, rag domain)
     raptor_id = _insert_canonical(
         conn,
@@ -642,31 +600,34 @@ def test_help_does_not_import_ml_libs():
 
 
 class TestModeBM25:
-    def test_abstracts_returns_paper_hits(self, seeded_db):
+    def test_abstract_text_surfaces_via_sections(self, seeded_db):
+        """The abstract is now indexed as the # Abstract chunk inside
+        ``sections``, so a BM25 query over abstract text still resolves
+        the paper — just under the Abstract section title."""
         r = search_mod.mode_bm25(
             seeded_db,
             query="hierarchical indexing",
-            scope="abstracts",
             filters={},
             limit=10,
         )
-        assert r["mode"] == "abstracts"
+        assert r["mode"] == "sections"
         assert r["query"] == "hierarchical indexing"
         assert isinstance(r["results"], list)
-        assert any(
-            h.get("paper_name") == "bookrag_2024" for h in r["results"]
-        ), r["results"]
-        hit = next(h for h in r["results"] if h["paper_name"] == "bookrag_2024")
-        # Enrichment — topics, entities preview, snippet
-        assert "snippet" in hit
-        assert "entities_preview" in hit
-        assert "topics" in hit
+        hits = [h for h in r["results"] if h["paper_name"] == "bookrag_2024"]
+        assert hits, r["results"]
+        group = hits[0]
+        # Enrichment — topics, entities preview, hit_count
+        assert "hit_count" in group
+        assert "entities_preview" in group
+        assert "topics" in group
+        # Abstract chunk was hit (the seeded markdown opens with # Abstract).
+        section_titles = [s["section_title"] for s in group["sections"]]
+        assert "Abstract" in section_titles, section_titles
 
-    def test_sections_routes_to_sections_table(self, seeded_db):
+    def test_sections_groups_hits_by_paper(self, seeded_db):
         r = search_mod.mode_bm25(
             seeded_db,
             query="BookRAG",
-            scope="sections",
             filters={},
             limit=10,
         )
@@ -683,18 +644,25 @@ class TestModeBM25:
         assert len(group["sections"]) == group["hit_count"]
 
     def test_domain_filter_narrows_results(self, seeded_db):
-        # Seed a row in 'other' domain whose abstract mentions BookRAG.
+        # Seed a sections row in the 'other' domain whose body mentions BookRAG.
+        p2_id = seeded_db.execute(
+            "SELECT id FROM papers WHERE paper_name = ?", ("stale_2024",)
+        ).fetchone()[0]
         seeded_db.execute(
-            "UPDATE abstracts SET body = ? WHERE paper_name = ?",
-            ("BookRAG also mentioned here", "stale_2024"),
+            """
+            INSERT INTO sections
+                (paper_id, domain, paper_name, section_title, section_level, body)
+            VALUES (?, 'other', 'stale_2024', 'Mentions', '1',
+                    'BookRAG also mentioned here')
+            """,
+            (p2_id,),
         )
         r_all = search_mod.mode_bm25(
-            seeded_db, query="BookRAG", scope="abstracts", filters={}, limit=10
+            seeded_db, query="BookRAG", filters={}, limit=10
         )
         r_rag = search_mod.mode_bm25(
             seeded_db,
             query="BookRAG",
-            scope="abstracts",
             filters={"domain": "rag"},
             limit=10,
         )
@@ -707,7 +675,6 @@ class TestModeBM25:
         r = search_mod.mode_bm25(
             seeded_db,
             query="BookRAG",
-            scope="abstracts",
             filters={},
             limit=10,
         )
@@ -716,6 +683,60 @@ class TestModeBM25:
         assert "figures" in hit
         assert isinstance(hit["figures"], dict)
         assert hit["figures"]["count"] >= 1
+
+    def test_hyphenated_query_does_not_crash(self, seeded_db):
+        """Hyphens in user queries used to be parsed as the FTS5 NOT
+        operator, causing a hard crash. The sanitizer must wrap each
+        token in double quotes so the hyphen becomes phrase content."""
+        # Seed a section body containing 'tree-sitter' so we have a real
+        # hit to confirm the phrase semantics work too.
+        p1_id = seeded_db.execute(
+            "SELECT id FROM papers WHERE paper_name = ?", ("bookrag_2024",)
+        ).fetchone()[0]
+        seeded_db.execute(
+            """
+            INSERT INTO sections
+                (paper_id, domain, paper_name, section_title, section_level, body)
+            VALUES (?, 'rag', 'bookrag_2024', 'Tools', '1',
+                    'We use tree-sitter for source parsing.')
+            """,
+            (p1_id,),
+        )
+        r = search_mod.mode_bm25(
+            seeded_db,
+            query="tree-sitter",
+            filters={},
+            limit=10,
+        )
+        assert r["mode"] == "sections"
+        # Either the seed row is found (good) or we get an empty result
+        # set (also acceptable) — what we must NOT get is an exception.
+        assert isinstance(r.get("results", []), list)
+        # The seeded body should be matched by the phrase "tree" + "sitter".
+        assert any(
+            h.get("paper_name") == "bookrag_2024" for h in r["results"]
+        ), r
+
+    def test_punctuation_only_query_returns_soft_failure(self, seeded_db):
+        """A query with no word characters at all (``---``) hits the
+        sanitizer's empty-tokens guard — soft-fail payload, not crash."""
+        r = search_mod.mode_bm25(
+            seeded_db, query="---", filters={}, limit=10
+        )
+        assert r["mode"] == "sections"
+        assert r["status"] == "empty_query"
+        assert "hint" in r
+
+    def test_special_chars_in_query_do_not_crash(self, seeded_db):
+        """Slashes, parens, and colons must also reduce to phrase
+        content rather than FTS5 syntax."""
+        for q in ["BAAI/bge-small", "O(1)", "method:foo", "(parens)"]:
+            r = search_mod.mode_bm25(
+                seeded_db, query=q, filters={}, limit=10
+            )
+            assert r["mode"] == "sections", q
+            # No KeyError, no OperationalError — that's the contract.
+            assert isinstance(r.get("results", []), list)
 
 
 # ===========================================================================
@@ -734,8 +755,9 @@ class TestModeTaxonomy:
         assert r["aliases"], r
         assert r["papers"]
         # Synonym-index regime: papers list is `[{"paper_name": ...}]`
-        # with no per-paper sections payload (claude follows up with
-        # `--sections "alias1 OR alias2"` BM25 to locate text).
+        # with no per-paper sections payload (claude follows up with a
+        # positional BM25 query to locate text — sections is the only
+        # BM25 path).
         for paper in r["papers"]:
             assert set(paper.keys()) == {"paper_name"}
 
@@ -1170,11 +1192,10 @@ class TestOutputFormatting:
         bm25 = search_mod.mode_bm25(
             seeded_db,
             query="BookRAG",
-            scope="abstracts",
             filters={},
             limit=5,
         )
-        assert bm25["mode"] == "abstracts"
+        assert bm25["mode"] == "sections"
 
         tax = search_mod.mode_taxonomy_lookup(
             seeded_db, term="RAPTOR", kind="entity", filters={}
@@ -1200,10 +1221,7 @@ class TestOutputFormatting:
     def test_human_formatter_nonempty_per_mode(self, seeded_db):
         payloads = [
             search_mod.mode_bm25(
-                seeded_db, query="BookRAG", scope="abstracts", filters={}, limit=5
-            ),
-            search_mod.mode_bm25(
-                seeded_db, query="BookRAG", scope="sections", filters={}, limit=5
+                seeded_db, query="BookRAG", filters={}, limit=5
             ),
             search_mod.mode_taxonomy_lookup(
                 seeded_db, term="RAPTOR", kind="entity", filters={}

@@ -64,6 +64,16 @@ CREATE TABLE IF NOT EXISTS figures (
 -- back to a render — the table was vestigial. Idempotent.
 DROP TABLE IF EXISTS page_images;
 
+-- Drop the legacy `abstracts` FTS5 virtual table on any DB that predates
+-- the removal. The abstract text is fully indexed by `sections` (every
+-- paper's `# Abstract` section is one row, plus the level-1 markdown
+-- blob row contains it as a substring). Paper-level rollups happen via
+-- `GROUP BY paper_name` on `sections`. The structured `papers.abstract`
+-- column stays for display / export / future non-BM25 use. Dropping the
+-- virtual table also drops its shadow tables (abstracts_data,
+-- abstracts_idx, abstracts_content, abstracts_docsize, abstracts_config).
+DROP TABLE IF EXISTS abstracts;
+
 CREATE TABLE IF NOT EXISTS paper_references (
     id INTEGER PRIMARY KEY,
     paper_id INTEGER NOT NULL REFERENCES papers(id),
@@ -94,16 +104,6 @@ CREATE INDEX IF NOT EXISTS idx_paper_refs_cited_paper ON paper_references(cited_
 -- ============================================================
 -- GROUP 2: FULL-TEXT SEARCH (BM25)
 -- ============================================================
-
-CREATE VIRTUAL TABLE abstracts USING fts5(
-    paper_id UNINDEXED,
-    domain,
-    paper_name,
-    collection,
-    title,
-    body,
-    tokenize='porter unicode61'
-);
 
 CREATE VIRTUAL TABLE sections USING fts5(
     paper_id UNINDEXED,
