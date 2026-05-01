@@ -22,6 +22,9 @@ dependencies = [
     "tomli-w",
 ]
 
+[project.scripts]
+lodestone-mcp = "_system.scripts.mcp_server:main"
+
 [dependency-groups]
 dev = [
     "pytest",

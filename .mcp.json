@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "lodestone": {
+      "command": "/Users/pierce/Personal/Code/lodestone/.venv/bin/lodestone-mcp",
+      "args": [],
+      "env": {
+        "LODESTONE_DB": "/Users/pierce/Personal/Code/lodestone/lodestone.db",
+        "MCP_TIMEOUT": "30000"
+      }
+    }
+  }
+}
