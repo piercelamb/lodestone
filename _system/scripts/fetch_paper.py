@@ -304,6 +304,10 @@ def _resolve_figure_bytes(
     if desc.inline_data is not None:
         return _process_figure_image(desc.inline_data, desc.inline_mime or "")
     if desc.src_url is None:
+        _LOG.debug(
+            "figure %d (id=%s) has no <img> source; skipping (placeholder)",
+            desc.figure_number, desc.figure_id,
+        )
         return None
     downloaded = _download_figure(client, desc.src_url)
     if downloaded is None:
