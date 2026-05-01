@@ -19,8 +19,10 @@ import argparse
 import hashlib
 import io
 import json
+import os
 import re
 import sqlite3
+import tarfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,10 +41,16 @@ from tenacity import (
 from _system.db.cascade import delete_paper_cascade
 from _system.db.connection import get_conn, transaction
 from _system.html.latexml_parser import FigureDescriptor, parse as parse_latexml
+from _system.latex import LATEX_SENTINEL_PREFIX
+from _system.latex import assemble as latex_assemble
+from _system.latex import eprint as latex_eprint
+from _system.latex import figures as latex_figures
 from _system.schemas.paper_metadata import HtmlSource, PaperMetadata, PaperStatus
 from _system.utils.arxiv_urls import base_url_for_source, parse_arxiv_id
 from _system.utils.logging import get_logger
 from _system.utils.slug import generate_paper_name
+
+__all__ = ["fetch", "LATEX_SENTINEL_PREFIX"]
 
 _LOG = get_logger("scripts.fetch_paper")
 
@@ -565,6 +573,92 @@ def _persist(
             )
 
 
+@dataclass
+class _LatexFetchResult:
+    """Output of `_try_latex_fallback`: assembled LaTeX + processed figure rows."""
+
+    assembled_tex: str
+    processed_figures: list[_ProcessedFigure]
+
+
+def _latex_fallback_enabled(explicit: bool | None) -> bool:
+    """Resolve the latex-fallback toggle from kwarg → env → default-on."""
+    if explicit is not None:
+        return explicit
+    raw = os.environ.get("LODESTONE_LATEX_FALLBACK", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off", ""}
+
+
+def _try_latex_fallback(
+    client: httpx.Client, arxiv_id: str
+) -> _LatexFetchResult | None:
+    """Download the e-print, assemble main.tex, materialize raster figures.
+
+    Returns None on any unrecoverable step (no e-print, malformed tarball,
+    no `\\documentclass`, oversize payload). The walker is NOT run here —
+    convert_paper produces markdown. We only need raw figures and the
+    assembled tex string; the walker re-runs at convert-time.
+    """
+    fetched = latex_eprint.fetch_eprint(client, arxiv_id)
+    if fetched is None:
+        return None
+    blob, fmt = fetched
+    try:
+        with latex_eprint.extract_to_tempdir(blob, fmt) as tex_root:
+            main = latex_assemble.find_main_tex(tex_root)
+            if main is None:
+                _LOG.info(
+                    "e-print %s extracted but contains no \\documentclass file",
+                    arxiv_id,
+                )
+                return None
+            assembled = latex_assemble.assemble_source(main)
+            descriptors = latex_figures.discover_figures(assembled, tex_root)
+            processed: list[_ProcessedFigure] = []
+            for desc in descriptors:
+                pf = _process_latex_figure(desc)
+                if pf is not None:
+                    processed.append(pf)
+            return _LatexFetchResult(
+                assembled_tex=assembled, processed_figures=processed,
+            )
+    except (ValueError, OSError, tarfile.TarError) as exc:
+        _LOG.warning("latex fallback for %s failed during extraction: %s",
+                     arxiv_id, exc)
+        return None
+
+
+def _process_latex_figure(
+    desc: latex_figures.LatexFigureDescriptor,
+) -> _ProcessedFigure | None:
+    """Read raster bytes from disk and run them through the existing
+    downscale/re-encode pipeline used by the HTML path.
+
+    Figures with `local_path is None` (TikZ-only, PDF/EPS/SVG, missing
+    file) are not persisted — the walker emits a placeholder comment at
+    the right ordinal so the markdown still reads correctly. The figure
+    counter in markdown stays in sync because the walker counts
+    `\\begin{figure}` envs, not DB rows.
+    """
+    raw = latex_figures.read_figure_bytes(desc)
+    if raw is None:
+        return None
+    img_bytes, mime_hint = raw
+    processed = _process_figure_image(img_bytes, mime_hint)
+    if processed is None:
+        return None
+    out_bytes, mime = processed
+    return _ProcessedFigure(
+        figure_number=desc.figure_number,
+        display_number=desc.display_number,
+        figure_id=desc.figure_id,
+        caption=desc.caption,
+        section_context=desc.section_context,
+        image_bytes=out_bytes,
+        mime_type=mime,
+    )
+
+
 def fetch(
     *,
     conn: sqlite3.Connection,
@@ -573,6 +667,7 @@ def fetch(
     domain_override: str | None = None,
     client: httpx.Client | None = None,
     arxiv_lookup: Callable[[str], _ArxivMetadata] | None = None,
+    latex_fallback: bool | None = None,
 ) -> PaperMetadata:
     """Two-phase fetch of an arxiv paper. See module docstring for details.
 
@@ -603,6 +698,18 @@ def fetch(
         html_body, html_source = _fetch_html_body(client, arxiv_id)
 
         if html_body is None:
+            if _latex_fallback_enabled(latex_fallback):
+                latex_result = _try_latex_fallback(client, arxiv_id)
+                if latex_result is not None:
+                    return _persist_latex_fallback(
+                        conn,
+                        arxiv_id=arxiv_id,
+                        meta=meta,
+                        latex_result=latex_result,
+                        domain_override=domain_override,
+                        existing_row=existing_row,
+                        client=client,
+                    )
             return _persist_failed_html(
                 conn, arxiv_id, meta, domain_override, existing_row
             )
@@ -647,6 +754,58 @@ def fetch(
     finally:
         if owns_client:
             client.close()
+
+
+def _persist_latex_fallback(
+    conn: sqlite3.Connection,
+    *,
+    arxiv_id: str,
+    meta: _ArxivMetadata,
+    latex_result: _LatexFetchResult,
+    domain_override: str | None,
+    existing_row: PaperMetadata | None,
+    client: httpx.Client,
+) -> PaperMetadata:
+    """Persist a paper that succeeded via the LaTeX-source fallback.
+
+    The PDF is still downloaded for content-hash purposes (matches HTML
+    path semantics — paper identity is hash-anchored, not source-anchored).
+    Code-repo discovery skips the HTML body parse and goes straight to the
+    arxiv comment + PwC.
+    """
+    pdf_bytes = _download_pdf(client, arxiv_id)
+    content_hash = hashlib.sha256(pdf_bytes).hexdigest()
+    _log_soft_dedup(conn, content_hash, arxiv_id)
+
+    code_repo = _discover_code_repo(client, arxiv_id, "", meta)
+
+    paper_name, ingested_at = _resolve_slug_and_timestamp(
+        conn, meta, arxiv_id, existing_row,
+    )
+
+    pm = PaperMetadata(
+        arxiv_id=arxiv_id,
+        paper_name=paper_name,
+        title=meta.title,
+        authors=json.dumps(meta.authors),
+        date=meta.published,
+        abstract=meta.abstract,
+        pdf_url=meta.pdf_url,
+        domain=domain_override or (existing_row.domain if existing_row else None),
+        collection=existing_row.collection if existing_row else None,
+        status=PaperStatus.FETCHED,
+        markdown=None,
+        raw_html=LATEX_SENTINEL_PREFIX + latex_result.assembled_tex,
+        html_source=HtmlSource.LATEX_LOCAL,
+        content_hash=content_hash,
+        code_repo=code_repo,
+        # convert_paper sets needs_review based on walker skip counters;
+        # at fetch we don't know yet whether the markdown will be partial.
+        needs_review=False,
+        ingested_at=ingested_at,
+    )
+    _persist(conn, pm, latex_result.processed_figures)
+    return pm
 
 
 def _persist_failed_html(

@@ -11,6 +11,11 @@ from _system.schemas.paper_metadata import HtmlSource
 # resolution on ar5iv.
 _ARXIV_HTML_BASE = "https://arxiv.org/html/{arxiv_id}/"
 _AR5IV_HTML_BASE = "https://ar5iv.labs.arxiv.org/html/{arxiv_id}/"
+# Sentinel base URL for the LaTeX-source fallback. Never resolved over the
+# network — the LaTeX walker reads figures directly from the tarball at
+# fetch-time and inlines them into the DB, so urljoin() on this base never
+# happens. We still need *some* string to plug into the convert-stage signature.
+_LATEX_LOCAL_BASE = "local-latex://{arxiv_id}/"
 
 # Strict arxiv_id validators (anchored match, not search). Old-form
 # `cat/NNNNNNN[vN]` is still valid on arxiv for pre-2007 papers — accept
@@ -56,7 +61,11 @@ _URL_PREFIXES: tuple[str, ...] = (
 def base_url_for_source(source: HtmlSource, arxiv_id: str) -> str:
     if source is HtmlSource.ARXIV:
         return _ARXIV_HTML_BASE.format(arxiv_id=arxiv_id)
-    return _AR5IV_HTML_BASE.format(arxiv_id=arxiv_id)
+    if source is HtmlSource.AR5IV:
+        return _AR5IV_HTML_BASE.format(arxiv_id=arxiv_id)
+    if source is HtmlSource.LATEX_LOCAL:
+        return _LATEX_LOCAL_BASE.format(arxiv_id=arxiv_id)
+    raise ValueError(f"unknown HtmlSource: {source!r}")
 
 
 def parse_arxiv_id(raw: str) -> str:
