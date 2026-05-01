@@ -362,13 +362,13 @@ def test_user_agent_header_present_on_every_request(conn, fast_sleep):
 # ---------------------------------------------------------------------------
 
 
-def test_figure_downscaling_preserves_aspect_3000x2000_to_1920x1280():
+def test_figure_downscaling_preserves_aspect_3000x2000_to_1280():
     raw = _png_bytes(3000, 2000)
     out, mime = _process_figure_image(raw, "image/png")
     img = Image.open(io.BytesIO(out))
-    assert img.width == 1920
-    # Aspect ratio 3:2 → height should be 1280.
-    assert img.height == 1280
+    assert img.width == 1280
+    # Aspect ratio 3:2 → height should be ~853.
+    assert 852 <= img.height <= 854
 
 
 def test_figure_jpeg_reencoded_quality_85():
@@ -377,15 +377,41 @@ def test_figure_jpeg_reencoded_quality_85():
     assert mime == "image/jpeg"
     img = Image.open(io.BytesIO(out))
     assert img.format == "JPEG"
-    assert img.width == 1920
+    assert img.width == 1280
 
 
-def test_figure_png_preserved_when_not_downscaled():
+def test_figure_png_without_alpha_reencoded_as_jpeg():
     raw = _png_bytes(800, 600)
     out, mime = _process_figure_image(raw, "image/png")
-    # Under the 1920 cap → bytes returned unchanged.
-    assert out is raw or out == raw
+    assert mime == "image/jpeg"
+    img = Image.open(io.BytesIO(out))
+    assert img.format == "JPEG"
+    assert img.width == 800
+    assert img.height == 600
+
+
+def test_figure_png_with_real_alpha_kept_as_png():
+    rgba = Image.new("RGBA", (400, 300), color=(200, 50, 50, 128))
+    buf = io.BytesIO()
+    rgba.save(buf, format="PNG")
+    raw = buf.getvalue()
+    out, mime = _process_figure_image(raw, "image/png")
     assert mime == "image/png"
+    img = Image.open(io.BytesIO(out))
+    assert img.format == "PNG"
+    assert img.mode in ("RGBA", "LA", "P")
+
+
+def test_figure_rgba_with_opaque_alpha_treated_as_jpeg():
+    rgba = Image.new("RGBA", (400, 300), color=(200, 50, 50, 255))
+    buf = io.BytesIO()
+    rgba.save(buf, format="PNG")
+    raw = buf.getvalue()
+    out, mime = _process_figure_image(raw, "image/png")
+    assert mime == "image/jpeg"
+    img = Image.open(io.BytesIO(out))
+    assert img.format == "JPEG"
+    assert img.mode == "RGB"
 
 
 def test_data_uri_figure_persisted_without_any_network(conn, fast_sleep):

@@ -54,7 +54,7 @@ USER_AGENT = "Lodestone/1.0 (mailto:pierce.lamb@getwhys.io)"
 Image.MAX_IMAGE_PIXELS = 256 * 1024 * 1024
 
 _MAX_IMAGE_BYTES = 20 * 1024 * 1024
-_MAX_IMAGE_WIDTH = 1920
+_MAX_IMAGE_WIDTH = 1280
 _JPEG_QUALITY = 85
 _PWC_RATE_SLEEP_S = 1.0
 
@@ -251,9 +251,15 @@ def _download_figure(
 def _process_figure_image(
     raw_bytes: bytes, content_type_hint: str
 ) -> tuple[bytes, str] | None:
-    """Decode, optionally downscale to 1920 width (aspect preserved), re-encode
-    JPEG at quality=85 or preserve PNG. Returns (bytes, mime) or None on
-    decompression-bomb / decode error."""
+    """Decode, downscale to _MAX_IMAGE_WIDTH (aspect preserved), and re-encode
+    as JPEG q=_JPEG_QUALITY. Sources carrying an alpha channel stay PNG —
+    JPEG can't represent transparency. Returns (bytes, mime) or None on
+    decompression-bomb / decode error.
+
+    Re-encoding is unconditional: passing source PNGs through often leaves
+    photographic / schematic figures at 3-5x the JPEG-equivalent byte size
+    with no perceptible quality difference at our serving dimensions.
+    """
     try:
         img = Image.open(io.BytesIO(raw_bytes))
         img.load()
@@ -266,36 +272,29 @@ def _process_figure_image(
         _LOG.warning("figure decode failed, skipping (%s)", exc)
         return None
 
-    fmt = (img.format or "").upper()
-    resized = False
     if img.width > _MAX_IMAGE_WIDTH:
         # thumbnail() only downsamples; the huge height cap preserves
         # aspect ratio without ever upscaling.
         img.thumbnail((_MAX_IMAGE_WIDTH, 10_000_000), Image.LANCZOS)
-        resized = True
+
+    # Many arxiv figures arrive as RGBA with a fully-opaque alpha channel
+    # (matplotlib's default save mode). Treat that as "no real alpha" so it
+    # can re-encode to JPEG. Only keep PNG when transparency is actually
+    # used somewhere in the image.
+    if img.mode == "P" and "transparency" in img.info:
+        img = img.convert("RGBA")
+    if img.mode in ("RGBA", "LA"):
+        alpha = img.getchannel("A")
+        if alpha.getextrema()[0] < 255:
+            out = io.BytesIO()
+            img.save(out, format="PNG", optimize=True)
+            return out.getvalue(), "image/png"
 
     out = io.BytesIO()
-    if fmt == "JPEG" or "jpeg" in content_type_hint.lower():
-        if img.mode in ("RGBA", "P"):
-            img = img.convert("RGB")
-        img.save(out, format="JPEG", quality=_JPEG_QUALITY)
-        return out.getvalue(), "image/jpeg"
-
-    if fmt == "PNG" or "png" in content_type_hint.lower():
-        if resized:
-            img.save(out, format="PNG")
-            return out.getvalue(), "image/png"
-        return raw_bytes, "image/png"
-
-    # Fallback: preserve format via PIL save if possible, else PNG.
-    save_fmt = fmt or "PNG"
-    try:
-        img.save(out, format=save_fmt)
-        return out.getvalue(), f"image/{save_fmt.lower()}"
-    except (KeyError, OSError):
-        out = io.BytesIO()
-        img.save(out, format="PNG")
-        return out.getvalue(), "image/png"
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    img.save(out, format="JPEG", quality=_JPEG_QUALITY, optimize=True)
+    return out.getvalue(), "image/jpeg"
 
 
 def _resolve_figure_bytes(
