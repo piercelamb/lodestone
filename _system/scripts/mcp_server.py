@@ -29,6 +29,7 @@ import signal
 import sqlite3
 import sys
 import traceback
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -84,30 +85,25 @@ _DEFAULT_MAX_FIGURES_PER_RESPONSE = 8
 _FIGURE_REF_RE = re.compile(r"\(figure:(\d+)\)")
 
 
-def _max_figure_bytes() -> int:
-    raw = os.environ.get("LODESTONE_MAX_FIGURE_BYTES")
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
     if not raw:
-        return _DEFAULT_MAX_FIGURE_BYTES
+        return default
     try:
         v = int(raw)
-        if v > 0:
-            return v
     except ValueError:
-        pass
-    return _DEFAULT_MAX_FIGURE_BYTES
+        return default
+    return v if v > 0 else default
+
+
+def _max_figure_bytes() -> int:
+    return _env_positive_int("LODESTONE_MAX_FIGURE_BYTES", _DEFAULT_MAX_FIGURE_BYTES)
 
 
 def _max_figures_per_response() -> int:
-    raw = os.environ.get("LODESTONE_MAX_FIGURES_PER_RESPONSE")
-    if not raw:
-        return _DEFAULT_MAX_FIGURES_PER_RESPONSE
-    try:
-        v = int(raw)
-        if v > 0:
-            return v
-    except ValueError:
-        pass
-    return _DEFAULT_MAX_FIGURES_PER_RESPONSE
+    return _env_positive_int(
+        "LODESTONE_MAX_FIGURES_PER_RESPONSE", _DEFAULT_MAX_FIGURES_PER_RESPONSE
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -458,8 +454,14 @@ def _read_code_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
     )
 
 
-# Each entry: (name, description, inputSchema, dispatch_fn, attach_mode)
-# attach_mode ∈ {"scan", "figure", "none"} — controls which packer we use.
+class AttachMode(StrEnum):
+    """Controls which figure-attach packer wraps a tool's payload."""
+
+    SCAN = "scan"      # walk the payload for (figure:N) refs and inline them
+    FIGURE = "figure"  # payload is itself a single figure — fetch the BLOB
+    NONE = "none"      # text-only, no figure attachment
+
+
 TOOLS: list[dict[str, Any]] = [
     {
         "name": "bm25",
@@ -491,7 +493,7 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["query"],
         },
         "dispatch": _bm25_dispatch,
-        "attach": "scan",
+        "attach": AttachMode.SCAN,
     },
     {
         "name": "lookup",
@@ -514,7 +516,7 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["term", "kind"],
         },
         "dispatch": _lookup_dispatch,
-        "attach": "none",
+        "attach": AttachMode.NONE,
     },
     {
         "name": "browse",
@@ -546,7 +548,7 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["which"],
         },
         "dispatch": _browse_dispatch,
-        "attach": "none",
+        "attach": AttachMode.NONE,
     },
     {
         "name": "toc",
@@ -559,7 +561,7 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["paper_name"],
         },
         "dispatch": _toc_dispatch,
-        "attach": "none",
+        "attach": AttachMode.NONE,
     },
     {
         "name": "read",
@@ -583,7 +585,7 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["paper_name"],
         },
         "dispatch": _read_dispatch,
-        "attach": "scan",
+        "attach": AttachMode.SCAN,
     },
     {
         "name": "figure",
@@ -604,7 +606,7 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["paper", "n"],
         },
         "dispatch": _figure_dispatch,
-        "attach": "figure",
+        "attach": AttachMode.FIGURE,
     },
     {
         "name": "repo_tree",
@@ -618,7 +620,7 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["paper_name"],
         },
         "dispatch": _repo_tree_dispatch,
-        "attach": "none",
+        "attach": AttachMode.NONE,
     },
     {
         "name": "read_code",
@@ -639,25 +641,21 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["paper_name", "path"],
         },
         "dispatch": _read_code_dispatch,
-        "attach": "none",
+        "attach": AttachMode.NONE,
     },
 ]
 
 
-def _tool_index() -> dict[str, dict[str, Any]]:
-    return {t["name"]: t for t in TOOLS}
+_TOOL_INDEX: dict[str, dict[str, Any]] = {t["name"]: t for t in TOOLS}
 
-
-def _tools_list_payload() -> list[dict[str, Any]]:
-    """Project the registry into the spec's tools/list schema."""
-    return [
-        {
-            "name": t["name"],
-            "description": t["description"],
-            "inputSchema": t["inputSchema"],
-        }
-        for t in TOOLS
-    ]
+_TOOLS_LIST_PAYLOAD: list[dict[str, Any]] = [
+    {
+        "name": t["name"],
+        "description": t["description"],
+        "inputSchema": t["inputSchema"],
+    }
+    for t in TOOLS
+]
 
 
 # ---------------------------------------------------------------------------
@@ -738,7 +736,24 @@ def _handle_tools_list(msg: dict) -> dict:
     return {
         "jsonrpc": "2.0",
         "id": msg.get("id"),
-        "result": {"tools": _tools_list_payload()},
+        "result": {"tools": _TOOLS_LIST_PAYLOAD},
+    }
+
+
+def _tool_error(msg_id: Any, text: str) -> dict:
+    """Wrap a free-text error as a ``tools/call`` result with ``isError: true``.
+
+    Per spec, tool-level failures stay inside ``result`` (with ``isError``)
+    rather than becoming JSON-RPC errors — that's what the MCP client looks
+    at to decide whether to surface the failure to the model.
+    """
+    return {
+        "jsonrpc": "2.0",
+        "id": msg_id,
+        "result": {
+            "content": [{"type": "text", "text": text}],
+            "isError": True,
+        },
     }
 
 
@@ -751,35 +766,16 @@ def _handle_tools_call(state: _ServerState, msg: dict) -> dict:
     if not isinstance(name, str) or not name:
         return _err(msg_id, _ERR_INVALID_PARAMS, "tools/call requires 'name'")
 
-    tool = _tool_index().get(name)
+    tool = _TOOL_INDEX.get(name)
     if tool is None:
-        # Per spec, unknown tools surface as a tool error result rather than
-        # a JSON-RPC method-not-found error (the method 'tools/call' is
-        # known; the tool name is the parameter that's invalid).
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": {
-                "content": [{"type": "text", "text": f"unknown tool: {name}"}],
-                "isError": True,
-            },
-        }
+        return _tool_error(msg_id, f"unknown tool: {name}")
 
     if state.startup_error or state.conn is None:
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": {
-                "content": [{
-                    "type": "text",
-                    "text": (
-                        "lodestone-mcp startup error: "
-                        f"{state.startup_error or 'sqlite connection unavailable'}"
-                    ),
-                }],
-                "isError": True,
-            },
-        }
+        return _tool_error(
+            msg_id,
+            "lodestone-mcp startup error: "
+            f"{state.startup_error or 'sqlite connection unavailable'}",
+        )
 
     try:
         payload = tool["dispatch"](state.conn, args)
@@ -793,30 +789,16 @@ def _handle_tools_call(state: _ServerState, msg: dict) -> dict:
             f"missing required argument: {exc}",
         )
     except (TypeError, ValueError) as exc:
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": {
-                "content": [{"type": "text", "text": repr(exc)}],
-                "isError": True,
-            },
-        }
+        return _tool_error(msg_id, repr(exc))
     except Exception as exc:  # noqa: BLE001
         _log("error", f"tool '{name}' raised: {exc!r}")
         traceback.print_exc(file=sys.stderr)
-        return {
-            "jsonrpc": "2.0",
-            "id": msg_id,
-            "result": {
-                "content": [{"type": "text", "text": repr(exc)}],
-                "isError": True,
-            },
-        }
+        return _tool_error(msg_id, repr(exc))
 
     attach = tool["attach"]
-    if attach == "figure":
+    if attach is AttachMode.FIGURE:
         result = _figure_only_result(payload, state.conn)
-    elif attach == "scan":
+    elif attach is AttachMode.SCAN:
         result = _pack_result(payload, state.conn)
     else:
         result = _pack_result(payload, None)

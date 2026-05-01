@@ -26,7 +26,6 @@ from pathlib import Path
 import pytest
 
 from _system.scripts import mcp_server
-from _system.scripts.search import _SOFT_FAILURE_STATUSES  # noqa: F401
 
 # Re-use the seeded_db fixture and PNG constant from test_search by
 # importing the helpers. pytest will pick the fixture up via conftest
