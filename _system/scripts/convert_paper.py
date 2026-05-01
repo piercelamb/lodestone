@@ -3,11 +3,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
+from pathlib import Path
 from typing import NamedTuple
 
 from _system.db.connection import get_conn, transaction
 from _system.html import latexml_parser
+from _system.latex import LATEX_SENTINEL_PREFIX
+from _system.latex import figures as latex_figures
+from _system.latex import walker as latex_walker
 from _system.schemas.paper_metadata import HtmlSource, PaperStatus, can_run_from
 from _system.utils.arxiv_urls import base_url_for_source
 from _system.utils.logging import get_logger
@@ -87,9 +92,6 @@ def convert(
         raise ValueError(
             f"paper_name={paper_name!r}: unknown html_source={html_source_str!r}"
         ) from exc
-    base_url = base_url_for_source(source, arxiv_id)
-
-    parsed = latexml_parser.parse(raw_html, base_url)
 
     db_numbers = {
         r[0]
@@ -102,22 +104,35 @@ def convert(
             f"paper_name={paper_name!r}: papers.figure_count={figure_count} "
             f"disagrees with COUNT(figures)={len(db_numbers)}"
         )
-    # Only figures the parser flagged as fetch-eligible (had a usable src_url
-    # or inline data) should ever reach the DB. <figure> blocks with no <img>
-    # child surface as descriptors with both fields None and are dropped at
-    # fetch by design — excluding them here keeps the genuine "image 404 /
-    # decode failure during fetch" anomaly detectable without flagging
-    # structural placeholders that no re-fetch could resurrect.
-    fetchable = [
-        f for f in parsed.figures
-        if f.src_url is not None or f.inline_data is not None
-    ]
-    if len(fetchable) != len(db_numbers):
-        raise FigureCountMismatch(
-            f"paper_name={paper_name!r}: parser produced {len(fetchable)} "
-            f"fetchable figures but DB has {len(db_numbers)} (image likely "
-            f"404'd or failed to decode during fetch; re-fetch with --force)"
+
+    needs_review = False
+    if source is HtmlSource.LATEX_LOCAL:
+        markdown, references, figures_count, needs_review = _convert_latex(
+            raw_html, db_numbers, paper_name,
         )
+    else:
+        base_url = base_url_for_source(source, arxiv_id)
+        parsed = latexml_parser.parse(raw_html, base_url)
+        markdown = parsed.markdown
+        references = parsed.references
+        figures_count = len(parsed.figures)
+
+        # Only figures the parser flagged as fetch-eligible (had a usable src_url
+        # or inline data) should ever reach the DB. <figure> blocks with no <img>
+        # child surface as descriptors with both fields None and are dropped at
+        # fetch by design — excluding them here keeps the genuine "image 404 /
+        # decode failure during fetch" anomaly detectable without flagging
+        # structural placeholders that no re-fetch could resurrect.
+        fetchable = [
+            f for f in parsed.figures
+            if f.src_url is not None or f.inline_data is not None
+        ]
+        if len(fetchable) != len(db_numbers):
+            raise FigureCountMismatch(
+                f"paper_name={paper_name!r}: parser produced {len(fetchable)} "
+                f"fetchable figures but DB has {len(db_numbers)} (image likely "
+                f"404'd or failed to decode during fetch; re-fetch with --force)"
+            )
 
     with transaction(conn):
         conn.execute(
@@ -128,8 +143,13 @@ def convert(
                    status   = ?
              WHERE paper_name = ?
             """,
-            (parsed.markdown, PaperStatus.CONVERTED.value, paper_name),
+            (markdown, PaperStatus.CONVERTED.value, paper_name),
         )
+        if needs_review:
+            conn.execute(
+                "UPDATE papers SET needs_review = 1 WHERE id = ?",
+                (paper_id,),
+            )
         # Replace-all semantics on re-convert: the parser is the source of
         # truth for this paper's references. Drop everything we had stored
         # under paper_id and re-insert from the fresh parse. cited_paper_id
@@ -137,7 +157,7 @@ def convert(
         conn.execute(
             "DELETE FROM paper_references WHERE paper_id = ?", (paper_id,)
         )
-        if parsed.references:
+        if references:
             conn.executemany(
                 """
                 INSERT INTO paper_references (
@@ -146,7 +166,7 @@ def convert(
                 """,
                 [
                     (paper_id, r.bibitem_id, r.ref_number, r.raw_text, r.cited_arxiv_id)
-                    for r in parsed.references
+                    for r in references
                 ],
             )
         # Forward resolve: references this paper just inserted whose
@@ -195,21 +215,85 @@ def convert(
         paper_id,
         paper_name,
         source.value,
-        len(parsed.markdown),
-        len(parsed.figures),
-        len(parsed.references),
+        len(markdown),
+        figures_count,
+        len(references),
         forward_resolved,
         backward_resolved,
     )
     return ConvertResult(
         paper_name=paper_name,
         status=PaperStatus.CONVERTED.value,
-        markdown_chars=len(parsed.markdown),
-        figures=len(parsed.figures),
-        references=len(parsed.references),
+        markdown_chars=len(markdown),
+        figures=figures_count,
+        references=len(references),
         references_resolved_forward=forward_resolved,
         references_resolved_backward=backward_resolved,
     )
+
+
+_FIGURE_REF_RE = re.compile(r"\(figure:(\d+)\)")
+_LATEX_DISCOVERY_TEX_ROOT = Path("/nonexistent-convert-time")
+
+
+def _convert_latex(
+    raw_html: str,
+    db_numbers: set[int],
+    paper_name: str,
+) -> tuple[str, list, int, bool]:
+    """Run the LaTeX walker over the assembled .tex stored in raw_html.
+
+    Returns ``(markdown, references, figures_count, needs_review)``.
+    ``needs_review`` is True iff the walker reported any unknown macros,
+    unknown envs, or per-section failures — convert sets
+    ``papers.needs_review = 1`` so ``search.py --needs-review`` surfaces
+    partial conversions for human inspection.
+    """
+    if not raw_html.startswith(LATEX_SENTINEL_PREFIX):
+        raise RawHtmlMissing(
+            f"paper_name={paper_name!r}: html_source=latex_local but raw_html "
+            "does not start with the LaTeX sentinel; re-fetch with --force"
+        )
+    assembled_tex = raw_html[len(LATEX_SENTINEL_PREFIX):]
+
+    # Re-run discovery so the walker's `\begin{figure}` ordinal alignment
+    # matches fetch-time — captions for envs without DB rows (TikZ, PDF
+    # figures) come from this pass; raster bytes live in the DB. The
+    # bogus tex_root is fine: paths won't resolve, but we mark
+    # has_image from db_numbers below.
+    discovered = latex_figures.discover_figures(
+        assembled_tex, _LATEX_DISCOVERY_TEX_ROOT,
+    )
+    walker_figs = [
+        d._replace(has_image=d.figure_number in db_numbers)
+        for d in discovered
+    ]
+
+    result = latex_walker.tex_to_markdown(assembled_tex, walker_figs)
+
+    md_referenced = {int(m) for m in _FIGURE_REF_RE.findall(result.markdown)}
+    missing = db_numbers - md_referenced
+    if missing:
+        raise FigureCountMismatch(
+            f"paper_name={paper_name!r}: latex walker emitted markdown for "
+            f"{len(md_referenced)} figures but DB has rows for "
+            f"{sorted(db_numbers)}; missing refs for {sorted(missing)} "
+            "(re-fetch with --force)"
+        )
+
+    needs_review = bool(
+        result.skipped_macros or result.skipped_envs
+        or result.failed_sections or result.parse_errors
+    )
+    if needs_review:
+        _LOG.warning(
+            "paper_name=%s: latex walker partial conversion — "
+            "skipped_macros=%s skipped_envs=%s failed_sections=%s parse_errors=%d",
+            paper_name, result.skipped_macros, result.skipped_envs,
+            result.failed_sections, result.parse_errors,
+        )
+
+    return result.markdown, list(result.references), len(walker_figs), needs_review
 
 
 def _main(argv: list[str] | None = None) -> None:

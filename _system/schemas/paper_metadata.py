@@ -21,6 +21,7 @@ class PaperStatus(StrEnum):
 class HtmlSource(StrEnum):
     ARXIV = "arxiv"
     AR5IV = "ar5iv"
+    LATEX_LOCAL = "latex_local"
 
 
 STATUS_ORDER: dict[PaperStatus, int] = {
