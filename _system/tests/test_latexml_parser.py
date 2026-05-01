@@ -112,6 +112,91 @@ def test_missing_img_emits_placeholder_comment() -> None:
     assert fig.src_url is None and fig.inline_data is None
 
 
+def test_figure_with_table_body_renders_as_text_no_descriptor() -> None:
+    """A `<figure class='ltx_figure'>` with no <img> but a real `<table>`
+    inside (e.g. side-by-side multi-table layout) should render the table
+    as text and produce no FigureDescriptor — there's nothing for fetch
+    to download. The caption appears below the body in bold."""
+    html = (
+        '<html><body><figure class="ltx_figure" id="A2.3">'
+        '<div class="ltx_flex_figure">'
+        '<table class="ltx_tabular">'
+        '<tr><th>Method</th><th>GSM8K</th></tr>'
+        '<tr><td>IO</td><td>51</td></tr>'
+        '<tr><td>ToT</td><td>90</td></tr>'
+        '</table>'
+        '</div>'
+        '<figcaption>Table 4: New tasks with zero-shot ToT</figcaption>'
+        "</figure></body></html>"
+    )
+    paper = parse(html, base_url="https://example.com/")
+    # No descriptor — text-only figures aren't downloadable.
+    assert len(paper.figures) == 0
+    # Table content survives in markdown.
+    assert "Method" in paper.markdown
+    assert "GSM8K" in paper.markdown
+    assert "ToT" in paper.markdown
+    assert "90" in paper.markdown
+    # Caption is bolded below the body.
+    assert "**Table 4: New tasks with zero-shot ToT**" in paper.markdown
+    # No placeholder comment — we rendered actual content.
+    assert "no image in HTML" not in paper.markdown
+
+
+def test_text_only_figure_dedupes_latexml_caption_duplicates() -> None:
+    """LaTeXML bubbles `\\captionof{table}{...}` from a nested minipage up to
+    the host figure for float-number registration AND keeps it at the
+    original position, so the same caption text shows up twice as direct
+    figcaption children. The author wrote one caption — our markdown should
+    have one. Verified against the ToT paper (2305.10601) where the source
+    has 3 `\\captionof` calls but the HTML has 5 figcaption elements."""
+    html = (
+        '<html><body><figure class="ltx_figure" id="X1">'
+        # bubble: top copy of caption A
+        '<figcaption>Table 4: New tasks</figcaption>'
+        # bubble: top copy of caption B
+        '<figcaption>Table 5: Game of 24</figcaption>'
+        '<table class="ltx_tabular"><tr><td>x</td></tr></table>'
+        # in-place: caption A again, caption B again, caption C
+        '<figcaption>Table 4: New tasks</figcaption>'
+        '<figcaption>Table 5: Game of 24</figcaption>'
+        '<figcaption>Table 6: Creative Writing</figcaption>'
+        "</figure></body></html>"
+    )
+    paper = parse(html, base_url="https://example.com/")
+    assert paper.markdown.count("**Table 4: New tasks**") == 1
+    assert paper.markdown.count("**Table 5: Game of 24**") == 1
+    assert paper.markdown.count("**Table 6: Creative Writing**") == 1
+
+
+def test_text_only_figure_does_not_consume_a_figure_number() -> None:
+    """Text-only figures must not bump the figure counter — image-bearing
+    figures around them must still get contiguous numbers (1, 2, ...) so
+    the markdown's `figure:N` refs line up with DB row figure_numbers."""
+    html = (
+        '<html><body>'
+        # Image-bearing figure → figure:1
+        '<figure class="ltx_figure" id="F1">'
+        '<img src="a.png"><figcaption>Figure 1: First</figcaption>'
+        "</figure>"
+        # Text-only figure → no number consumed
+        '<figure class="ltx_figure" id="A1">'
+        '<table class="ltx_tabular"><tr><td>x</td></tr></table>'
+        '<figcaption>Inline table</figcaption>'
+        "</figure>"
+        # Image-bearing figure → figure:2 (not figure:3)
+        '<figure class="ltx_figure" id="F2">'
+        '<img src="b.png"><figcaption>Figure 2: Second</figcaption>'
+        "</figure>"
+        '</body></html>'
+    )
+    paper = parse(html, base_url="https://example.com/")
+    assert [f.figure_number for f in paper.figures] == [1, 2]
+    assert "(figure:1)" in paper.markdown
+    assert "(figure:2)" in paper.markdown
+    assert "(figure:3)" not in paper.markdown
+
+
 def test_data_uri_figure_decodes_inline_bytes() -> None:
     """<img src='data:image/png;base64,...'> -> inline_data set, src_url None."""
     payload = base64.b64encode(b"hello-bytes").decode()

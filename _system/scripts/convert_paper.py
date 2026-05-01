@@ -102,14 +102,21 @@ def convert(
             f"paper_name={paper_name!r}: papers.figure_count={figure_count} "
             f"disagrees with COUNT(figures)={len(db_numbers)}"
         )
-    # papers.figure_count is fetch's successfully-stored count; any drop
-    # (image 404, placeholder) makes this disagree with the re-parse and
-    # requires a --force re-fetch.
-    if len(parsed.figures) != len(db_numbers):
+    # Only figures the parser flagged as fetch-eligible (had a usable src_url
+    # or inline data) should ever reach the DB. <figure> blocks with no <img>
+    # child surface as descriptors with both fields None and are dropped at
+    # fetch by design — excluding them here keeps the genuine "image 404 /
+    # decode failure during fetch" anomaly detectable without flagging
+    # structural placeholders that no re-fetch could resurrect.
+    fetchable = [
+        f for f in parsed.figures
+        if f.src_url is not None or f.inline_data is not None
+    ]
+    if len(fetchable) != len(db_numbers):
         raise FigureCountMismatch(
-            f"paper_name={paper_name!r}: parser produced {len(parsed.figures)} "
-            f"figures but DB has {len(db_numbers)} (figure was likely dropped "
-            f"during fetch; re-fetch with --force)"
+            f"paper_name={paper_name!r}: parser produced {len(fetchable)} "
+            f"fetchable figures but DB has {len(db_numbers)} (image likely "
+            f"404'd or failed to decode during fetch; re-fetch with --force)"
         )
 
     with transaction(conn):

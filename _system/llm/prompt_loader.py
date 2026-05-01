@@ -47,14 +47,22 @@ class LoadedPrompt(NamedTuple):
 def _substitute_markdown(
     text: str, md_context: dict[str, str], *, path: Path
 ) -> str:
+    # Validate against the template, not the substituted output. After
+    # substitution, an `{ALL_CAPS}` token in the result could be either an
+    # unfilled slot OR user-supplied content (LaTeX subscripts like `{IO}`,
+    # bibliographic `{ICML}` tokens, etc.) — and we can't tell them apart
+    # post-hoc. Checking pre-substitution makes the rule unambiguous: every
+    # placeholder the template declares must be backed by a context entry.
+    declared = set(_UNSUB_MD_PLACEHOLDER_RE.findall(text))
+    provided = {"{" + key + "}" for key in md_context}
+    missing = sorted(declared - provided)
+    if missing:
+        raise PromptPlaceholderError(
+            f"unresolved placeholder {missing[0]!r} in {path}"
+        )
     out = text
     for key, value in md_context.items():
         out = out.replace("{" + key + "}", str(value))
-    leftover = _UNSUB_MD_PLACEHOLDER_RE.search(out)
-    if leftover is not None:
-        raise PromptPlaceholderError(
-            f"unresolved placeholder {leftover.group(0)!r} in {path}"
-        )
     return out
 
 

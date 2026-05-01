@@ -163,6 +163,39 @@ def test_figure_count_mismatch_on_db_inconsistency_raises(conn):
         convert(paper_name="paper_name_2023", conn=conn)
 
 
+_FIGURE_WITH_PLACEHOLDER_HTML = """<!doctype html>
+<html><body>
+<section class="ltx_section" id="S1">
+  <h2 class="ltx_title ltx_title_section"><span class="ltx_tag">1.</span> Method</h2>
+  <p>Method prose.</p>
+  <figure class="ltx_figure" id="S1.F1">
+    <img src="fig1.png"/>
+    <figcaption class="ltx_caption"><span class="ltx_tag">Figure 1.</span> Overview</figcaption>
+  </figure>
+  <figure class="ltx_figure" id="S1.F2">
+    <figcaption class="ltx_caption"><span class="ltx_tag">Figure 2.</span> Sub-panel wrapper, no img</figcaption>
+  </figure>
+</section>
+</body></html>
+"""
+
+
+def test_placeholder_figure_does_not_count_against_db(conn):
+    """A <figure> with no <img> child is dropped at fetch by design; convert
+    must not count it as a fetch-time anomaly."""
+    _seed(conn, raw_html=_FIGURE_WITH_PLACEHOLDER_HTML, figure_count=1)
+    paper_id = conn.execute(
+        "SELECT id FROM papers WHERE paper_name = ?", ("paper_name_2023",)
+    ).fetchone()[0]
+    conn.execute(
+        "DELETE FROM figures WHERE paper_id = ? AND figure_number = 2", (paper_id,)
+    )
+    # Should NOT raise — parser produces 2 figures total but only 1 is
+    # fetch-eligible (Figure 2 is a placeholder), matching DB count of 1.
+    result = convert(paper_name="paper_name_2023", conn=conn)
+    assert result.figures == 2  # parsed.figures still counts placeholders for markdown
+
+
 def test_status_failed_html_blocks_convert(conn):
     _seed(conn, status=PaperStatus.FAILED_HTML.value, raw_html=None)
     with pytest.raises(StageNotAllowed) as exc_info:

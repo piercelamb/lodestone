@@ -100,6 +100,27 @@ def test_latex_bare_braces_in_body_do_not_trip_loader(prompts_root):
     assert "{alpha}" in loaded.user
 
 
+def test_all_caps_token_in_substituted_content_does_not_raise(prompts_root):
+    """Real papers contain LaTeX subscripts (`prompt_{IO}`, `p^{IO}`) and
+    bibliographic tokens (`{ICML}`, `{ACL}`) that survive into the markdown.
+    Once substituted into `{PAPER_CONTENT}`, those should not be re-flagged
+    as unresolved placeholders — the leftover check must operate on the
+    template, not the substituted result."""
+    paper_with_caps_token = (
+        "Standard input-output prompting formulates the task as "
+        "$p_\\theta(y|\\texttt{prompt}_{IO}(x))$ where ..."
+    )
+    _write_prompt_set(
+        prompts_root / "iocase",
+        user="paper: {PAPER_CONTENT}",
+    )
+    loaded = load_prompt(
+        "iocase", md_context={"PAPER_CONTENT": paper_with_caps_token}
+    )
+    assert "{IO}" in loaded.user
+    assert "{PAPER_CONTENT}" not in loaded.user
+
+
 def test_missing_prompt_dir_raises_file_not_found(prompts_root):
     with pytest.raises(FileNotFoundError):
         load_prompt("does_not_exist")

@@ -265,14 +265,27 @@ def _extract_title_text(title_elem) -> str:
 
 
 def _convert_figure(elem, state: _State) -> str:
+    img = elem.find(".//img")
+    src = (img.get("src") or "") if img is not None else ""
+
+    # When the figure has no usable image source, try to render its interior
+    # content as text before falling back to a placeholder. LaTeX's
+    # ``\begin{figure}`` is sometimes used purely for layout (side-by-side
+    # algorithm pseudocode, multi-table grids) — those have no <img>, but
+    # they have real content the reader needs. We do this before the
+    # counter bump so text-only "figures" don't consume figure numbers
+    # (and the markdown's `figure:N` refs stay contiguous with the DB
+    # rows fetch will create).
+    if not src:
+        text_render = _render_figure_as_text(elem, state)
+        if text_render is not None:
+            return text_render
+
     state.figure_counter += 1
     fig_num = state.figure_counter
     figure_id = elem.get("id") or ""
     caption = _figure_caption(elem)
     display_number = _parse_display_number(caption)
-
-    img = elem.find(".//img")
-    src = (img.get("src") or "") if img is not None else ""
 
     section_context = " > ".join(t for t in state.section_stack if t)
 
@@ -379,6 +392,47 @@ def _parse_display_number(caption: str) -> Optional[str]:
     if not m:
         return None
     return m.group(1)
+
+
+def _render_figure_as_text(elem, state: _State) -> Optional[str]:
+    """Render a `<figure class='ltx_figure'>` with no image as text.
+
+    Walks non-caption children with the standard converter so nested tables,
+    algorithm listings, and prose come through as text. Captions are bolded
+    and appended below the body to match `_convert_table_figure`'s layout.
+
+    Returns ``None`` when the figure has no substantive non-caption content
+    — caller falls back to emitting the placeholder comment + descriptor so
+    the position is at least marked. Stripping `<img>` children avoids the
+    placeholder's empty-src element bleeding into the rendered text.
+    """
+    captions: list[str] = []
+    seen_captions: set[str] = set()
+    body_parts: list[str] = []
+    for child in elem:
+        if not isinstance(child.tag, str):
+            continue
+        if child.tag == "figcaption":
+            text = _normalize_ws(child.text_content())
+            # LaTeXML emits the same caption text twice when a `\captionof`
+            # inside a nested minipage is also bubbled to the host figure
+            # for float-number registration (see ToT 2305.10601 §A.2: source
+            # has 3 captions, HTML has 5). Dedup on normalized caption text
+            # since the author can't write two identical figcaptions in one
+            # block — a true match is always upstream noise.
+            if text and text not in seen_captions:
+                captions.append(text)
+                seen_captions.add(text)
+            continue
+        if child.tag == "img":
+            continue
+        body_parts.append(_convert(child, state))
+    body = "".join(body_parts).strip()
+    if not body:
+        return None
+    pieces = [body]
+    pieces.extend(f"**{c}**" for c in captions)
+    return "\n\n" + "\n\n".join(pieces) + "\n\n"
 
 
 def _convert_table_figure(elem, state: _State) -> str:
