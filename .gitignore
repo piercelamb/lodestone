@@ -14,3 +14,7 @@ lodestone.db-*
 
 # Smoke-test artifacts
 /tmp/lodestone_*.db
+
+# Claude Code per-user state
+.claude/settings.local.json
+.claude/scheduled_tasks.lock

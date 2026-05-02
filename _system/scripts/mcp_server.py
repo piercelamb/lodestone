@@ -7,7 +7,7 @@ content blocks for any ``(figure:N)`` markdown refs the response carries.
 
 Tools registered (all surface as ``mcp__lodestone__<name>`` in Claude Code):
 
-    bm25, lookup, browse, toc, read, figure, repo_tree, read_code
+    search, bm25, lookup, browse, toc, read, figure, repo_tree, read_code
 
 Transport notes (per spec §Transports):
 
@@ -37,12 +37,15 @@ from _system.db.connection import get_conn
 from _system.scripts.search import (
     Scope,
     _SOFT_FAILURE_STATUSES,
+    format_search_markdown,
     mode_bm25,
     mode_browse,
     mode_figure,
     mode_read,
     mode_read_code,
     mode_repo_tree,
+    mode_search,
+    mode_search_multi,
     mode_taxonomy_lookup,
     mode_toc,
 )
@@ -334,15 +337,25 @@ def _finalize_result(blocks: list[dict], payload: dict) -> dict:
     }
 
 
-def _pack_result(payload: dict, conn: sqlite3.Connection | None) -> dict:
+def _pack_result(
+    payload: dict,
+    conn: sqlite3.Connection | None,
+    *,
+    text_format: Any = None,
+) -> dict:
     """Build the ``tools/call`` result envelope from a mode_* payload.
 
-    Always emits a JSON text block + ``structuredContent``. Appends labeled
-    image blocks for any ``(figure:N)`` refs the payload carries when a
-    sqlite connection is available. Soft-failure statuses pass through as
-    ``isError: false``.
+    Emits a single text block (markdown if the tool supplied a
+    ``text_format`` callable, otherwise the raw JSON dump) plus
+    ``structuredContent`` carrying the full JSON shape for callers that
+    want it. Appends labeled image blocks for any ``(figure:N)`` refs the
+    payload carries when a sqlite connection is available. Soft-failure
+    statuses pass through as ``isError: false``.
     """
-    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    if text_format is not None:
+        text = text_format(payload)
+    else:
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
     blocks: list[dict] = [{"type": "text", "text": text}]
 
     if conn is not None:
@@ -406,6 +419,22 @@ def _bm25_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
     )
 
 
+def _search_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
+    query = args["query"]
+    limit = int(args.get("limit", 5))
+    filters: dict[str, Any] = (
+        {"domain": args["domain"]} if args.get("domain") else {}
+    )
+    if isinstance(query, list):
+        return mode_search_multi(
+            conn,
+            queries=[str(q) for q in query],
+            filters=filters,
+            limit=limit,
+        )
+    return mode_search(conn, query=query, filters=filters, limit=limit)
+
+
 def _lookup_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
     return mode_taxonomy_lookup(
         conn,
@@ -464,6 +493,83 @@ class AttachMode(StrEnum):
 
 TOOLS: list[dict[str, Any]] = [
     {
+        "name": "search",
+        "description": (
+            "First-pass exploratory search across the lodestone corpus. "
+            "Returns three buckets in one call: (1) taxonomy — canonical "
+            "term hits across entity/topic/collection mixed, each tagged "
+            "with its kind; (2) sections — BM25 hits over paper section "
+            "text; (3) readmes — BM25 hits over paper-anchored code-repo "
+            "READMEs. Use this FIRST when you don't yet know what's in the "
+            "corpus; then drill in with 'lookup', 'read'/'toc', or 'bm25'. "
+            "No images — keep this cheap for orientation.\n\n"
+            "Query syntax (GitHub-code-search subset; not regex):\n"
+            "  - bare words = implicit AND, punctuation auto-defanged\n"
+            "    so 'tree-sitter' searches the literal phrase, not 'tree NOT sitter'\n"
+            "  - \"chain of thought\" = exact phrase\n"
+            "  - reasoning OR planning = alternation (uppercase operators)\n"
+            "  - reasoning NOT supervised = exclusion\n"
+            "  - (monte carlo) tree* = grouping + prefix\n"
+            "  - paper:NAME, domain:NAME, collection:NAME = metadata filter\n"
+            "  - surface:sections|readmes|taxonomy = only that bucket\n"
+            "    surface:both = sections + readmes (legacy alias, no taxonomy)\n"
+            "    omitted = all three buckets\n"
+            "  - kind:entity|topic|collection = narrow taxonomy bucket\n"
+            "  - /regex/ is NOT supported (FTS5 is token-based)\n"
+            "Examples:\n"
+            "  'chain of thought' OR reasoning\n"
+            "  paper:treeofthoughts_2023 deliberate\n"
+            "  tree* NOT supervised\n"
+            "  kind:entity reasoning\n"
+            "  surface:readmes embedding\n\n"
+            "Multi-query: pass an array of up to 8 query strings as "
+            "'query' to fan out independent searches in one call. Each "
+            "query is parsed and executed on its own (own qualifiers, own "
+            "operators, own soft-failure status); results are concatenated "
+            "in one response under per-query H2 sections. Use this when "
+            "you want to orient across several disjoint angles at once "
+            "without paying multiple round-trips:\n"
+            "  query=[\"chain of thought\", \"tree of thoughts\", "
+            "\"self-consistency\"]\n"
+            "Per-query 'limit' is shared across the fan-out — keep it "
+            "small (default 5)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": 8,
+                        },
+                    ],
+                    "description": (
+                        "Free-text query, OR an array of 1-8 query "
+                        "strings. Each string in an array is parsed and "
+                        "executed independently; results are concatenated "
+                        "in one response."
+                    ),
+                },
+                "domain": {"type": "string"},
+                "limit": {
+                    "type": "integer",
+                    "default": 5,
+                    "minimum": 1,
+                    "maximum": 20,
+                    "description": "Max rows per bucket (default 5).",
+                },
+            },
+            "required": ["query"],
+        },
+        "dispatch": _search_dispatch,
+        "attach": AttachMode.NONE,
+        "text_format": format_search_markdown,
+    },
+    {
         "name": "bm25",
         "description": (
             "BM25 text search across the lodestone corpus. Returns hits "
@@ -471,7 +577,23 @@ TOOLS: list[dict[str, Any]] = [
             "counts. Snippets are short windows; any (figure:N) refs that "
             "land inside a snippet are appended as inline image content "
             "blocks following the JSON, each preceded by a "
-            "'--- paper_id=X figure=N caption=... ---' text marker."
+            "'--- paper_id=X figure=N caption=... ---' text marker.\n\n"
+            "Query syntax (GitHub-code-search subset; not regex):\n"
+            "  - bare words = implicit AND, punctuation auto-defanged\n"
+            "    so 'tree-sitter' searches the literal phrase\n"
+            "  - \"exact phrase\" = phrase query\n"
+            "  - a OR b, a NOT b = alternation / exclusion (uppercase ops)\n"
+            "  - (group) and term* = parens + prefix\n"
+            "  - paper:NAME, domain:NAME, collection:NAME = metadata filter\n"
+            "  - surface:sections|readmes|both = pick the surface\n"
+            "    (overrides/agrees with the 'scope' kwarg)\n"
+            "  - kind: NOT supported here — use 'search' for the taxonomy bucket\n"
+            "  - /regex/ is NOT supported\n"
+            "Examples:\n"
+            "  paper:bookrag_2024 indexing\n"
+            "  \"hierarchical retrieval\" OR HiRe\n"
+            "  tree* NOT supervised\n"
+            "  surface:readmes embedding"
         ),
         "inputSchema": {
             "type": "object",
@@ -796,12 +918,13 @@ def _handle_tools_call(state: _ServerState, msg: dict) -> dict:
         return _tool_error(msg_id, repr(exc))
 
     attach = tool["attach"]
+    text_format = tool.get("text_format")
     if attach is AttachMode.FIGURE:
         result = _figure_only_result(payload, state.conn)
     elif attach is AttachMode.SCAN:
-        result = _pack_result(payload, state.conn)
+        result = _pack_result(payload, state.conn, text_format=text_format)
     else:
-        result = _pack_result(payload, None)
+        result = _pack_result(payload, None, text_format=text_format)
 
     # Soft-failure payloads pass through as normal results (isError stays
     # false). The structured content carries the diagnostic.

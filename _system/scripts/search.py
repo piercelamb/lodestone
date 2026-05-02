@@ -36,6 +36,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -86,8 +87,13 @@ class Scope(StrEnum):
 
 
 # ---------------------------------------------------------------------------
-# Mode 1 — BM25
+# GitHub-code-search-style query parser
 # ---------------------------------------------------------------------------
+# Surface: bare tokens (implicit AND, each defanged into a phrase so
+# ``-``/``/``/``:`` don't escape into operator syntax), ``"phrase"``,
+# ``AND``/``OR``/``NOT`` (uppercase), parens, ``term*`` prefix, and
+# ``key:value`` qualifiers (``paper`` / ``domain`` / ``collection`` /
+# ``surface`` / ``kind``). ``/regex/`` is rejected — FTS5 is token-based.
 
 
 # Matches a single Unicode word character — used to drop tokens that hold no
@@ -95,37 +101,391 @@ class Scope(StrEnum):
 # wrap. Without this filter, FTS5 raises a syntax error on the empty phrase.
 _FTS5_TOKEN_HAS_WORD_CHAR = re.compile(r"\w", re.UNICODE)
 
+# A qualifier key prefix at the current scan position, e.g. ``paper:`` /
+# ``domain:``. Only lowercase + underscore — uppercase ``BAAI/bge-small`` is
+# never a qualifier, matching GitHub.
+_QUALIFIER_KEY_RE = re.compile(r"[a-z_]+")
 
-class FTS5QueryError(ValueError):
-    """The user's BM25 query has no searchable tokens after sanitization."""
+_OPERATORS: frozenset[str] = frozenset({"AND", "OR", "NOT"})
+
+_SUPPORTED_QUALIFIERS: frozenset[str] = frozenset(
+    {"paper", "domain", "collection", "surface", "kind"}
+)
+
+_VALID_KIND_VALUES: frozenset[str] = frozenset({"entity", "topic", "collection"})
+_VALID_SURFACE_VALUES: frozenset[str] = frozenset(
+    {"sections", "readmes", "both", "taxonomy"}
+)
 
 
-def _sanitize_fts5_match(query: str) -> str:
-    """Wrap each whitespace-delimited token in double quotes for safe MATCH.
+class GitHubQueryError(ValueError):
+    """Base for parser-rejected queries — caller surfaces as soft-fail."""
 
-    The FTS5 query parser treats ``-``, ``+``, ``:``, ``(``, ``)``, ``*`` as
-    syntactic operators, so a bare ``tree-sitter`` parses as ``tree NOT sitter``
-    with ``sitter`` read as a column name (the failure mode that motivated this
-    helper). Wrapping each token in ``"..."`` reduces it to a phrase query
-    whose contents are tokenized but never reinterpreted as operators —
-    ``"tree-sitter"`` becomes a 2-token phrase requiring ``tree`` adjacent to
-    ``sitter``.
 
-    Internal ``"`` characters are escaped by doubling. Tokens that carry no
-    word characters (e.g. a stray ``--``) are dropped; if every token drops
-    out, raises :class:`FTS5QueryError` so the caller can surface a clean
-    error instead of a SQLite syntax exception.
+class EmptyQueryError(GitHubQueryError):
+    """Query has no searchable tokens (whitespace-only, punctuation-only,
+    or qualifiers-only on a surface that requires text)."""
+
+
+class UnclosedQuoteError(GitHubQueryError):
+    """Odd number of unescaped ``"`` characters."""
+
+
+class UnmatchedParenError(GitHubQueryError):
+    """``(`` / ``)`` mismatch."""
+
+
+class DanglingOperatorError(GitHubQueryError):
+    """``AND`` / ``OR`` / ``NOT`` at the start, end, or adjacent to another."""
+
+
+class RegexNotSupportedError(GitHubQueryError):
+    """``/.../`` regex form — not supported."""
+
+
+class UnknownQualifierError(GitHubQueryError):
+    """Qualifier key not in :data:`_SUPPORTED_QUALIFIERS`."""
+
+
+class InvalidQualifierValueError(GitHubQueryError):
+    """``kind:`` or ``surface:`` value outside its allowed set, or a
+    qualifier key with no value attached."""
+
+
+class ConflictingFilterError(GitHubQueryError):
+    """Same qualifier supplied twice in one query, or qualifier value
+    conflicts with the kwarg-supplied value at the dispatch boundary."""
+
+
+@dataclass(frozen=True)
+class ParsedQuery:
+    """Result of :func:`_parse_github_query`.
+
+    ``fts_expression`` is a valid FTS5 MATCH input (or ``""`` if the query
+    held only qualifiers). ``qualifiers`` is the extracted ``key:value`` map;
+    each key appears at most once (duplicates raise
+    :class:`ConflictingFilterError`).
     """
-    parts: list[str] = []
-    for tok in query.split():
-        if not _FTS5_TOKEN_HAS_WORD_CHAR.search(tok):
+
+    fts_expression: str
+    qualifiers: dict[str, str] = field(default_factory=dict)
+
+
+def _read_quoted(query: str, i: int) -> tuple[str, int]:
+    """Lex a ``"..."`` phrase starting at ``query[i] == '"'``.
+
+    Returns ``(unescaped_phrase, end_index)`` where ``end_index`` is the
+    position past the closing quote. Honors ``\\"`` and ``\\\\``. Raises
+    :class:`UnclosedQuoteError` if no closing quote is found.
+    """
+    assert query[i] == '"'
+    n = len(query)
+    j = i + 1
+    buf: list[str] = []
+    while j < n:
+        c = query[j]
+        if c == "\\" and j + 1 < n and query[j + 1] in ('"', "\\"):
+            buf.append(query[j + 1])
+            j += 2
             continue
-        parts.append('"' + tok.replace('"', '""') + '"')
-    if not parts:
-        raise FTS5QueryError(
-            f"query has no searchable tokens after sanitization: {query!r}"
+        if c == '"':
+            return "".join(buf), j + 1
+        buf.append(c)
+        j += 1
+    raise UnclosedQuoteError(
+        f"unclosed quote in query: {query!r}"
+    )
+
+
+def _validate_operator_placement(tokens: list[str], *, raw: str) -> None:
+    """Reject leading/trailing/adjacent operators and dangling parens.
+
+    Walks tokens with an "expects-operand" / "expects-operator" state
+    machine. Operands are everything that isn't ``AND``/``OR``/``NOT`` or a
+    paren. ``(`` resets to expects-operand; ``)`` requires expects-operator.
+    Paren matching is already validated by :func:`_parse_github_query`.
+    """
+    expects_operand = True
+    saw_operand = False
+    for tok in tokens:
+        if tok == "(":
+            if not expects_operand:
+                raise DanglingOperatorError(
+                    f"missing operator before '(' in query: {raw!r}"
+                )
+            expects_operand = True
+            continue
+        if tok == ")":
+            if expects_operand:
+                raise DanglingOperatorError(
+                    f"empty group or operator before ')' in query: {raw!r}"
+                )
+            expects_operand = False
+            continue
+        if tok in _OPERATORS:
+            if expects_operand:
+                raise DanglingOperatorError(
+                    f"operator {tok!r} with no left-hand operand in query: {raw!r}"
+                )
+            expects_operand = True
+            continue
+        saw_operand = True
+        if not expects_operand:
+            continue
+        expects_operand = False
+    if expects_operand and saw_operand:
+        raise DanglingOperatorError(
+            f"trailing operator in query: {raw!r}"
         )
-    return " ".join(parts)
+
+
+def _classify_bare_token(run: str) -> str | None:
+    """Convert a bare run into its FTS5-token form.
+
+    Returns ``None`` to signal the run held no word characters and should
+    be dropped (matches the legacy ``_sanitize_fts5_match`` defang
+    behavior for stray punctuation like ``---``).
+    """
+    if not _FTS5_TOKEN_HAS_WORD_CHAR.search(run):
+        return None
+    if len(run) > 1 and run.endswith("*") and _FTS5_TOKEN_HAS_WORD_CHAR.search(run[:-1]):
+        stem = run[:-1]
+        return '"' + stem.replace('"', '""') + '"*'
+    return '"' + run.replace('"', '""') + '"'
+
+
+def _collect_qualifier(
+    qualifiers: dict[str, str], key: str, value: str
+) -> None:
+    """Validate ``key`` / ``value`` and store. Raises typed errors on the
+    fast path so the dispatch layer can convert them to soft-fails."""
+    if key not in _SUPPORTED_QUALIFIERS:
+        raise UnknownQualifierError(
+            f"unknown qualifier {key!r}; supported: "
+            f"{', '.join(sorted(_SUPPORTED_QUALIFIERS))}"
+        )
+    if not value:
+        raise InvalidQualifierValueError(
+            f"qualifier {key!r} has no value"
+        )
+    if key == "kind" and value not in _VALID_KIND_VALUES:
+        raise InvalidQualifierValueError(
+            f"kind:{value!r} not allowed; expected one of "
+            f"{sorted(_VALID_KIND_VALUES)}"
+        )
+    if key == "surface" and value not in _VALID_SURFACE_VALUES:
+        raise InvalidQualifierValueError(
+            f"surface:{value!r} not allowed; expected one of "
+            f"{sorted(_VALID_SURFACE_VALUES)}"
+        )
+    if key in qualifiers and qualifiers[key] != value:
+        raise ConflictingFilterError(
+            f"qualifier {key!r} given twice with conflicting values: "
+            f"{qualifiers[key]!r} vs {value!r}"
+        )
+    qualifiers[key] = value
+
+
+def _parse_github_query(query: str) -> ParsedQuery:
+    """Parse a GitHub-code-search-style query into an FTS5 expression +
+    qualifier map.
+
+    Single-pass character scanner. Recognized tokens (in priority order):
+
+      1. whitespace — separator
+      2. ``(`` / ``)`` — paren tokens
+      3. ``"..."`` — exact phrase (escapes ``\\"`` ``\\\\``)
+      4. ``key:value`` or ``key:"quoted"`` — qualifier (key matches ``[a-z_]+``)
+      5. ``AND`` / ``OR`` / ``NOT`` exact bare runs — operator passthrough
+      6. ``/regex/`` bare runs — rejected (out of scope for FTS5)
+      7. anything else — bare token; defanged into a phrase, with a
+         trailing ``*`` lifted as an FTS5 prefix marker
+    """
+    if not query or not query.strip():
+        raise EmptyQueryError(f"empty query: {query!r}")
+
+    tokens: list[str] = []
+    qualifiers: dict[str, str] = {}
+
+    n = len(query)
+    i = 0
+    paren_depth = 0
+
+    while i < n:
+        c = query[i]
+        if c.isspace():
+            i += 1
+            continue
+
+        if c == "(":
+            tokens.append("(")
+            paren_depth += 1
+            i += 1
+            continue
+
+        if c == ")":
+            if paren_depth == 0:
+                raise UnmatchedParenError(
+                    f"unmatched ')' in query: {query!r}"
+                )
+            tokens.append(")")
+            paren_depth -= 1
+            i += 1
+            continue
+
+        if c == '"':
+            phrase, end = _read_quoted(query, i)
+            if not phrase:
+                # `""` empty phrase — drop, no FTS token
+                i = end
+                continue
+            tokens.append('"' + phrase.replace('"', '""') + '"')
+            i = end
+            continue
+
+        # Qualifier? key matches [a-z_]+ followed immediately by ':'.
+        m = _QUALIFIER_KEY_RE.match(query, i)
+        if m and m.end() < n and query[m.end()] == ":":
+            key = m.group(0)
+            j = m.end() + 1  # past ':'
+            if j >= n or query[j].isspace():
+                raise InvalidQualifierValueError(
+                    f"qualifier {key!r} has no value in query: {query!r}"
+                )
+            if query[j] == '"':
+                value, j = _read_quoted(query, j)
+            else:
+                start = j
+                while j < n and not query[j].isspace() and query[j] not in '()"':
+                    j += 1
+                value = query[start:j]
+            _collect_qualifier(qualifiers, key, value)
+            i = j
+            continue
+
+        # Bare run — until whitespace, paren, or quote.
+        start = i
+        while i < n and not query[i].isspace() and query[i] not in '()"':
+            i += 1
+        run = query[start:i]
+
+        if run in _OPERATORS:
+            tokens.append(run)
+            continue
+
+        if len(run) >= 2 and run.startswith("/") and run.endswith("/"):
+            raise RegexNotSupportedError(
+                f"regex {run!r} not supported — FTS5 is token-based. "
+                f"Use prefix ('term*'), phrase ('\"...\"'), or boolean "
+                f"operators (AND/OR/NOT) instead."
+            )
+
+        emitted = _classify_bare_token(run)
+        if emitted is not None:
+            tokens.append(emitted)
+
+    if paren_depth != 0:
+        raise UnmatchedParenError(
+            f"unmatched '(' in query: {query!r}"
+        )
+
+    _validate_operator_placement(tokens, raw=query)
+
+    fts_expression = _join_tokens_for_fts5(tokens)
+    return ParsedQuery(
+        fts_expression=fts_expression,
+        qualifiers=qualifiers,
+    )
+
+
+def _join_tokens_for_fts5(tokens: list[str]) -> str:
+    """Reassemble parsed tokens into a valid FTS5 MATCH expression.
+
+    FTS5 accepts juxtaposition as implicit AND for *most* token sequences,
+    but the grammar refuses to parse a paren-group immediately followed by
+    a phrase or prefix marker — ``( "a" ) "b"*`` raises ``fts5: syntax
+    error near ""b""`` even though the same expression with explicit
+    ``AND`` works. To stay compatible across operator/group/prefix
+    combinations we emit ``AND`` between every pair of adjacent operands
+    (an "operand" being either a phrase token or a closing paren). This
+    is functionally identical to implicit AND for FTS5 but parses cleanly
+    in every case.
+    """
+    out: list[str] = []
+    for tok in tokens:
+        if out:
+            prev = out[-1]
+            prev_ends_operand = prev not in _OPERATORS and prev != "("
+            next_starts_operand = tok not in _OPERATORS and tok != ")"
+            if prev_ends_operand and next_starts_operand:
+                out.append("AND")
+        out.append(tok)
+    return " ".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Mode 1 — BM25
+# ---------------------------------------------------------------------------
+
+
+_BM25_SYNTAX_HINT = (
+    "Supported syntax: bare words (implicit AND, defanged), \"phrase\", "
+    "AND/OR/NOT (uppercase), parens, term*, and qualifiers "
+    "paper:NAME / domain:X / collection:NAME / surface:sections|readmes|both."
+)
+
+
+_EMPTY_QUERY_HINT = (
+    "Query had no searchable tokens after parsing. Pass at least "
+    "one word; queries that contain only qualifiers (e.g. "
+    "'paper:foo') match nothing on this surface."
+)
+
+
+def _soft_fail_payload(
+    *, mode: str, status: str, query: str, error: str, extra_hint: str = ""
+) -> dict[str, Any]:
+    hint = _EMPTY_QUERY_HINT if status == "empty_query" else _BM25_SYNTAX_HINT
+    if extra_hint:
+        hint = f"{extra_hint} {hint}"
+    return {
+        "mode": mode,
+        "status": status,
+        "query": query,
+        "error": error,
+        "hint": hint,
+    }
+
+
+def _malformed_query_payload(
+    *, mode: str, query: str, error: str, extra_hint: str = ""
+) -> dict[str, Any]:
+    return _soft_fail_payload(
+        mode=mode, status="malformed_query", query=query,
+        error=error, extra_hint=extra_hint,
+    )
+
+
+def _empty_query_payload(*, mode: str, query: str, error: str) -> dict[str, Any]:
+    return _soft_fail_payload(
+        mode=mode, status="empty_query", query=query, error=error,
+    )
+
+
+def _merge_qualifier_with_kwarg(
+    qualifiers: dict[str, str], kwarg_value: Any, key: str
+) -> Any:
+    """Intersect a parsed qualifier with the corresponding kwarg-supplied
+    value. Returns the unified value or raises :class:`ConflictingFilterError`.
+    """
+    qual = qualifiers.get(key)
+    if qual is None:
+        return kwarg_value
+    if kwarg_value in (None, "") or kwarg_value == qual:
+        return qual
+    raise ConflictingFilterError(
+        f"qualifier {key}:{qual!r} conflicts with kwarg {key}={kwarg_value!r}"
+    )
 
 
 def mode_bm25(
@@ -135,65 +495,143 @@ def mode_bm25(
     filters: dict[str, Any],
     limit: int,
     scope: Scope = Scope.SECTIONS,
+    snippet_tokens: int = 10,
 ) -> dict[str, Any]:
     """BM25 text search across ``sections`` and/or ``readmes_fts``.
 
-    ``scope`` selects the surface(s) to query: SECTIONS (default — fully
-    backwards-compatible), READMES (paper-anchored README index), or
-    BOTH (union, merged by paper_name with `readme_hit` field on
-    README-only matches).
+    ``query`` is a GitHub-code-search-style string parsed by
+    :func:`_parse_github_query`: bare tokens (implicit AND), ``"phrase"``,
+    ``AND``/``OR``/``NOT``, parens, prefix ``term*``, and qualifiers
+    ``paper:`` / ``domain:`` / ``collection:`` / ``surface:``. The
+    ``kind:`` qualifier is rejected here (only meaningful for the search
+    tool's taxonomy bucket).
 
-    A query whose tokens all drop out under sanitization (e.g. pure
-    punctuation like ``---``) emits ``status='empty_query'`` — agent-
-    recoverable, not a crash.
+    ``scope`` selects the default surface(s): SECTIONS (current
+    behavior), READMES, or BOTH. ``surface:`` qualifier wins (and
+    must agree if both are non-default).
+
+    ``snippet_tokens`` controls FTS5 ``snippet()`` window width.
+
+    Soft failures (no exception raised; soft-status payload):
+
+    * ``empty_query`` — punctuation-only or qualifier-only query
+    * ``malformed_query`` — quote/paren/operator mismatch, unknown
+      qualifier, ``/regex/`` form, or qualifier↔kwarg conflict
     """
-    domain = filters.get("domain")
-    collection = filters.get("collection")
     try:
-        if scope is Scope.SECTIONS:
-            return _bm25_sections(conn, query=query, domain=domain,
-                                  collection=collection, limit=limit)
-        if scope is Scope.READMES:
-            return _bm25_readmes(conn, query=query, domain=domain,
-                                 collection=collection, limit=limit)
-        return _bm25_both(conn, query=query, domain=domain,
-                          collection=collection, limit=limit)
-    except FTS5QueryError as e:
-        return {
-            "mode": "sections",
-            "status": "empty_query",
-            "query": query,
-            "error": str(e),
-            "hint": (
-                "BM25 query had no searchable tokens after sanitization. "
-                "Pass at least one word; punctuation-only queries match "
-                "nothing."
-            ),
-        }
+        parsed = _parse_github_query(query)
+    except EmptyQueryError as e:
+        return _empty_query_payload(mode="sections", query=query, error=str(e))
+    except GitHubQueryError as e:
+        return _malformed_query_payload(
+            mode="sections", query=query, error=str(e),
+        )
+
+    if "kind" in parsed.qualifiers:
+        return _malformed_query_payload(
+            mode="sections", query=query,
+            error="kind: qualifier is only valid on the 'search' tool's "
+                  "taxonomy bucket; bm25 hits sections/readmes which have "
+                  "no term_type column.",
+        )
+
+    try:
+        domain = _merge_qualifier_with_kwarg(
+            parsed.qualifiers, filters.get("domain"), "domain"
+        )
+        collection = _merge_qualifier_with_kwarg(
+            parsed.qualifiers, filters.get("collection"), "collection"
+        )
+    except ConflictingFilterError as e:
+        return _malformed_query_payload(
+            mode="sections", query=query, error=str(e),
+        )
+
+    paper_name = parsed.qualifiers.get("paper")
+
+    surface_qual = parsed.qualifiers.get("surface")
+    if surface_qual is not None:
+        if surface_qual == "taxonomy":
+            return _malformed_query_payload(
+                mode="sections", query=query,
+                error="surface:taxonomy is only valid on the 'search' tool; "
+                      "bm25 has no taxonomy surface (use the 'search' tool "
+                      "or the 'lookup' tool for canonical terms).",
+            )
+        try:
+            scope_from_qual = Scope(surface_qual)
+        except ValueError:
+            return _malformed_query_payload(
+                mode="sections", query=query,
+                error=f"surface:{surface_qual!r} not a valid scope",
+            )
+        if scope is not Scope.SECTIONS and scope is not scope_from_qual:
+            return _malformed_query_payload(
+                mode="sections", query=query,
+                error=f"surface:{surface_qual} conflicts with scope={scope.value}",
+            )
+        scope = scope_from_qual
+
+    if not parsed.fts_expression:
+        return _empty_query_payload(
+            mode="sections", query=query,
+            error="query held only qualifiers, no FTS body",
+        )
+
+    if scope is Scope.SECTIONS:
+        result = _bm25_sections(
+            conn, fts_expression=parsed.fts_expression,
+            domain=domain, collection=collection, paper_name=paper_name,
+            limit=limit, snippet_tokens=snippet_tokens,
+        )
+    elif scope is Scope.READMES:
+        result = _bm25_readmes(
+            conn, fts_expression=parsed.fts_expression,
+            domain=domain, collection=collection, paper_name=paper_name,
+            limit=limit, snippet_tokens=snippet_tokens,
+        )
+    else:
+        result = _bm25_both(
+            conn, fts_expression=parsed.fts_expression,
+            domain=domain, collection=collection, paper_name=paper_name,
+            limit=limit, snippet_tokens=snippet_tokens,
+        )
+    result["query"] = query
+    return result
 
 
 def _bm25_sections(
     conn: sqlite3.Connection,
     *,
-    query: str,
+    fts_expression: str,
     domain: str | None,
     collection: str | None,
+    paper_name: str | None,
     limit: int,
+    snippet_tokens: int = 10,
+    enrich: bool = True,
 ) -> dict[str, Any]:
     # sections columns: (paper_id, domain, paper_name, section_title, section_level, body)
     # snippet() against 'body' = column index 5.
-    match_query = _sanitize_fts5_match(query)
+    # Breadcrumb is prepended to body at index time as `breadcrumb\n\n<raw>`,
+    # so first line of body == breadcrumb. We extract it explicitly so the
+    # caller doesn't depend on whether snippet()'s token window happened to
+    # land near the start of body.
     sql = (
         "SELECT s.paper_id, s.domain, s.paper_name, s.section_title, "
         "       s.section_level, "
-        "       snippet(sections, 5, '[', ']', '…', 10) AS snip "
+        f"       snippet(sections, 5, '[', ']', '…', {int(snippet_tokens)}) AS snip, "
+        "       substr(s.body, 1, instr(s.body || char(10), char(10)) - 1) AS breadcrumb "
         "  FROM sections s"
     )
     wheres = ["sections MATCH ?"]
-    params: list[Any] = [match_query]
+    params: list[Any] = [fts_expression]
     if domain:
         wheres.append("s.domain = ?")
         params.append(domain)
+    if paper_name:
+        wheres.append("s.paper_name = ?")
+        params.append(paper_name)
     if collection:
         # Join papers for the collection filter — sections does not carry
         # collection in FTS5 (by design; the paper owns the collection).
@@ -210,7 +648,7 @@ def _bm25_sections(
     # distinct paper_ids in three queries regardless of result count.
     grouped: dict[str, dict[str, Any]] = {}
     pid_order: list[int] = []
-    for paper_id, dom, paper_name, section_title, section_level, snip in rows:
+    for paper_id, dom, paper_name, section_title, section_level, snip, breadcrumb in rows:
         group = grouped.get(paper_name)
         if group is None:
             group = {
@@ -226,25 +664,18 @@ def _bm25_sections(
         group["sections"].append({
             "section_title": section_title,
             "section_level": section_level,
+            "breadcrumb": breadcrumb,
             "snippet": snip,
         })
 
-    topics_by_pid = _topics_batch(conn, pid_order)
-    entities_by_pid = _entities_preview_batch(conn, pid_order)
-    figures_by_pid = _figures_preview_batch(conn, pid_order)
-    code_repo_by_pid = _code_repo_envelope_batch(conn, pid_order)
-    for group in grouped.values():
-        pid = group.pop("_paper_id")
-        group["topics"] = topics_by_pid.get(pid, [])
-        group["entities_preview"] = entities_by_pid.get(pid, [])
-        group["figures"] = figures_by_pid.get(
-            pid, {"count": 0, "first_caption": None}
-        )
-        group["code_repo"] = code_repo_by_pid.get(pid)
+    if enrich:
+        _attach_bm25_enrichment(conn, grouped, pid_order)
+    else:
+        for group in grouped.values():
+            group.pop("_paper_id", None)
 
     return {
         "mode": "sections",
-        "query": query,
         "results": list(grouped.values()),
     }
 
@@ -252,24 +683,29 @@ def _bm25_sections(
 def _bm25_readmes(
     conn: sqlite3.Connection,
     *,
-    query: str,
+    fts_expression: str,
     domain: str | None,
     collection: str | None,
+    paper_name: str | None,
     limit: int,
+    snippet_tokens: int = 10,
+    enrich: bool = True,
 ) -> dict[str, Any]:
     """BM25 against ``readmes_fts``. Same envelope shape as ``_bm25_sections``
     so ``to_human`` / enrichment branches treat both uniformly."""
-    match_query = _sanitize_fts5_match(query)
     sql = (
         "SELECT r.paper_id, r.domain, r.paper_name, r.path, "
-        "       snippet(readmes_fts, 4, '[', ']', '…', 10) AS snip "
+        f"       snippet(readmes_fts, 4, '[', ']', '…', {int(snippet_tokens)}) AS snip "
         "  FROM readmes_fts r"
     )
     wheres = ["readmes_fts MATCH ?"]
-    params: list[Any] = [match_query]
+    params: list[Any] = [fts_expression]
     if domain:
         wheres.append("r.domain = ?")
         params.append(domain)
+    if paper_name:
+        wheres.append("r.paper_name = ?")
+        params.append(paper_name)
     if collection:
         sql += " JOIN papers p ON p.id = r.paper_id"
         wheres.append("p.collection = ?")
@@ -300,22 +736,14 @@ def _bm25_readmes(
         group["hit_count"] += 1
         group["readme_hit"] = {"path": path, "snippet": snip}
 
-    topics_by_pid = _topics_batch(conn, pid_order)
-    entities_by_pid = _entities_preview_batch(conn, pid_order)
-    figures_by_pid = _figures_preview_batch(conn, pid_order)
-    code_repo_by_pid = _code_repo_envelope_batch(conn, pid_order)
-    for group in grouped.values():
-        pid = group.pop("_paper_id")
-        group["topics"] = topics_by_pid.get(pid, [])
-        group["entities_preview"] = entities_by_pid.get(pid, [])
-        group["figures"] = figures_by_pid.get(
-            pid, {"count": 0, "first_caption": None}
-        )
-        group["code_repo"] = code_repo_by_pid.get(pid)
+    if enrich:
+        _attach_bm25_enrichment(conn, grouped, pid_order)
+    else:
+        for group in grouped.values():
+            group.pop("_paper_id", None)
 
     return {
         "mode": "sections",
-        "query": query,
         "scope": Scope.READMES.value,
         "results": list(grouped.values()),
     }
@@ -324,16 +752,25 @@ def _bm25_readmes(
 def _bm25_both(
     conn: sqlite3.Connection,
     *,
-    query: str,
+    fts_expression: str,
     domain: str | None,
     collection: str | None,
+    paper_name: str | None,
     limit: int,
+    snippet_tokens: int = 10,
+    enrich: bool = True,
 ) -> dict[str, Any]:
     """Union of sections + READMES hits, merged by paper_name."""
-    sec = _bm25_sections(conn, query=query, domain=domain,
-                         collection=collection, limit=limit)
-    rdm = _bm25_readmes(conn, query=query, domain=domain,
-                        collection=collection, limit=limit)
+    sec = _bm25_sections(
+        conn, fts_expression=fts_expression,
+        domain=domain, collection=collection, paper_name=paper_name,
+        limit=limit, snippet_tokens=snippet_tokens, enrich=enrich,
+    )
+    rdm = _bm25_readmes(
+        conn, fts_expression=fts_expression,
+        domain=domain, collection=collection, paper_name=paper_name,
+        limit=limit, snippet_tokens=snippet_tokens, enrich=enrich,
+    )
 
     by_name: dict[str, dict[str, Any]] = {}
     for group in sec.get("results", []):
@@ -351,10 +788,34 @@ def _bm25_both(
 
     return {
         "mode": "sections",
-        "query": query,
         "scope": Scope.BOTH.value,
         "results": list(by_name.values()),
     }
+
+
+def _attach_bm25_enrichment(
+    conn: sqlite3.Connection,
+    grouped: dict[str, dict[str, Any]],
+    pid_order: list[int],
+) -> None:
+    """Run the four enrichment SELECTs and stamp results onto each group.
+
+    Pops the private ``_paper_id`` field from each group as a side effect.
+    Used by ``_bm25_sections`` and ``_bm25_readmes`` for the full envelope.
+    Skipped when ``enrich=False`` (the slim ``mode_search`` path).
+    """
+    topics_by_pid = _topics_batch(conn, pid_order)
+    entities_by_pid = _entities_preview_batch(conn, pid_order)
+    figures_by_pid = _figures_preview_batch(conn, pid_order)
+    code_repo_by_pid = _code_repo_envelope_batch(conn, pid_order)
+    for group in grouped.values():
+        pid = group.pop("_paper_id")
+        group["topics"] = topics_by_pid.get(pid, [])
+        group["entities_preview"] = entities_by_pid.get(pid, [])
+        group["figures"] = figures_by_pid.get(
+            pid, {"count": 0, "first_caption": None}
+        )
+        group["code_repo"] = code_repo_by_pid.get(pid)
 
 
 def _code_repo_envelope_batch(
@@ -731,6 +1192,304 @@ def _classify_tier_a_match(
     if alias_row is not None:
         return "alias"
     return "fts"
+
+
+# ---------------------------------------------------------------------------
+# Mode 2.5 — Search (first-pass composite)
+# ---------------------------------------------------------------------------
+
+
+# (taxonomy, sections, readmes) bucket gate keyed on the parsed surface:
+# qualifier (None == default == all three). Values were validated by the
+# parser so the lookup is exhaustive.
+_SEARCH_SURFACE_BUCKETS: dict[str | None, tuple[bool, bool, bool]] = {
+    None: (True, True, True),
+    "sections": (False, True, False),
+    "readmes": (False, False, True),
+    "taxonomy": (True, False, False),
+    "both": (False, True, True),
+}
+
+
+def mode_search(
+    conn: sqlite3.Connection,
+    *,
+    query: str,
+    filters: dict[str, Any],
+    limit: int = 5,
+) -> dict[str, Any]:
+    """First-pass exploratory search across the corpus.
+
+    Fans out three subqueries and returns labeled buckets the caller can
+    use to orient before drilling in:
+
+    * ``taxonomy``: canonical_terms hits via a single ``terms_fts`` MATCH
+      with no ``term_type`` predicate so entity/topic/collection rows mix
+      in one ranking. Pure FTS — no KNN fallback. Each row carries
+      ``canonical_name``, ``kind``, ``entity_type``, ``domain``.
+    * ``sections``: slim summary of BM25 section hits — one row per
+      paper with ``hit_count`` and ``top_sections`` (the matching
+      section titles, no snippets, no enrichment).
+    * ``readmes``: slim summary of BM25 README hits — one row per paper
+      with ``hit_count``, ``path``, and the matched ``snippet``.
+
+    Quick-glance shape by design. Caller drills into ``lookup`` (canonical
+    metadata + papers), ``bm25`` (full snippets + figures), or
+    ``read``/``toc`` (full paper text) once it knows what to ask for.
+
+    No figure attachment by design — the MCP wrapper registers this tool
+    with ``AttachMode.NONE`` so the response stays text-only.
+
+    Empty/whitespace ``query`` → ``status='empty_query'`` (soft failure,
+    agent-recoverable). Parser-rejected query → ``status='malformed_query'``.
+
+    Beyond the bm25 surface, ``mode_search`` honors two extra qualifiers:
+
+    * ``surface:sections|readmes|both`` — restricts which buckets are
+      populated. Default keeps both.
+    * ``kind:entity|topic|collection`` — narrows the taxonomy bucket to
+      the named term_type.
+    """
+    if not query or not query.strip():
+        return {
+            "mode": "search",
+            "status": "empty_query",
+            "query": query,
+            "error": "empty query",
+            "hint": (
+                "search needs at least one word; pass a non-empty query."
+            ),
+        }
+
+    try:
+        parsed = _parse_github_query(query)
+    except EmptyQueryError as e:
+        return _empty_query_payload(mode="search", query=query, error=str(e))
+    except GitHubQueryError as e:
+        return _malformed_query_payload(
+            mode="search", query=query, error=str(e),
+        )
+
+    try:
+        domain = _merge_qualifier_with_kwarg(
+            parsed.qualifiers, filters.get("domain"), "domain"
+        )
+        collection = _merge_qualifier_with_kwarg(
+            parsed.qualifiers, filters.get("collection"), "collection"
+        )
+    except ConflictingFilterError as e:
+        return _malformed_query_payload(
+            mode="search", query=query, error=str(e),
+        )
+
+    paper_name = parsed.qualifiers.get("paper")
+    kind_filter = parsed.qualifiers.get("kind")
+
+    want_taxonomy, want_sections, want_readmes = _SEARCH_SURFACE_BUCKETS[
+        parsed.qualifiers.get("surface")
+    ]
+
+    if not parsed.fts_expression:
+        return _empty_query_payload(
+            mode="search", query=query,
+            error="query held only qualifiers, no FTS body",
+        )
+
+    # Unqueried buckets are OMITTED from the payload (vs emitted as []) so
+    # the agent reads "skipped" rather than "searched and found nothing."
+    taxonomy: list[dict[str, Any]] | None = None
+    if want_taxonomy:
+        taxonomy = _search_taxonomy(
+            conn,
+            fts_expression=parsed.fts_expression,
+            domain=domain,
+            kind=kind_filter,
+            limit=limit,
+        )
+
+    sections_slim: list[dict[str, Any]] | None = None
+    if want_sections:
+        sections_payload = _bm25_sections(
+            conn,
+            fts_expression=parsed.fts_expression,
+            domain=domain,
+            collection=collection,
+            paper_name=paper_name,
+            limit=limit,
+            snippet_tokens=64,
+            enrich=False,
+        )
+        sections_slim = [
+            {
+                "paper_name": g["paper_name"],
+                "hit_count": g.get("hit_count", 0),
+                "hits": [
+                    {
+                        "section_title": s.get("section_title", ""),
+                        "breadcrumb": s.get("breadcrumb", ""),
+                        "snippet": s.get("snippet", ""),
+                    }
+                    for s in g.get("sections", [])
+                    if s.get("section_title")
+                ],
+            }
+            for g in sections_payload.get("results", [])
+        ]
+
+    readmes_slim: list[dict[str, Any]] | None = None
+    if want_readmes:
+        readmes_slim = []
+        readmes_payload = _bm25_readmes(
+            conn,
+            fts_expression=parsed.fts_expression,
+            domain=domain,
+            collection=collection,
+            paper_name=paper_name,
+            limit=limit,
+            snippet_tokens=64,
+            enrich=False,
+        )
+        for g in readmes_payload.get("results", []):
+            rh = g.get("readme_hit") or {}
+            readmes_slim.append({
+                "paper_name": g["paper_name"],
+                "hit_count": g.get("hit_count", 0),
+                "path": rh.get("path"),
+                "snippet": rh.get("snippet"),
+            })
+
+    payload: dict[str, Any] = {
+        "mode": "search",
+        "query": query,
+        "domain": domain or None,
+    }
+    if taxonomy is not None:
+        payload["taxonomy"] = taxonomy
+    if sections_slim is not None:
+        payload["sections"] = sections_slim
+    if readmes_slim is not None:
+        payload["readmes"] = readmes_slim
+    return payload
+
+
+_MAX_SEARCH_MULTI_QUERIES = 8
+
+
+def mode_search_multi(
+    conn: sqlite3.Connection,
+    *,
+    queries: list[str],
+    filters: dict[str, Any],
+    limit: int = 5,
+) -> dict[str, Any]:
+    """Run multiple ``mode_search`` queries independently and concatenate
+    their per-query payloads into one envelope.
+
+    Each query is parsed and executed via :func:`mode_search` on its own,
+    so per-query qualifiers (``paper:``, ``surface:``, ``kind:``…),
+    operators, and soft-failure statuses (``empty_query`` /
+    ``malformed_query``) are preserved on each sub-result. Filters
+    supplied as kwargs apply uniformly to every query.
+
+    The envelope shape is::
+
+        {
+            "mode": "search",
+            "multi": True,
+            "queries": [...],
+            "domain": <kwarg domain or None>,
+            "results": [<full mode_search payload>, ...],
+        }
+
+    Capped at ``_MAX_SEARCH_MULTI_QUERIES`` to keep one MCP response
+    bounded; over-cap calls return a top-level ``malformed_query`` payload
+    rather than silently truncating.
+    """
+    if not queries:
+        return _empty_query_payload(
+            mode="search", query="",
+            error="search_multi called with no queries",
+        )
+    if len(queries) > _MAX_SEARCH_MULTI_QUERIES:
+        return _malformed_query_payload(
+            mode="search",
+            query=", ".join(queries),
+            error=(
+                f"too many queries: {len(queries)} "
+                f"(max {_MAX_SEARCH_MULTI_QUERIES})"
+            ),
+        )
+    results = [
+        mode_search(conn, query=q, filters=filters, limit=limit)
+        for q in queries
+    ]
+    return {
+        "mode": "search",
+        "multi": True,
+        "queries": list(queries),
+        "domain": filters.get("domain") or None,
+        "results": results,
+    }
+
+
+def _search_taxonomy(
+    conn: sqlite3.Connection,
+    *,
+    fts_expression: str,
+    domain: str | None,
+    kind: str | None = None,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Multi-kind canonical term search via FTS5 only.
+
+    Single ``terms_fts MATCH`` with the parsed FTS expression. No
+    ``term_type`` predicate by default so all three kinds (entity / topic
+    / collection) compete in one bm25 ranking. ``kind`` (from a
+    ``kind:`` qualifier) narrows the bucket to one term_type. No KNN
+    fallback — keep this orientation path cheap and predictable; callers
+    that want semantic broadening drill into ``lookup`` (Tier-B KNN).
+    """
+    fts_sql = (
+        "SELECT term_id, domain, term_type, entity_type, canonical_name "
+        "  FROM terms_fts "
+        " WHERE terms_fts MATCH ? "
+    )
+    fts_params: list[Any] = [fts_expression]
+    if kind:
+        fts_sql += " AND term_type = ? "
+        fts_params.append(kind)
+    if domain:
+        fts_sql += " AND domain = ? "
+        fts_params.append(domain)
+    fts_sql += " ORDER BY rank LIMIT ?"
+    fts_params.append(limit)
+
+    try:
+        fts_rows = conn.execute(fts_sql, fts_params).fetchall()
+    except sqlite3.OperationalError as exc:
+        # Degenerate MATCH (e.g. all-punctuation after quoting) raises
+        # "fts5: syntax error near ..."; treat as zero hits. Anything
+        # else (missing table, IO) is a real failure.
+        if "fts5" not in str(exc).lower():
+            raise
+        _LOG.warning(
+            "terms_fts MATCH syntax error for fts=%r: %s", fts_expression, exc,
+        )
+        return []
+
+    seen_ids: set[int] = set()
+    out: list[dict[str, Any]] = []
+    for term_id, dom, term_type, entity_type, canonical_name in fts_rows:
+        if term_id in seen_ids:
+            continue
+        seen_ids.add(term_id)
+        out.append({
+            "canonical_name": canonical_name,
+            "kind": term_type,
+            "entity_type": entity_type,
+            "domain": dom,
+        })
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1231,11 +1990,172 @@ def to_json(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def _clean_breadcrumb_for_display(breadcrumb: str) -> str:
+    """Strip per-segment ``#`` level markers from a section breadcrumb.
+
+    ``split_sections`` builds breadcrumbs as ``# A > ## B > ### C`` where
+    the leading ``#`` count encodes the markdown header level. The level
+    info is redundant once we have the path, and the bare ``#`` symbols
+    look like markdown headers when rendered inside our own markdown
+    output. ``# A > ## B`` → ``A > B``.
+    """
+    if not breadcrumb:
+        return ""
+    parts = [seg.lstrip("# ").strip() for seg in breadcrumb.split(" > ")]
+    return " > ".join(p for p in parts if p)
+
+
+def format_search_markdown(
+    payload: dict[str, Any], *, header_level: int = 1
+) -> str:
+    """Render a ``mode_search`` payload as a compact markdown digest.
+
+    Used at the MCP boundary so Claude reads a token-cheap orientation
+    summary instead of the raw JSON. The full JSON shape stays available
+    via ``structuredContent``. Multi-query envelopes route to a sectioned
+    renderer that nests sub-results one level deeper.
+
+    ``header_level`` is the level of the top-level header (1 == ``#``).
+    The multi renderer recurses with level 3 so its per-query H2 sits
+    above the sub-payload's bucket headers.
+    """
+    if payload.get("multi"):
+        return _format_search_multi_markdown(payload)
+
+    h_top = "#" * header_level
+    h_bucket = "#" * (header_level + 1)
+    h_sub = "#" * (header_level + 2)
+
+    status = payload.get("status")
+    if status in ("empty_query", "malformed_query"):
+        label = "empty query" if status == "empty_query" else "malformed query"
+        lines = [f"{h_top} search ({label})"]
+        if status == "malformed_query":
+            lines.append(f"query: {payload.get('query', '')!r}")
+        err = payload.get("error")
+        if err and status == "malformed_query":
+            lines.append(f"error: {err}")
+        hint = payload.get("hint")
+        if hint:
+            lines.append(hint)
+        return "\n".join(lines)
+
+    query = payload.get("query", "")
+    domain = payload.get("domain")
+    header = f"{h_top} search {query!r}"
+    if domain:
+        header += f"  [domain={domain}]"
+    lines: list[str] = [header, ""]
+
+    if "taxonomy" in payload:
+        taxonomy = payload.get("taxonomy") or []
+        lines.append(f"{h_bucket} taxonomy ({len(taxonomy)})")
+        if taxonomy:
+            by_kind: dict[str, list[dict[str, Any]]] = {}
+            for row in taxonomy:
+                by_kind.setdefault(row.get("kind", "?"), []).append(row)
+            for kind in ("entity", "topic", "collection"):
+                rows = by_kind.get(kind)
+                if not rows:
+                    continue
+                lines.append(f"{h_sub} {kind} ({len(rows)})")
+                for row in rows:
+                    lines.append(f"- {row.get('canonical_name', '?')}")
+        else:
+            lines.append(
+                "(none — try a different surface form, or skip to bm25)"
+            )
+        lines.append("")
+
+    if "sections" in payload:
+        sections = payload.get("sections") or []
+        sec_total = sum(int(g.get("hit_count", 0)) for g in sections)
+        lines.append(
+            f"{h_bucket} sections ({sec_total} hits across {len(sections)} "
+            f"paper{'' if len(sections) == 1 else 's'})"
+        )
+        if sections:
+            for g in sections:
+                lines.append(
+                    f"- {g.get('paper_name', '?')} ({g.get('hit_count', 0)} hits)"
+                )
+                for i, hit in enumerate(g.get("hits", []), start=1):
+                    crumb = _clean_breadcrumb_for_display(hit.get("breadcrumb", ""))
+                    heading = crumb or hit.get("section_title", "?")
+                    lines.append(f"  {i}. **{heading}**")
+                    raw = (hit.get("snippet") or "").strip()
+                    snip = " ".join(raw.split())
+                    if snip:
+                        lines.append(f"     {snip}")
+        else:
+            lines.append("(none)")
+        lines.append("")
+
+    if "readmes" in payload:
+        readmes = payload.get("readmes") or []
+        rdm_total = sum(int(g.get("hit_count", 0)) for g in readmes)
+        lines.append(
+            f"{h_bucket} readmes ({rdm_total} hits across {len(readmes)} "
+            f"paper{'' if len(readmes) == 1 else 's'})"
+        )
+        if readmes:
+            for g in readmes:
+                path = g.get("path") or ""
+                raw = (g.get("snippet") or "").strip()
+                snip = " ".join(raw.split())
+                lines.append(
+                    f"- {g.get('paper_name', '?')}: {path} — {snip}"
+                )
+        else:
+            lines.append("(none)")
+
+    return "\n".join(lines)
+
+
+def _format_search_multi_markdown(payload: dict[str, Any]) -> str:
+    """Render a multi-query envelope as one stitched markdown document.
+
+    H1 is the multi header; per-query H2 ("## query N: 'q'") sits above
+    each sub-payload's H3 bucket headers. Soft-failure sub-results
+    surface inline so the agent doesn't need to crack open
+    ``structuredContent``.
+    """
+    queries = payload.get("queries") or []
+    domain = payload.get("domain")
+    n = len(queries)
+    header = f"# search (multi: {n} {'query' if n == 1 else 'queries'})"
+    if domain:
+        header += f"  [domain={domain}]"
+    parts: list[str] = [header, ""]
+
+    for i, sub in enumerate(payload.get("results") or [], start=1):
+        q = sub.get("query", "")
+        status = sub.get("status")
+        tag = f" ({status.replace('_', ' ')})" if status else ""
+        parts.append(f"## query {i}{tag}: {q!r}")
+        # Render the sub at level 2 so its buckets land at H3 ("###
+        # taxonomy") under the per-query H2. The sub's own H2 top-header
+        # is redundant with our "## query i" line, so strip it.
+        sub_md = format_search_markdown(sub, header_level=2)
+        sub_lines = sub_md.split("\n")
+        if sub_lines and sub_lines[0].startswith("## search"):
+            sub_lines = sub_lines[1:]
+            if sub_lines and sub_lines[0] == "":
+                sub_lines = sub_lines[1:]
+        parts.extend(sub_lines)
+        parts.append("")
+
+    return "\n".join(parts).rstrip() + "\n"
+
+
 def to_human(payload: dict[str, Any]) -> str:
     """Short plaintext rendering per mode. Designed for terminal eyeballing,
     not programmatic reuse — pipelines should consume ``to_json``.
     """
     mode = payload.get("mode", "?")
+    if mode == "search":
+        return format_search_markdown(payload)
+
     lines: list[str] = []
 
     if mode == "sections":
@@ -1243,6 +2163,16 @@ def to_human(payload: dict[str, Any]) -> str:
             lines.append(
                 f"empty BM25 query: {payload.get('query')!r}"
             )
+            hint = payload.get("hint")
+            if hint:
+                lines.append(hint)
+        elif payload.get("status") == "malformed_query":
+            lines.append(
+                f"malformed BM25 query: {payload.get('query')!r}"
+            )
+            err = payload.get("error")
+            if err:
+                lines.append(err)
             hint = payload.get("hint")
             if hint:
                 lines.append(hint)
@@ -1463,6 +2393,15 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=10,
                    help="max BM25 hits (default: 10)")
 
+    p.add_argument("--search", default=None, action="append",
+                   help="generic first-pass search: returns three buckets "
+                        "(taxonomy / sections / readmes) for QUERY in one call. "
+                        "Mirrors the `search` MCP tool. Use --domain to filter; "
+                        "--limit caps each bucket (default 5). Repeat the flag "
+                        "to fan out multiple queries (max 8); each runs "
+                        "independently and the per-query payloads are "
+                        "concatenated under one envelope.")
+
     p.add_argument("--entity", default=None, help="taxonomy lookup: entity")
     p.add_argument("--topic", default=None, help="taxonomy lookup: topic")
 
@@ -1525,6 +2464,8 @@ def _check_mode_conflicts(
     modes: list[str] = []
     if args.query is not None:
         modes.append("QUERY (Mode 1 BM25)")
+    if args.search is not None:
+        modes.append("--search")
     # Mode 2 lookups — --collection is dual-use: only counts as Mode 2 when
     # there is no positional query.
     if args.entity is not None:
@@ -1625,6 +2566,29 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
             filters={"aliases_term": args.aliases},
         )
 
+    # Mode 2.5: generic first-pass search (composite — three buckets).
+    # ``--search`` uses ``action='append'`` so a single use gives ['q'] and
+    # repeated uses give ['q1', 'q2', ...]. Multi fans out via
+    # mode_search_multi; the single case still goes through mode_search so
+    # legacy callers keep the flat envelope.
+    if args.search is not None:
+        search_filters: dict[str, Any] = {}
+        if args.domain:
+            search_filters["domain"] = args.domain
+        if len(args.search) == 1:
+            return mode_search(
+                conn,
+                query=args.search[0],
+                filters=search_filters,
+                limit=args.limit,
+            )
+        return mode_search_multi(
+            conn,
+            queries=args.search,
+            filters=search_filters,
+            limit=args.limit,
+        )
+
     # Mode 2: taxonomy lookup. --collection is DUAL-USE — it becomes a lookup
     # term only when there is no positional query. Table-driven so the three
     # near-identical branches share one call site.
@@ -1660,9 +2624,9 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
 
     raise SystemExit(
         "no action selected — pass a positional QUERY or one of the mode "
-        "flags (--entity/--topic/--collection/--collections/--topics/"
-        "--entity-type/--aliases/--needs-review/--toc/--read/--figure). "
-        "Run with --help for details."
+        "flags (--search/--entity/--topic/--collection/--collections/"
+        "--topics/--entity-type/--aliases/--needs-review/--toc/--read/"
+        "--figure). Run with --help for details."
     )
 
 
@@ -1670,6 +2634,7 @@ _SOFT_FAILURE_STATUSES = frozenset({
     "section_not_found",
     "malformed_section_query",
     "empty_query",
+    "malformed_query",
     "no_repo",
     "failed_repo",
     "file_not_found",
