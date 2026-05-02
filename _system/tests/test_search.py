@@ -729,7 +729,9 @@ class TestModeBM25:
 
     def test_special_chars_in_query_do_not_crash(self, seeded_db):
         """Slashes, parens, and colons must also reduce to phrase
-        content rather than FTS5 syntax."""
+        content rather than FTS5 syntax. ``method:foo`` is now parsed as
+        a qualifier (unknown one → malformed_query soft-fail) but still
+        returns a structured payload, never an exception."""
         for q in ["BAAI/bge-small", "O(1)", "method:foo", "(parens)"]:
             r = search_mod.mode_bm25(
                 seeded_db, query=q, filters={}, limit=10
@@ -737,6 +739,171 @@ class TestModeBM25:
             assert r["mode"] == "sections", q
             # No KeyError, no OperationalError — that's the contract.
             assert isinstance(r.get("results", []), list)
+
+
+# ===========================================================================
+# GitHub-code-search-style query parser
+# ===========================================================================
+
+
+class TestParseGithubQuery:
+    """Pure parser tests — no DB, no FTS5 execution. Verifies the
+    fts_expression / qualifiers / typed-error contract."""
+
+    def test_bare_token_defang_preserves_punctuation(self):
+        p = search_mod._parse_github_query("tree-sitter")
+        assert p.fts_expression == '"tree-sitter"'
+        assert p.qualifiers == {}
+
+    def test_multiple_bare_tokens_are_implicit_and(self):
+        p = search_mod._parse_github_query("chain of thought")
+        # Each token defanged independently. We emit explicit AND between
+        # adjacent operands because FTS5's implicit-AND grammar refuses
+        # `(group) prefix*` and similar combinations.
+        assert p.fts_expression == '"chain" AND "of" AND "thought"'
+
+    def test_phrase_query(self):
+        p = search_mod._parse_github_query('"chain of thought"')
+        assert p.fts_expression == '"chain of thought"'
+
+    def test_escaped_quote_in_phrase(self):
+        p = search_mod._parse_github_query('"name = \\"x\\""')
+        # FTS5 escape doubles the internal quote
+        assert p.fts_expression == '"name = ""x"""'
+
+    def test_or_operator_passthrough(self):
+        p = search_mod._parse_github_query("reasoning OR planning")
+        assert p.fts_expression == '"reasoning" OR "planning"'
+
+    def test_not_operator_passthrough(self):
+        p = search_mod._parse_github_query("reasoning NOT supervised")
+        assert p.fts_expression == '"reasoning" NOT "supervised"'
+
+    def test_and_operator_passthrough(self):
+        p = search_mod._parse_github_query("a AND b")
+        assert p.fts_expression == '"a" AND "b"'
+
+    def test_lowercase_or_is_a_search_term(self):
+        # GitHub-style: only uppercase AND/OR/NOT are operators.
+        p = search_mod._parse_github_query("a or b")
+        assert p.fts_expression == '"a" AND "or" AND "b"'
+
+    def test_parens_grouping(self):
+        p = search_mod._parse_github_query("(monte carlo) tree")
+        assert p.fts_expression == '( "monte" AND "carlo" ) AND "tree"'
+
+    def test_parens_with_prefix_after(self):
+        # Regression: FTS5 rejects implicit AND between a paren-group and
+        # a prefix marker. Explicit AND fixes it.
+        p = search_mod._parse_github_query("(monte carlo) tree*")
+        assert p.fts_expression == '( "monte" AND "carlo" ) AND "tree"*'
+
+    def test_prefix_token(self):
+        p = search_mod._parse_github_query("tree*")
+        assert p.fts_expression == '"tree"*'
+
+    def test_paper_qualifier(self):
+        p = search_mod._parse_github_query("paper:bookrag_2024 indexing")
+        assert p.qualifiers == {"paper": "bookrag_2024"}
+        assert p.fts_expression == '"indexing"'
+
+    def test_quoted_qualifier_value(self):
+        p = search_mod._parse_github_query(
+            'collection:"hierarchical indexing" foo'
+        )
+        assert p.qualifiers == {"collection": "hierarchical indexing"}
+        assert p.fts_expression == '"foo"'
+
+    def test_multiple_qualifiers(self):
+        p = search_mod._parse_github_query(
+            "domain:rag kind:entity reasoning"
+        )
+        assert p.qualifiers == {"domain": "rag", "kind": "entity"}
+        assert p.fts_expression == '"reasoning"'
+
+    def test_surface_qualifier_validates(self):
+        p = search_mod._parse_github_query("surface:sections foo")
+        assert p.qualifiers == {"surface": "sections"}
+
+    def test_kind_qualifier_validates(self):
+        p = search_mod._parse_github_query("kind:topic foo")
+        assert p.qualifiers == {"kind": "topic"}
+
+    # --- error paths ---------------------------------------------------
+
+    def test_regex_rejected(self):
+        with pytest.raises(search_mod.RegexNotSupportedError):
+            search_mod._parse_github_query("/foo.*/")
+
+    def test_unclosed_quote(self):
+        with pytest.raises(search_mod.UnclosedQuoteError):
+            search_mod._parse_github_query('"unclosed phrase')
+
+    def test_unmatched_open_paren(self):
+        with pytest.raises(search_mod.UnmatchedParenError):
+            search_mod._parse_github_query("(foo")
+
+    def test_unmatched_close_paren(self):
+        with pytest.raises(search_mod.UnmatchedParenError):
+            search_mod._parse_github_query("foo)")
+
+    def test_dangling_leading_operator(self):
+        with pytest.raises(search_mod.DanglingOperatorError):
+            search_mod._parse_github_query("OR foo")
+
+    def test_dangling_trailing_operator(self):
+        with pytest.raises(search_mod.DanglingOperatorError):
+            search_mod._parse_github_query("foo OR")
+
+    def test_dangling_adjacent_operators(self):
+        with pytest.raises(search_mod.DanglingOperatorError):
+            search_mod._parse_github_query("foo OR AND bar")
+
+    def test_unknown_qualifier(self):
+        with pytest.raises(search_mod.UnknownQualifierError):
+            search_mod._parse_github_query("method:foo bar")
+
+    def test_invalid_kind_value(self):
+        with pytest.raises(search_mod.InvalidQualifierValueError):
+            search_mod._parse_github_query("kind:bogus foo")
+
+    def test_invalid_surface_value(self):
+        with pytest.raises(search_mod.InvalidQualifierValueError):
+            search_mod._parse_github_query("surface:bogus foo")
+
+    def test_surface_taxonomy_value_accepted(self):
+        p = search_mod._parse_github_query("surface:taxonomy reasoning")
+        assert p.qualifiers == {"surface": "taxonomy"}
+
+    def test_qualifier_repeated_with_conflicting_value(self):
+        with pytest.raises(search_mod.ConflictingFilterError):
+            search_mod._parse_github_query("paper:a paper:b foo")
+
+    def test_qualifier_repeated_same_value_ok(self):
+        p = search_mod._parse_github_query("paper:a paper:a foo")
+        assert p.qualifiers == {"paper": "a"}
+
+    def test_empty_query(self):
+        with pytest.raises(search_mod.EmptyQueryError):
+            search_mod._parse_github_query("")
+
+    def test_whitespace_only_query(self):
+        with pytest.raises(search_mod.EmptyQueryError):
+            search_mod._parse_github_query("   ")
+
+    def test_qualifier_only_query_returns_empty_fts(self):
+        # qualifier-only queries parse, but their fts_expression is "" — the
+        # dispatch layer is what surfaces this as an empty_query soft fail
+        # for surfaces that require text.
+        p = search_mod._parse_github_query("paper:foo")
+        assert p.fts_expression == ""
+        assert p.qualifiers == {"paper": "foo"}
+
+    def test_punctuation_only_drops_to_empty_fts(self):
+        # `---` carries no word characters → defang drops it. With no
+        # qualifiers either, parse succeeds but fts_expression is "".
+        p = search_mod._parse_github_query("---")
+        assert p.fts_expression == ""
 
 
 # ===========================================================================
@@ -836,6 +1003,527 @@ class TestModeTaxonomy:
         assert r_coll["mode"] == "collection"
         assert r_coll["canonical"]["name"] == "hierarchical indexing"
         assert any(p["paper_name"] == "bookrag_2024" for p in r_coll["papers"])
+
+
+# ===========================================================================
+# Mode 2.5 — Search (composite)
+# ===========================================================================
+
+
+class TestModeSearch:
+    def test_taxonomy_mixes_kinds(self, seeded_db):
+        """A query that resolves a topic should also surface other-kind
+        canonicals when they share lexical/stemmed overlap. The seeded DB
+        has 'entity resolution' (topic) and 'hierarchical indexing'
+        (collection) — query "indexing" hits the collection, query
+        "RAPTOR" hits the entity. Verify the kind tag is plumbed through."""
+        r = search_mod.mode_search(
+            seeded_db, query="indexing", filters={"domain": "rag"}, limit=5
+        )
+        assert r["mode"] == "search"
+        kinds = {row["kind"] for row in r["taxonomy"]}
+        assert "collection" in kinds, r["taxonomy"]
+
+        r2 = search_mod.mode_search(
+            seeded_db, query="RAPTOR", filters={"domain": "rag"}, limit=5
+        )
+        kinds2 = {row["kind"] for row in r2["taxonomy"]}
+        assert "entity" in kinds2, r2["taxonomy"]
+
+    def test_buckets_present_and_shaped(self, seeded_db):
+        r = search_mod.mode_search(
+            seeded_db, query="BookRAG", filters={"domain": "rag"}, limit=5
+        )
+        assert set(r.keys()) >= {
+            "mode", "query", "domain", "taxonomy", "sections", "readmes"
+        }
+        assert r["query"] == "BookRAG"
+        assert r["domain"] == "rag"
+        for row in r["taxonomy"]:
+            assert set(row.keys()) == {
+                "canonical_name", "kind", "entity_type", "domain",
+            }
+        # Sections bucket: slim shape — paper_name + hit_count + hits[].
+        if r["sections"]:
+            sec = r["sections"][0]
+            assert set(sec.keys()) == {"paper_name", "hit_count", "hits"}
+            assert isinstance(sec["hits"], list)
+            if sec["hits"]:
+                assert set(sec["hits"][0].keys()) == {
+                    "section_title", "breadcrumb", "snippet",
+                }
+        # Readmes bucket: slim shape — paper_name + hit_count + path + snippet.
+        if r["readmes"]:
+            rd = r["readmes"][0]
+            assert set(rd.keys()) == {"paper_name", "hit_count", "path", "snippet"}
+
+    def test_empty_query_soft_fail(self, seeded_db):
+        r = search_mod.mode_search(seeded_db, query="", filters={}, limit=5)
+        assert r["mode"] == "search"
+        assert r["status"] == "empty_query"
+        # Status is in the project soft-failure set so the MCP wrapper
+        # surfaces it as isError=false (agent-recoverable).
+        assert r["status"] in _system_search_soft_failures()
+
+    def test_whitespace_query_soft_fail(self, seeded_db):
+        r = search_mod.mode_search(seeded_db, query="   ", filters={}, limit=5)
+        assert r["status"] == "empty_query"
+
+    def test_domain_filter_narrows_taxonomy(self, seeded_db):
+        # All seeded canonicals are in 'rag'; querying with domain='other'
+        # should yield no taxonomy hits (and the KNN fallback is gated by
+        # domain too, so cross-domain leakage doesn't smuggle them in).
+        r = search_mod.mode_search(
+            seeded_db, query="RAPTOR", filters={"domain": "other"}, limit=5
+        )
+        assert r["taxonomy"] == [], r["taxonomy"]
+
+    def test_fts_only_no_knn_fallback(self, seeded_db, monkeypatch):
+        """A lexically-novel query returns an empty taxonomy bucket — there
+        is no KNN fallback. The Embedder must NOT be touched on this path
+        (the whole point of removing Tier B was to drop the heavy ML
+        import from the orientation tool)."""
+
+        class _ExplodingEmbedder:
+            def __init__(self) -> None:
+                raise AssertionError(
+                    "Embedder must not be constructed on the search path"
+                )
+
+        import _system.resolution.embeddings as emb_mod
+
+        monkeypatch.setattr(emb_mod, "Embedder", _ExplodingEmbedder)
+
+        r = search_mod.mode_search(
+            seeded_db, query="zzznosuchterm", filters={"domain": "rag"}, limit=5
+        )
+        assert r["taxonomy"] == [], r["taxonomy"]
+
+    def test_markdown_format_render(self, seeded_db):
+        """Markdown formatter is what reaches Claude on the MCP path.
+        Smoke-check top-level headers, kind-grouped taxonomy subheaders,
+        and absence of the entity_type tag."""
+        r = search_mod.mode_search(
+            seeded_db, query="RAPTOR", filters={"domain": "rag"}, limit=5
+        )
+        md = search_mod.format_search_markdown(r)
+        assert md.startswith("# search 'RAPTOR'")
+        assert "## taxonomy" in md
+        assert "## sections" in md
+        assert "## readmes" in md
+        # Taxonomy is grouped under per-kind subheaders.
+        if any(row["kind"] == "entity" for row in r["taxonomy"]):
+            assert "### entity" in md
+        # entity_type tag is intentionally omitted now.
+        assert "[entity:" not in md
+        # No JSON braces leak into the markdown.
+        assert "{" not in md and "}" not in md
+
+    def test_markdown_format_empty_query(self):
+        md = search_mod.format_search_markdown({
+            "mode": "search", "status": "empty_query", "query": "",
+            "hint": "search needs at least one word; pass a non-empty query.",
+        })
+        assert md.startswith("# search (empty query)")
+        assert "non-empty query" in md
+
+    def test_markdown_format_malformed_query(self):
+        md = search_mod.format_search_markdown({
+            "mode": "search", "status": "malformed_query",
+            "query": '"unclosed',
+            "error": "unclosed quote",
+            "hint": "Supported syntax: bare words ...",
+        })
+        assert md.startswith("# search (malformed query)")
+        assert "unclosed quote" in md
+
+
+# ===========================================================================
+# GitHub-style query syntax — integration through mode_bm25 / mode_search
+# ===========================================================================
+
+
+class TestQuerySyntaxBM25:
+    """End-to-end coverage of the GitHub-style operators / qualifiers
+    flowing through mode_bm25 against the real seeded FTS5 index."""
+
+    def test_or_returns_union_of_hits(self, seeded_db):
+        # Both 'BookRAG' and 'RAPTOR' appear in the seeded paper. OR should
+        # find at least the union of those two single-token queries.
+        r_or = search_mod.mode_bm25(
+            seeded_db, query="BookRAG OR RAPTOR", filters={}, limit=20,
+        )
+        assert r_or["mode"] == "sections"
+        assert r_or.get("status") != "malformed_query", r_or
+        names = {h["paper_name"] for h in r_or["results"]}
+        assert "bookrag_2024" in names
+
+    def test_not_excludes(self, seeded_db):
+        # `BookRAG NOT supervised` matches sections that contain BookRAG
+        # but not the word 'supervised'. None of the seeded sections
+        # contain 'supervised' so all BookRAG hits survive.
+        r_full = search_mod.mode_bm25(
+            seeded_db, query="BookRAG", filters={}, limit=20,
+        )
+        r_not = search_mod.mode_bm25(
+            seeded_db, query="BookRAG NOT supervised", filters={}, limit=20,
+        )
+        assert r_not.get("status") != "malformed_query", r_not
+        full_count = sum(h["hit_count"] for h in r_full["results"])
+        not_count = sum(h["hit_count"] for h in r_not["results"])
+        assert not_count == full_count
+
+    def test_phrase_query_finds_literal_match(self, seeded_db):
+        r = search_mod.mode_bm25(
+            seeded_db, query='"hierarchical indexing"', filters={}, limit=10,
+        )
+        assert r.get("status") != "malformed_query", r
+        # Seeded abstract has the literal "hierarchical indexing" phrase.
+        names = {h["paper_name"] for h in r["results"]}
+        assert "bookrag_2024" in names
+
+    def test_prefix_token_matches_stem(self, seeded_db):
+        # Seed body uses "indexing"; prefix "index*" should hit it.
+        r = search_mod.mode_bm25(
+            seeded_db, query="index*", filters={}, limit=10,
+        )
+        assert r.get("status") != "malformed_query", r
+        names = {h["paper_name"] for h in r["results"]}
+        assert "bookrag_2024" in names
+
+    def test_paper_qualifier_narrows_to_one_paper(self, seeded_db):
+        # Seed an extra section in stale_2024 mentioning BookRAG, then
+        # confirm `paper:bookrag_2024 BookRAG` excludes stale_2024.
+        p2_id = seeded_db.execute(
+            "SELECT id FROM papers WHERE paper_name = ?", ("stale_2024",)
+        ).fetchone()[0]
+        seeded_db.execute(
+            """
+            INSERT INTO sections
+                (paper_id, domain, paper_name, section_title, section_level, body)
+            VALUES (?, 'other', 'stale_2024', 'Mentions', '1',
+                    'BookRAG also mentioned here')
+            """,
+            (p2_id,),
+        )
+        r_all = search_mod.mode_bm25(
+            seeded_db, query="BookRAG", filters={}, limit=20,
+        )
+        r_one = search_mod.mode_bm25(
+            seeded_db,
+            query="paper:bookrag_2024 BookRAG",
+            filters={},
+            limit=20,
+        )
+        names_all = {h["paper_name"] for h in r_all["results"]}
+        names_one = {h["paper_name"] for h in r_one["results"]}
+        assert "stale_2024" in names_all
+        assert names_one == {"bookrag_2024"}
+
+    def test_domain_qualifier_in_query(self, seeded_db):
+        # qualifier-form domain narrows just like the kwarg form.
+        r = search_mod.mode_bm25(
+            seeded_db, query="domain:rag BookRAG", filters={}, limit=20,
+        )
+        names = {h["paper_name"] for h in r["results"]}
+        assert "bookrag_2024" in names
+
+    def test_domain_qualifier_conflict_with_kwarg(self, seeded_db):
+        r = search_mod.mode_bm25(
+            seeded_db,
+            query="domain:rag BookRAG",
+            filters={"domain": "other"},
+            limit=10,
+        )
+        assert r["status"] == "malformed_query"
+
+    def test_kind_qualifier_rejected_on_bm25(self, seeded_db):
+        r = search_mod.mode_bm25(
+            seeded_db, query="kind:entity BookRAG", filters={}, limit=10,
+        )
+        assert r["status"] == "malformed_query"
+        assert "kind" in r["error"]
+
+    def test_unclosed_quote_returns_malformed_query(self, seeded_db):
+        r = search_mod.mode_bm25(
+            seeded_db, query='"unclosed phrase', filters={}, limit=10,
+        )
+        assert r["status"] == "malformed_query"
+        assert r["mode"] == "sections"
+
+    def test_regex_returns_malformed_query(self, seeded_db):
+        r = search_mod.mode_bm25(
+            seeded_db, query="/foo.*/", filters={}, limit=10,
+        )
+        assert r["status"] == "malformed_query"
+
+    def test_qualifier_only_query_is_empty(self, seeded_db):
+        r = search_mod.mode_bm25(
+            seeded_db, query="paper:bookrag_2024", filters={}, limit=10,
+        )
+        assert r["status"] == "empty_query"
+
+
+class TestQuerySyntaxSearch:
+    """Same coverage on mode_search — verifies surface: routing and
+    kind: filtering at the taxonomy bucket."""
+
+    def test_or_in_taxonomy_search(self, seeded_db):
+        r = search_mod.mode_search(
+            seeded_db, query="BookRAG OR RAPTOR",
+            filters={"domain": "rag"}, limit=10,
+        )
+        assert r.get("status") != "malformed_query", r
+        canon = {row["canonical_name"] for row in r["taxonomy"]}
+        assert "BookRAG" in canon or "RAPTOR" in canon
+
+    def test_kind_filter_narrows_taxonomy_bucket(self, seeded_db):
+        # Without kind: both entity and collection rows can surface for
+        # 'indexing' (entity-typed BookRAG/RAPTOR don't match, but
+        # collection 'hierarchical indexing' does). With kind:collection
+        # nothing else can sneak in.
+        r = search_mod.mode_search(
+            seeded_db, query="kind:collection indexing",
+            filters={"domain": "rag"}, limit=10,
+        )
+        assert r.get("status") != "malformed_query", r
+        kinds = {row["kind"] for row in r["taxonomy"]}
+        assert kinds <= {"collection"}, r["taxonomy"]
+
+    def test_surface_sections_skips_readmes(self, seeded_db):
+        # Unqueried buckets are OMITTED from the payload (vs returning []
+        # — that would suggest "searched and found nothing" which misleads
+        # the agent). The markdown renderer simply drops the heading.
+        r = search_mod.mode_search(
+            seeded_db, query="surface:sections BookRAG",
+            filters={"domain": "rag"}, limit=10,
+        )
+        assert r.get("status") != "malformed_query", r
+        assert "readmes" not in r
+        assert "sections" in r
+
+    def test_surface_readmes_skips_sections(self, seeded_db):
+        r = search_mod.mode_search(
+            seeded_db, query="surface:readmes BookRAG",
+            filters={"domain": "rag"}, limit=10,
+        )
+        assert r.get("status") != "malformed_query", r
+        assert "sections" not in r
+        assert "readmes" in r
+
+    def test_surface_sections_skips_taxonomy_and_readmes(self, seeded_db):
+        # Tighter contract: surface:X means ONLY bucket X populated.
+        r = search_mod.mode_search(
+            seeded_db, query="surface:sections BookRAG",
+            filters={"domain": "rag"}, limit=10,
+        )
+        assert "taxonomy" not in r
+        assert "readmes" not in r
+        assert "sections" in r
+
+    def test_surface_taxonomy_only_populates_taxonomy(self, seeded_db):
+        # `BookRAG` is a canonical term in the taxonomy. surface:taxonomy
+        # produces only the taxonomy bucket; sections + readmes keys absent.
+        r = search_mod.mode_search(
+            seeded_db, query="surface:taxonomy BookRAG",
+            filters={"domain": "rag"}, limit=10,
+        )
+        assert r.get("status") != "malformed_query", r
+        assert "sections" not in r
+        assert "readmes" not in r
+        canon = {row["canonical_name"] for row in r["taxonomy"]}
+        assert "BookRAG" in canon
+
+    def test_surface_taxonomy_with_kind_filter(self, seeded_db):
+        # Combine surface:taxonomy with kind: — the taxonomy bucket
+        # narrows further, sections/readmes keys absent.
+        r = search_mod.mode_search(
+            seeded_db, query="surface:taxonomy kind:collection indexing",
+            filters={"domain": "rag"}, limit=10,
+        )
+        assert "sections" not in r
+        assert "readmes" not in r
+        kinds = {row["kind"] for row in r["taxonomy"]}
+        assert kinds <= {"collection"}
+
+    def test_markdown_omits_unqueried_buckets(self, seeded_db):
+        r = search_mod.mode_search(
+            seeded_db, query="surface:taxonomy reasoning",
+            filters={"domain": "rag"}, limit=10,
+        )
+        md = search_mod.format_search_markdown(r)
+        # The taxonomy heading is present; sections / readmes are NOT.
+        assert "## taxonomy" in md
+        assert "## sections" not in md
+        assert "## readmes" not in md
+
+    def test_surface_taxonomy_rejected_on_bm25(self, seeded_db):
+        r = search_mod.mode_bm25(
+            seeded_db, query="surface:taxonomy BookRAG",
+            filters={}, limit=10,
+        )
+        assert r["status"] == "malformed_query"
+        assert "taxonomy" in r["error"]
+
+    def test_paper_qualifier_in_search(self, seeded_db):
+        r = search_mod.mode_search(
+            seeded_db, query="paper:bookrag_2024 BookRAG",
+            filters={}, limit=10,
+        )
+        names = {g["paper_name"] for g in r["sections"]}
+        assert names == {"bookrag_2024"} or names == set()  # any others excluded
+
+    def test_malformed_search_query_is_soft_fail(self, seeded_db):
+        r = search_mod.mode_search(
+            seeded_db, query='"unclosed', filters={}, limit=10,
+        )
+        assert r["status"] == "malformed_query"
+        assert r["mode"] == "search"
+
+    def test_search_qualifier_only_is_empty_query(self, seeded_db):
+        r = search_mod.mode_search(
+            seeded_db, query="paper:bookrag_2024",
+            filters={}, limit=10,
+        )
+        assert r["status"] == "empty_query"
+
+
+class TestModeSearchMulti:
+    """Multi-query fan-out: each query runs through mode_search
+    independently; per-query payloads concatenated into one envelope."""
+
+    def test_envelope_shape(self, seeded_db):
+        r = search_mod.mode_search_multi(
+            seeded_db,
+            queries=["BookRAG", "RAPTOR"],
+            filters={"domain": "rag"},
+            limit=5,
+        )
+        assert r["mode"] == "search"
+        assert r["multi"] is True
+        assert r["queries"] == ["BookRAG", "RAPTOR"]
+        assert r["domain"] == "rag"
+        assert isinstance(r["results"], list) and len(r["results"]) == 2
+        # Each sub-payload is a full mode_search envelope.
+        for sub in r["results"]:
+            assert sub["mode"] == "search"
+            assert "taxonomy" in sub
+            assert "sections" in sub
+            assert "readmes" in sub
+
+    def test_each_query_runs_independently(self, seeded_db):
+        # Two queries hitting different canonicals — fan-out preserves
+        # per-query routing rather than OR-ing them into one big query.
+        r = search_mod.mode_search_multi(
+            seeded_db,
+            queries=["BookRAG", "RAPTOR"],
+            filters={"domain": "rag"},
+            limit=5,
+        )
+        sub_a, sub_b = r["results"]
+        assert sub_a["query"] == "BookRAG"
+        assert sub_b["query"] == "RAPTOR"
+
+    def test_per_query_qualifiers_independent(self, seeded_db):
+        # Different surface qualifiers per query → each sub-payload only
+        # populates its own bucket subset.
+        r = search_mod.mode_search_multi(
+            seeded_db,
+            queries=["surface:taxonomy BookRAG", "surface:sections BookRAG"],
+            filters={"domain": "rag"},
+            limit=5,
+        )
+        a, b = r["results"]
+        assert "taxonomy" in a and "sections" not in a and "readmes" not in a
+        assert "sections" in b and "taxonomy" not in b and "readmes" not in b
+
+    def test_per_query_soft_failure_preserved(self, seeded_db):
+        # One good query + one malformed query: the malformed one comes
+        # back as a soft-failure inside the per-query payload, the good
+        # one runs normally. The envelope itself is NOT marked as failed.
+        r = search_mod.mode_search_multi(
+            seeded_db,
+            queries=["BookRAG", '"unclosed'],
+            filters={"domain": "rag"},
+            limit=5,
+        )
+        assert r.get("status") is None  # envelope itself OK
+        good, bad = r["results"]
+        assert good.get("status") is None
+        assert bad["status"] == "malformed_query"
+
+    def test_empty_queries_list_soft_fails(self, seeded_db):
+        r = search_mod.mode_search_multi(
+            seeded_db, queries=[], filters={}, limit=5,
+        )
+        assert r["status"] == "empty_query"
+        assert r["mode"] == "search"
+
+    def test_too_many_queries_soft_fails(self, seeded_db):
+        # Cap at _MAX_SEARCH_MULTI_QUERIES; over-cap returns malformed
+        # rather than silently truncating.
+        cap = search_mod._MAX_SEARCH_MULTI_QUERIES
+        r = search_mod.mode_search_multi(
+            seeded_db,
+            queries=["foo"] * (cap + 1),
+            filters={},
+            limit=5,
+        )
+        assert r["status"] == "malformed_query"
+        assert "too many" in r["error"]
+
+    def test_filters_apply_uniformly(self, seeded_db):
+        # domain kwarg applies to every fan-out query.
+        r = search_mod.mode_search_multi(
+            seeded_db,
+            queries=["BookRAG", "RAPTOR"],
+            filters={"domain": "other"},  # no seeded paper in 'other'
+            limit=5,
+        )
+        for sub in r["results"]:
+            assert sub["taxonomy"] == []
+
+    def test_markdown_renders_each_query(self, seeded_db):
+        r = search_mod.mode_search_multi(
+            seeded_db,
+            queries=["BookRAG", "RAPTOR"],
+            filters={"domain": "rag"},
+            limit=5,
+        )
+        md = search_mod.format_search_markdown(r)
+        assert md.startswith("# search (multi: 2 queries)")
+        assert "## query 1: 'BookRAG'" in md
+        assert "## query 2: 'RAPTOR'" in md
+        # Sub-buckets are demoted by one level so they nest cleanly.
+        assert "### taxonomy" in md
+        assert "### sections" in md
+        # The sub-payload's own H1 ("# search 'q'") was stripped.
+        assert "# search 'BookRAG'" not in md
+        assert "# search 'RAPTOR'" not in md
+
+    def test_markdown_renders_per_query_soft_failure(self, seeded_db):
+        r = search_mod.mode_search_multi(
+            seeded_db,
+            queries=["BookRAG", '"unclosed'],
+            filters={"domain": "rag"},
+            limit=5,
+        )
+        md = search_mod.format_search_markdown(r)
+        # The per-query header is present for both; the malformed status
+        # is tagged onto the H2 of the failing query so the diagnostic
+        # is visible in the document outline.
+        assert "## query 1: 'BookRAG'" in md
+        assert '## query 2 (malformed query): \'"unclosed\'' in md
+        # And the inline error/hint surface in the body.
+        assert "unclosed quote" in md
+
+
+def _system_search_soft_failures() -> frozenset[str]:
+    """Tiny helper so the empty-query test can verify the status string is
+    a member of the project's soft-failure set without re-importing the
+    private constant inside the test class."""
+    from _system.scripts.search import _SOFT_FAILURE_STATUSES
+    return _SOFT_FAILURE_STATUSES
 
 
 # ===========================================================================

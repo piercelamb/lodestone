@@ -440,13 +440,13 @@ class TestProtocolValidation:
 
 
 class TestToolsList:
-    def test_tools_list_returns_eight_tools(self):
+    def test_tools_list_returns_nine_tools(self):
         out = mcp_server._handle_tools_list({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         tools = out["result"]["tools"]
-        assert len(tools) == 8
+        assert len(tools) == 9
         names = {t["name"] for t in tools}
         assert names == {
-            "bm25", "lookup", "browse", "toc", "read",
+            "search", "bm25", "lookup", "browse", "toc", "read",
             "figure", "repo_tree", "read_code",
         }
         for t in tools:
@@ -460,6 +460,197 @@ class TestToolsList:
         # `__` would corrupt that prefix.
         for t in mcp_server.TOOLS:
             assert "__" not in t["name"], t["name"]
+
+
+# ===========================================================================
+# search tool — first-pass composite
+# ===========================================================================
+
+
+class TestSearchTool:
+    """The `search` tool is text-only by design (AttachMode.NONE) — it
+    fans out to taxonomy + sections-bm25 + readmes-bm25 and never inlines
+    figures, even when section snippets contain (figure:N) refs."""
+
+    def test_search_returns_three_buckets(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(state, "search", {"query": "Tree of Thoughts"})
+        assert not _is_error(resp), resp
+        assert not _has_image(resp), "search must not attach figure images"
+
+        # Text block is now markdown (token-cheap orientation digest).
+        text_blocks = _text_blocks(_content(resp))
+        assert len(text_blocks) == 1
+        text = text_blocks[0]["text"]
+        assert text.startswith("# search")
+        assert "## taxonomy" in text
+        assert "## sections" in text
+        assert "## readmes" in text
+
+        # Full JSON payload still rides on structuredContent for callers
+        # that want it (CLI, structured pipelines).
+        payload = resp["result"]["structuredContent"]
+        assert payload["mode"] == "search"
+        assert "taxonomy" in payload
+        assert "sections" in payload
+        assert "readmes" in payload
+
+    def test_search_no_image_blocks_even_with_figure_refs(self, fig_db):
+        # _MD_WITH_FIGS has (figure:1) in the Method section. A bm25-scope
+        # call would attach the image; search must NOT.
+        state = _make_state(fig_db)
+        resp = _call(state, "search", {"query": "tree expansion"})
+        assert not _has_image(resp), (
+            "search response carried image blocks despite AttachMode.NONE"
+        )
+
+    def test_search_empty_query_soft_fail(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(state, "search", {"query": ""})
+        # Soft-failure: payload carries the diagnostic, isError stays false.
+        assert not _is_error(resp)
+        # Markdown text surfaces the soft-fail header for the agent.
+        text = _text_blocks(_content(resp))[0]["text"]
+        assert text.startswith("# search (empty query)")
+        # Structured payload still carries the machine-readable status.
+        assert resp["result"]["structuredContent"]["status"] == "empty_query"
+
+    def test_search_missing_query_argument(self, fig_db):
+        # Missing required arg surfaces as JSON-RPC InvalidParams (code -32602)
+        # via the dispatcher's KeyError path.
+        state = _make_state(fig_db)
+        resp = mcp_server._handle_tools_call(
+            state,
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "search", "arguments": {}}},
+        )
+        assert "error" in resp
+        assert resp["error"]["code"] == -32602
+
+    def test_search_domain_filter_passes_through(self, fig_db):
+        state = _make_state(fig_db)
+        # 'rag' has the seeded paper; 'bogus' should narrow everything to empty.
+        resp = _call(state, "search", {"query": "Tree", "domain": "bogus"})
+        payload = resp["result"]["structuredContent"]
+        assert payload["domain"] == "bogus"
+        assert payload["taxonomy"] == []
+        assert payload["sections"] == []
+        assert payload["readmes"] == []
+
+    def test_search_operator_query(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(state, "search", {"query": "Tree OR thoughts"})
+        assert not _is_error(resp)
+        payload = resp["result"]["structuredContent"]
+        assert payload["mode"] == "search"
+        # OR should at least match the seeded tot_2023 paper.
+        names = {g["paper_name"] for g in payload["sections"]}
+        assert "tot_2023" in names
+
+    def test_search_paper_qualifier(self, fig_db):
+        state = _make_state(fig_db)
+        # paper: qualifier narrows the bm25 sections subquery to one paper.
+        resp = _call(state, "search", {"query": "paper:tot_2023 tree"})
+        payload = resp["result"]["structuredContent"]
+        names = {g["paper_name"] for g in payload["sections"]}
+        # Either no hits, or only tot_2023.
+        assert names <= {"tot_2023"}, payload
+
+    def test_search_malformed_query_is_soft_fail(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(state, "search", {"query": '"unclosed'})
+        assert not _is_error(resp)
+        text = _text_blocks(_content(resp))[0]["text"]
+        assert text.startswith("# search (malformed query)")
+        assert resp["result"]["structuredContent"]["status"] == "malformed_query"
+
+    def test_search_query_array_fans_out(self, fig_db):
+        # Pass query as an array: each string runs as its own mode_search,
+        # results are concatenated under the multi envelope.
+        state = _make_state(fig_db)
+        resp = _call(state, "search", {"query": ["Tree", "Thoughts"]})
+        assert not _is_error(resp)
+        assert not _has_image(resp), "search must not attach figure images"
+        payload = resp["result"]["structuredContent"]
+        assert payload["mode"] == "search"
+        assert payload["multi"] is True
+        assert payload["queries"] == ["Tree", "Thoughts"]
+        assert len(payload["results"]) == 2
+        # Each sub-payload is a full mode_search envelope.
+        for sub in payload["results"]:
+            assert sub["mode"] == "search"
+            assert "taxonomy" in sub
+            assert "sections" in sub
+            assert "readmes" in sub
+        # Markdown text reflects the multi envelope.
+        text = _text_blocks(_content(resp))[0]["text"]
+        assert text.startswith("# search (multi: 2 queries)")
+        assert "## query 1: 'Tree'" in text
+        assert "## query 2: 'Thoughts'" in text
+
+    def test_search_query_array_with_per_query_qualifiers(self, fig_db):
+        # Per-query qualifiers route independently — surface:taxonomy on
+        # one, surface:sections on the other.
+        state = _make_state(fig_db)
+        resp = _call(state, "search", {"query": [
+            "surface:taxonomy Tree",
+            "surface:sections tree",
+        ]})
+        assert not _is_error(resp)
+        payload = resp["result"]["structuredContent"]
+        a, b = payload["results"]
+        assert "taxonomy" in a and "sections" not in a
+        assert "sections" in b and "taxonomy" not in b
+
+    def test_search_query_array_mixed_failure(self, fig_db):
+        # One good query + one malformed: envelope itself stays OK
+        # (isError=false), the malformed one surfaces inside its
+        # per-query payload.
+        state = _make_state(fig_db)
+        resp = _call(state, "search", {"query": ["Tree", '"unclosed']})
+        assert not _is_error(resp)
+        payload = resp["result"]["structuredContent"]
+        assert payload["multi"] is True
+        good, bad = payload["results"]
+        assert good.get("status") is None
+        assert bad["status"] == "malformed_query"
+
+    def test_search_query_array_too_many_soft_fails(self, fig_db):
+        state = _make_state(fig_db)
+        # Cap is 8 (also enforced by the JSON Schema maxItems, but the
+        # mode-level guard is the real one — schema is advisory at this
+        # MCP transport).
+        resp = _call(state, "search", {"query": ["x"] * 9})
+        assert not _is_error(resp)
+        payload = resp["result"]["structuredContent"]
+        assert payload["status"] == "malformed_query"
+        assert "too many" in payload["error"]
+
+
+# ===========================================================================
+# bm25 tool — query syntax through the MCP boundary
+# ===========================================================================
+
+
+class TestBm25SyntaxAtMcp:
+    def test_bm25_paper_qualifier(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(state, "bm25", {"query": "paper:tot_2023 tree"})
+        assert not _is_error(resp)
+        # bm25 with figure refs in snippet returns the image envelope (no
+        # structuredContent), so parse the JSON text block instead.
+        text = _text_blocks(_content(resp))[0]["text"]
+        payload = json.loads(text)
+        names = {g["paper_name"] for g in payload.get("results", [])}
+        assert names <= {"tot_2023"}, payload
+
+    def test_bm25_malformed_query_is_soft_fail(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(state, "bm25", {"query": "/regex.*/"})
+        assert not _is_error(resp)
+        payload = resp["result"]["structuredContent"]
+        assert payload["status"] == "malformed_query"
+        assert "regex" in payload["error"].lower()
 
 
 # ===========================================================================
@@ -561,7 +752,7 @@ class TestProtocolHandshake:
         list_reply = responses[1]
         assert list_reply["id"] == 2
         tools = list_reply["result"]["tools"]
-        assert len(tools) == 8
+        assert len(tools) == 9
         for t in tools:
             assert t["name"].replace("_", "").isalnum()
 
