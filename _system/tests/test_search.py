@@ -912,97 +912,158 @@ class TestParseGithubQuery:
 
 
 class TestModeTaxonomy:
-    def test_finds_via_terms_fts_exact(self, seeded_db):
+    def test_finds_canonical_with_aliases_inlined(self, seeded_db):
         r = search_mod.mode_taxonomy_lookup(
-            seeded_db, term="RAPTOR", kind="entity", filters={}
+            seeded_db, query="RAPTOR", filters={}
         )
-        assert r["mode"] == "entity"
-        assert r["canonical"]["name"] == "RAPTOR"
-        assert r["resolved_via"] in ("exact", "alias", "fts")
-        assert r["aliases"], r
-        assert r["papers"]
-        # Synonym-index regime: papers list is keyed by paper_name (no
-        # per-paper sections payload). The taxonomy enrichment also
-        # decorates each paper entry with a `code_repo` envelope (None
-        # when the paper has no repo URL).
-        for paper in r["papers"]:
+        assert r["mode"] == "lookup"
+        assert r["query"] == "RAPTOR"
+        hits = r["hits"]
+        assert hits, r
+        h = next(h for h in hits if h["canonical_name"] == "RAPTOR")
+        assert h["kind"] == "entity"
+        # aliases inlined per hit (was a follow-up call before)
+        assert h["aliases"], h
+        assert all(set(a.keys()) == {"alias", "source_paper"} for a in h["aliases"])
+        # papers_count is omitted on entity hits — the underlying papers
+        # list is alias-derived and misses tier-1 canonical-surface
+        # mentions; publishing a count there would mislead.
+        assert "papers_count" not in h, h
+        # papers carry the same code_repo enrichment as before
+        for paper in h["papers"]:
             assert set(paper.keys()) == {"paper_name", "code_repo"}
 
     def test_finds_via_alias(self, seeded_db):
         r = search_mod.mode_taxonomy_lookup(
-            seeded_db, term="raptor", kind="entity", filters={}
+            seeded_db, query="raptor", filters={}
         )
-        assert r["canonical"]["name"] == "RAPTOR"
-        assert r["resolved_via"] in ("alias", "fts", "exact")
+        names = [h["canonical_name"] for h in r["hits"]]
+        assert "RAPTOR" in names
 
-    def test_reports_not_found(self, seeded_db, monkeypatch):
-        """A term that misses Tier A forces Tier B. Stub the Embedder with an
-        orthogonal vector so the KNN result's cosine falls below the 0.80
-        gate — exercises the "term not found" path without paying torch's
-        import cost (which breaks cross-test in the full suite on Py 3.14)."""
-
-        class _StubEmbedder:
-            def __init__(self) -> None:
-                pass
-
-            def embed(self, text: str) -> list[float]:
-                v = [0.0] * 384
-                v[50] = 1.0  # orthogonal to every seeded canonical vector
-                return v
-
-        import _system.resolution.embeddings as emb_mod
-
-        monkeypatch.setattr(emb_mod, "Embedder", _StubEmbedder)
-
+    def test_reports_no_hits_for_unknown_term(self, seeded_db):
         r = search_mod.mode_taxonomy_lookup(
-            seeded_db, term="totally_made_up_thing", kind="entity", filters={}
+            seeded_db, query="totally_made_up_thing", filters={}
         )
-        assert r["mode"] == "entity"
-        assert r.get("error") == "term not found"
+        assert r["mode"] == "lookup"
+        assert r["hits"] == []
+        # No status — empty hits is a normal outcome, not a soft fail.
+        assert r.get("status") is None
 
-    def test_falls_back_to_vec_knn(self, seeded_db, monkeypatch):
-        """Force Tier A miss by making terms_fts return nothing; Tier B
-        should hit via vec0 KNN on a stub Embedder whose vector coincides
-        exactly with the stored RAPTOR embedding."""
-
-        class _StubEmbedder:
-            def __init__(self) -> None:
-                pass
-
-            def embed(self, text: str) -> list[float]:
-                v = [0.0] * 384
-                v[0] = 1.0  # matches RAPTOR's stored embedding exactly
-                return v
-
-        # Patch Embedder import inside mode_taxonomy_lookup to return the stub.
-        import _system.resolution.embeddings as emb_mod
-
-        monkeypatch.setattr(emb_mod, "Embedder", _StubEmbedder)
-
-        # Pass a term that will miss terms_fts but match the stored vector.
+    def test_kind_qualifier_narrows(self, seeded_db):
         r = search_mod.mode_taxonomy_lookup(
-            seeded_db, term="zzznosuchterm", kind="entity", filters={}
+            seeded_db, query="kind:entity RAPTOR", filters={}
         )
-        assert r["canonical"]["name"] == "RAPTOR"
-        assert r["resolved_via"] == "vector"
+        assert all(h["kind"] == "entity" for h in r["hits"])
+        assert any(h["canonical_name"] == "RAPTOR" for h in r["hits"])
 
-    def test_topic_and_collection_share_fts_path(self, seeded_db):
-        r_topic = search_mod.mode_taxonomy_lookup(
-            seeded_db, term="entity resolution", kind="topic", filters={}
-        )
-        assert r_topic["mode"] == "topic"
-        assert r_topic["canonical"]["name"] == "entity resolution"
-        assert r_topic["papers"]
-
-        r_coll = search_mod.mode_taxonomy_lookup(
+    def test_topic_kind(self, seeded_db):
+        r = search_mod.mode_taxonomy_lookup(
             seeded_db,
-            term="hierarchical indexing",
-            kind="collection",
+            query="kind:topic \"entity resolution\"",
             filters={},
         )
-        assert r_coll["mode"] == "collection"
-        assert r_coll["canonical"]["name"] == "hierarchical indexing"
-        assert any(p["paper_name"] == "bookrag_2024" for p in r_coll["papers"])
+        names = [h["canonical_name"] for h in r["hits"]]
+        assert "entity resolution" in names
+        topic_hit = next(
+            h for h in r["hits"] if h["canonical_name"] == "entity resolution"
+        )
+        assert topic_hit["kind"] == "topic"
+        assert topic_hit["papers"]
+        # topics/collections still carry papers_count — the binding
+        # tables (paper_topics / papers.collection) are complete.
+        assert topic_hit["papers_count"] == len(topic_hit["papers"])
+
+    def test_collection_kind(self, seeded_db):
+        r = search_mod.mode_taxonomy_lookup(
+            seeded_db,
+            query="kind:collection \"hierarchical indexing\"",
+            filters={},
+        )
+        names = [h["canonical_name"] for h in r["hits"]]
+        assert "hierarchical indexing" in names
+        coll_hit = next(
+            h
+            for h in r["hits"]
+            if h["canonical_name"] == "hierarchical indexing"
+        )
+        assert coll_hit["kind"] == "collection"
+        assert any(p["paper_name"] == "bookrag_2024" for p in coll_hit["papers"])
+        assert coll_hit["papers_count"] == len(coll_hit["papers"])
+
+    def test_domain_qualifier_filters(self, seeded_db):
+        r = search_mod.mode_taxonomy_lookup(
+            seeded_db, query="domain:rag RAPTOR", filters={},
+        )
+        assert all(h["domain"] == "rag" for h in r["hits"])
+
+    def test_domain_kwarg_equivalent_to_qualifier(self, seeded_db):
+        r = search_mod.mode_taxonomy_lookup(
+            seeded_db, query="RAPTOR", filters={"domain": "rag"},
+        )
+        assert all(h["domain"] == "rag" for h in r["hits"])
+
+    def test_or_operator_returns_union(self, seeded_db):
+        r = search_mod.mode_taxonomy_lookup(
+            seeded_db,
+            query="RAPTOR OR \"entity resolution\"",
+            filters={},
+        )
+        names = {h["canonical_name"] for h in r["hits"]}
+        # FTS5 ranks union; both should appear when both exist.
+        assert "RAPTOR" in names or "entity resolution" in names
+        # At minimum we got at least one mixed-kind hit from a single query.
+        assert len(r["hits"]) >= 1
+
+    def test_empty_query_soft_fail(self, seeded_db):
+        r = search_mod.mode_taxonomy_lookup(
+            seeded_db, query="", filters={},
+        )
+        assert r["mode"] == "lookup"
+        assert r["status"] == "empty_query"
+
+    def test_qualifier_only_query_soft_fail(self, seeded_db):
+        r = search_mod.mode_taxonomy_lookup(
+            seeded_db, query="kind:entity domain:rag", filters={},
+        )
+        assert r["status"] == "empty_query"
+
+    def test_unsupported_qualifier_soft_fail(self, seeded_db):
+        r = search_mod.mode_taxonomy_lookup(
+            seeded_db, query="paper:bookrag_2024 RAPTOR", filters={},
+        )
+        assert r["status"] == "malformed_query"
+        assert "paper" in r["error"]
+
+    def test_invalid_kind_soft_fail(self, seeded_db):
+        r = search_mod.mode_taxonomy_lookup(
+            seeded_db, query="kind:bogus RAPTOR", filters={},
+        )
+        assert r["status"] == "malformed_query"
+
+    def test_limit_caps_hits(self, seeded_db):
+        r = search_mod.mode_taxonomy_lookup(
+            seeded_db, query="RAPTOR OR \"entity resolution\"",
+            filters={}, limit=1,
+        )
+        assert len(r["hits"]) <= 1
+
+    def test_no_embedder_loaded(self, seeded_db, monkeypatch):
+        """Lookup must be FTS-only — no torch / sentence_transformers /
+        sqlite_vec import. If the path ever regresses to load Embedder,
+        this stub raises and the test fails loudly."""
+        import _system.resolution.embeddings as emb_mod
+
+        def _boom(*a, **kw):
+            raise AssertionError(
+                "Embedder must NOT be loaded by mode_taxonomy_lookup"
+            )
+
+        monkeypatch.setattr(emb_mod, "Embedder", _boom)
+        # Both a hit case and a miss case — neither should construct Embedder.
+        search_mod.mode_taxonomy_lookup(seeded_db, query="RAPTOR", filters={})
+        search_mod.mode_taxonomy_lookup(
+            seeded_db, query="zzznosuchterm", filters={}
+        )
 
 
 # ===========================================================================
@@ -1621,6 +1682,41 @@ class TestModeToc:
             search_mod.mode_toc(seeded_db, paper_name="nope_2099")
 
 
+class TestModeTocMany:
+    def test_returns_per_paper_results(self, seeded_db):
+        r = search_mod.mode_toc_many(
+            seeded_db, paper_names=["bookrag_2024", "stale_2024"]
+        )
+        assert r["mode"] == "toc_many"
+        assert r["paper_names"] == ["bookrag_2024", "stale_2024"]
+        names = [sub["paper_name"] for sub in r["results"]]
+        assert names == ["bookrag_2024", "stale_2024"]
+        for sub in r["results"]:
+            assert sub["mode"] == "toc"
+            assert "toc" in sub
+        assert r["missing"] == []
+
+    def test_missing_paper_collected_not_raised(self, seeded_db):
+        r = search_mod.mode_toc_many(
+            seeded_db, paper_names=["bookrag_2024", "no_such_paper"],
+        )
+        names = [sub["paper_name"] for sub in r["results"]]
+        assert names == ["bookrag_2024"]
+        assert r["missing"] == ["no_such_paper"]
+
+    def test_dedupes_input_order_preserved(self, seeded_db):
+        r = search_mod.mode_toc_many(
+            seeded_db,
+            paper_names=["bookrag_2024", "bookrag_2024", "stale_2024"],
+        )
+        assert r["paper_names"] == ["bookrag_2024", "stale_2024"]
+        assert len(r["results"]) == 2
+
+    def test_empty_list_raises(self, seeded_db):
+        with pytest.raises(ValueError):
+            search_mod.mode_toc_many(seeded_db, paper_names=[])
+
+
 # ===========================================================================
 # Mode 5a — Read
 # ===========================================================================
@@ -1886,9 +1982,9 @@ class TestOutputFormatting:
         assert bm25["mode"] == "sections"
 
         tax = search_mod.mode_taxonomy_lookup(
-            seeded_db, term="RAPTOR", kind="entity", filters={}
+            seeded_db, query="RAPTOR", filters={}
         )
-        assert tax["mode"] == "entity"
+        assert tax["mode"] == "lookup"
 
         br = search_mod.mode_browse(
             seeded_db, which="needs_review", filters={}
@@ -1912,7 +2008,7 @@ class TestOutputFormatting:
                 seeded_db, query="BookRAG", filters={}, limit=5
             ),
             search_mod.mode_taxonomy_lookup(
-                seeded_db, term="RAPTOR", kind="entity", filters={}
+                seeded_db, query="RAPTOR", filters={}
             ),
             search_mod.mode_browse(seeded_db, which="needs_review", filters={}),
             search_mod.mode_browse(

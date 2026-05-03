@@ -640,42 +640,115 @@ def test_rerun_deletes_existing_paper_topics_before_insert(tmp_db_with_domain):
     assert len(topics) == 2
 
 
-def test_rerun_does_not_delete_canonical_terms_or_aliases(tmp_db_with_domain):
-    _seed_paper(tmp_db_with_domain)
-    tmp_db_with_domain.execute(
-        """
-        INSERT INTO canonical_terms (domain, term_type, entity_type, canonical_name, first_seen_in)
-        VALUES (?, ?, '', ?, ?)
-        """,
-        ("rag", "topic", "other topic", "some_other_paper"),
-    )
-    tmp_db_with_domain.execute(
-        """
-        INSERT INTO term_aliases (term_id, alias, source_paper, match_tier)
-        VALUES (1, 'an alias', 'some_other_paper', 2)
-        """
-    )
-    pre_terms = tmp_db_with_domain.execute(
-        "SELECT COUNT(*) FROM canonical_terms"
-    ).fetchone()[0]
-    pre_aliases = tmp_db_with_domain.execute(
-        "SELECT COUNT(*) FROM term_aliases"
-    ).fetchone()[0]
+class _OrthogonalEmbedder:
+    """Per-unique-string orthogonal vectors — guarantees tier-4 cannot
+    spuriously merge two distinct strings (cosine = 0). Avoids the
+    FakeEmbedder's per-process-randomized ``hash() % 384`` collision risk
+    that shows up in tests that exercise the resolver across runs."""
 
+    def __init__(self) -> None:
+        self._index: dict[str, int] = {}
+
+    def _vec_for(self, text: str) -> list[float]:
+        idx = self._index.setdefault(text, len(self._index))
+        v = [0.0] * 384
+        v[idx % 384] = 1.0
+        return v
+
+    def embed(self, text: str) -> list[float]:
+        return self._vec_for(text)
+
+    def embed_batch(self, texts):  # pragma: no cover
+        return [self.embed(t) for t in texts]
+
+
+def test_rerun_gcs_orphan_topic_canonicals_from_prior_run(tmp_db_with_domain):
+    """Re-classify wipes the paper's prior `paper_topics` rows up front.
+    If the second LLM run emits different topic phrasings, the first
+    run's topic canonicals are orphaned in `canonical_terms`. The
+    end-of-transaction GC must remove them once the new bindings are in
+    place. Bound canonicals from a *different* paper survive (they still
+    have a paper_topics referent).
+    """
+    _seed_paper(tmp_db_with_domain)
+    embedder = _OrthogonalEmbedder()
+
+    # First run: topics = ["apple zoology", "zebra fishery"].
     classify(
         paper_name="paper_name_2024",
         conn=tmp_db_with_domain,
-        call_llm=_fake_runner(),
+        call_llm=_runner_from_dict({
+            "domain_index": 0,
+            "new_domain": "",
+            "new_domain_desc": "",
+            "collection_index": -1,
+            "new_collection": "first cluster",
+            "new_collection_desc": "Initial classification cluster.",
+            "topics": ["apple zoology", "zebra fishery"],
+        }),
+        embedder=embedder,
     )
 
-    post_terms = tmp_db_with_domain.execute(
-        "SELECT COUNT(*) FROM canonical_terms"
-    ).fetchone()[0]
-    post_aliases = tmp_db_with_domain.execute(
-        "SELECT COUNT(*) FROM term_aliases"
-    ).fetchone()[0]
-    assert post_terms >= pre_terms
-    assert post_aliases >= pre_aliases
+    # Seed an unrelated paper that pins a distinct topic canonical so we
+    # can show GC is precise — the unrelated topic must survive.
+    other_paper_id = _seed_paper(
+        tmp_db_with_domain,
+        paper_name="other_2024",
+        arxiv_id="2400.99999",
+        domain="rag",
+        collection="first cluster",
+    )
+    tmp_db_with_domain.execute(
+        "INSERT INTO paper_topics (paper_id, domain, topic) VALUES (?, ?, ?)",
+        (other_paper_id, "rag", "unrelated cantaloupe"),
+    )
+    tmp_db_with_domain.execute(
+        """
+        INSERT INTO canonical_terms (domain, term_type, entity_type, canonical_name, first_seen_in)
+        VALUES (?, 'topic', '', ?, ?)
+        """,
+        ("rag", "unrelated cantaloupe", "other_2024"),
+    )
+
+    # Sanity: run-1 canonicals exist before run-2.
+    pre_topics = {
+        r[0] for r in tmp_db_with_domain.execute(
+            "SELECT canonical_name FROM canonical_terms WHERE term_type = 'topic'"
+        )
+    }
+    assert "apple zoology" in pre_topics
+    assert "zebra fishery" in pre_topics
+    assert "unrelated cantaloupe" in pre_topics
+
+    # Second run: completely different topic phrasings.
+    classify(
+        paper_name="paper_name_2024",
+        conn=tmp_db_with_domain,
+        call_llm=_runner_from_dict({
+            "domain_index": 0,
+            "new_domain": "",
+            "new_domain_desc": "",
+            "collection_index": 0,  # existing "first cluster"
+            "new_collection": "",
+            "new_collection_desc": "",
+            "topics": ["foobar widget", "qux baz silo"],
+        }),
+        embedder=embedder,
+    )
+
+    post_topics = {
+        r[0] for r in tmp_db_with_domain.execute(
+            "SELECT canonical_name FROM canonical_terms WHERE term_type = 'topic'"
+        )
+    }
+    # Run-1 orphans gone.
+    assert "apple zoology" not in post_topics
+    assert "zebra fishery" not in post_topics
+    # Run-2 canonicals present.
+    assert "foobar widget" in post_topics
+    assert "qux baz silo" in post_topics
+    # Bound canonical from the other paper survives.
+    assert "unrelated cantaloupe" in post_topics
 
 
 def test_second_run_idempotent_paper_topics_set(tmp_db_with_domain):

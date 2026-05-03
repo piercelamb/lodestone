@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Iterable, NamedTuple
 
 from _system.db.connection import get_conn, transaction
+from _system.db.orphan_gc import gc_orphan_topic_collection_canonicals
 from _system.llm import call_structured, load_prompt
 from _system.resolution.embeddings import Embedder
 from _system.resolution.resolver import pending_fts_rebuilds, resolve
@@ -294,6 +295,15 @@ def classify(
         )
 
         pending_fts_rebuilds(conn).update(touched_term_ids)
+
+        # Re-classify deletes the paper's paper_topics rows up front and
+        # re-runs the LLM. Topic canonicals from the *previous* run that
+        # the new run didn't re-bind are now orphaned in canonical_terms;
+        # collection canonicals can also orphan if the only paper that
+        # used them just moved off. GC them here, after all new bindings
+        # are in place. A GC'd canonical's deferred FTS rebuild becomes a
+        # no-op against an absent row (harmless).
+        gc_orphan_topic_collection_canonicals(conn)
 
     _LOG.info(
         "classified paper_id=%s paper_name=%s domain=%s collection=%s "

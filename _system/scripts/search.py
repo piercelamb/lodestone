@@ -22,10 +22,10 @@ Five modes dispatched by argparse:
 
 JSON is emitted to stdout by default. ``--human`` renders a short plaintext
 per mode. All logging goes to stderr via the shared :mod:`_system.utils.logging`
-logger. ``--help`` must finish in under 300 ms, so no ML library
-(``sentence_transformers`` / ``gliner2`` / ``torch``) may be imported at
-module scope — the sole caller (``mode_taxonomy_lookup`` Tier B) lazy-imports
-the :class:`Embedder`.
+logger. ``--help`` must finish in under 300 ms — no ML library
+(``sentence_transformers`` / ``gliner2`` / ``torch``) is imported anywhere
+in this module. Search across all modes is FTS5-only; semantic broadening
+lives upstream in the resolver / ingest path.
 """
 from __future__ import annotations
 
@@ -55,11 +55,6 @@ from _system.utils.sections import (
 from _system.utils.slug import _SLUG_RE
 
 _LOG = get_logger("scripts.search")
-
-# Cosine threshold for Tier-B vec0 KNN fallback in taxonomy lookup.
-# Looser than the resolver's 0.85 because this is a discovery tool — the
-# user is typing a surface form, not a curated alias.
-_TAXONOMY_VEC_MIN_COSINE = 0.80
 
 # BM25 enrichment size cap. Keeping each follow-up query small bounds the
 # JSON payload size even on queries that return many hits.
@@ -947,136 +942,180 @@ def _figures_preview_batch(
 def mode_taxonomy_lookup(
     conn: sqlite3.Connection,
     *,
-    term: str,
-    kind: str,
+    query: str,
     filters: dict[str, Any],
+    limit: int = 10,
 ) -> dict[str, Any]:
-    """Resolve ``term`` to a canonical row via ``terms_fts`` (Tier A) with
-    a ``term_embeddings`` KNN fallback (Tier B). ``kind`` ∈ :class:`TaxonomyKind`.
+    """Canonical-term FTS5 search with aliases inlined per hit.
 
-    On miss returns ``{"mode": kind, "term": term, "error": "term not found"}``
-    — does NOT raise.
+    ``query`` is a GitHub-code-search-style string parsed by
+    :func:`_parse_github_query`: bare tokens (implicit AND), ``"phrase"``,
+    ``AND``/``OR``/``NOT``, parens, prefix ``term*``. Two qualifiers are
+    honored: ``kind:entity|topic|collection`` (narrows the term_type
+    bucket) and ``domain:NAME``. ``paper:`` / ``collection:`` /
+    ``surface:`` are rejected — they have no meaning against canonical
+    terms.
+
+    Returns up to ``limit`` ranked hits. Each hit carries the canonical
+    metadata, every alias for the term (with its source paper), and the
+    list of papers that mention it (papers per kind: aliases-source for
+    entities, paper_topics for topics, papers.collection for collections).
+
+    No KNN / vector fallback — this is the precise canonical-search path.
+    Semantic broadening lives in the resolver / ingest pipeline; the
+    ``search`` tool's taxonomy bucket gives a wider FTS sweep at lower
+    detail.
+
+    Soft failures (no exception raised; soft-status payload):
+
+    * ``empty_query`` — punctuation-only or qualifier-only query
+    * ``malformed_query`` — quote/paren/operator mismatch, unknown
+      qualifier (incl. ``paper:`` / ``collection:`` / ``surface:``),
+      ``kind:`` value outside the allowed set, or qualifier↔kwarg
+      conflict
     """
+    if not query or not query.strip():
+        return _empty_query_payload(
+            mode="lookup", query=query, error="empty query",
+        )
+
     try:
-        kind_enum = TaxonomyKind(kind)
-    except ValueError as exc:
-        raise ValueError(f"invalid taxonomy kind: {kind!r}") from exc
-
-    domain = filters.get("domain")
-
-    # ------- Tier A: terms_fts MATCH with inline metadata predicates ------
-    hit = _taxonomy_tier_a(conn, term=term, kind=kind_enum, domain=domain)
-    resolved_via: str | None = None
-    if hit is not None:
-        term_id, dom, term_type, entity_type, canonical_name = hit
-        resolved_via = _classify_tier_a_match(
-            conn, term=term, term_id=term_id, canonical_name=canonical_name
+        parsed = _parse_github_query(query)
+    except EmptyQueryError as e:
+        return _empty_query_payload(mode="lookup", query=query, error=str(e))
+    except GitHubQueryError as e:
+        return _malformed_query_payload(
+            mode="lookup", query=query, error=str(e),
         )
 
-    # ------- Tier B: vec0 KNN. Lazy Embedder import. ---------------------
-    if hit is None:
-        # Lazy import: keeps `search.py --help` under 300 ms when Tier B
-        # never fires.
-        from _system.resolution.embeddings import Embedder  # noqa: PLC0415
+    for bad in ("paper", "collection", "surface"):
+        if bad in parsed.qualifiers:
+            return _malformed_query_payload(
+                mode="lookup", query=query,
+                error=f"{bad}: qualifier is not valid on lookup; "
+                      f"supported qualifiers are kind:, domain:.",
+            )
 
-        import sqlite_vec  # noqa: PLC0415
-
-        embedder = Embedder()
-        qvec = sqlite_vec.serialize_float32(embedder.embed(term))
-        knn_sql = (
-            "SELECT te.term_id, te.distance, ct.domain, ct.term_type, "
-            "       ct.entity_type, ct.canonical_name "
-            "  FROM term_embeddings te "
-            "  JOIN canonical_terms ct ON ct.id = te.term_id "
-            " WHERE te.embedding MATCH ? "
-            "   AND te.term_type = ? "
-            "   AND te.k = 1"
+    try:
+        domain = _merge_qualifier_with_kwarg(
+            parsed.qualifiers, filters.get("domain"), "domain"
         )
-        knn_params: list[Any] = [qvec, kind_enum.value]
-        # Topic / collection canonicals store entity_type=''; without this
-        # narrowing the KNN can return an entity-typed canonical as a
-        # semantic neighbor (cross-kind pollution).
-        if kind_enum in (TaxonomyKind.TOPIC, TaxonomyKind.COLLECTION):
-            knn_sql += " AND te.entity_type = ?"
-            knn_params.append("")
-        if domain:
-            knn_sql += " AND te.domain = ?"
-            knn_params.append(domain)
-        row = conn.execute(knn_sql, knn_params).fetchone()
-        if row is None:
-            return {"mode": kind_enum, "term": term, "error": "term not found"}
-        term_id, distance, dom, term_type, entity_type, canonical_name = row
-        # sqlite-vec returns L2 on unit-norm vectors: cos = 1 - d^2/2.
-        cosine = 1.0 - (distance * distance) / 2.0
-        if cosine < _TAXONOMY_VEC_MIN_COSINE:
-            return {"mode": kind_enum, "term": term, "error": "term not found"}
-        resolved_via = "vector"
+    except ConflictingFilterError as e:
+        return _malformed_query_payload(
+            mode="lookup", query=query, error=str(e),
+        )
 
-    # ------- Build the result payload ------------------------------------
-    # term_aliases is a synonym index: every row carries a non-canonical
-    # surface form. SELECT DISTINCT collapses the same alias across
-    # multiple papers so the keyword set is the union, with the source
-    # papers kept on each row for provenance.
-    aliases_rows = conn.execute(
-        "SELECT DISTINCT alias, source_paper FROM term_aliases "
-        " WHERE term_id = ? ORDER BY alias, source_paper",
-        (term_id,),
-    ).fetchall()
-    aliases_payload = [
-        {"alias": a, "source_paper": s} for a, s in aliases_rows
-    ]
+    kind_filter = parsed.qualifiers.get("kind")
 
-    # For entities, "type" is entity_type; for topic/collection, term_type.
-    type_label = entity_type if term_type == TaxonomyKind.ENTITY else term_type
-    canonical = {
-        "name": canonical_name,
-        "type": type_label,
-        "domain": dom,
-    }
+    if not parsed.fts_expression:
+        return _empty_query_payload(
+            mode="lookup", query=query,
+            error="query held only qualifiers, no FTS body",
+        )
 
-    result: dict[str, Any] = {
-        "mode": kind_enum,
-        "term": term,
-        "canonical": canonical,
-        "resolved_via": resolved_via,
-        "aliases": aliases_payload,
-    }
+    sql = (
+        "SELECT term_id, domain, term_type, entity_type, canonical_name "
+        "  FROM terms_fts "
+        " WHERE terms_fts MATCH ? "
+    )
+    params: list[Any] = [parsed.fts_expression]
+    if kind_filter:
+        sql += " AND term_type = ? "
+        params.append(kind_filter)
+    if domain:
+        sql += " AND domain = ? "
+        params.append(domain)
+    sql += " ORDER BY rank LIMIT ?"
+    params.append(limit)
 
-    # Papers per kind
-    if kind_enum is TaxonomyKind.ENTITY:
-        # No per-paper sections payload under the synonym-index regime —
-        # claude follows up with a positional BM25 query (e.g.
-        # ``"alias1 alias2"``) to locate hit positions; sections is the
-        # only BM25 path. Papers list is the union of
-        # papers that contributed any synonym for this term; tier-1-only
-        # mentions (canonical-as-surface-form) leave no row and so no
-        # paper here, which is fine — the BM25 query catches them via
-        # the canonical name as one of the OR terms.
-        prows = conn.execute(
-            "SELECT DISTINCT source_paper FROM term_aliases "
-            " WHERE term_id = ? ORDER BY source_paper",
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    except sqlite3.OperationalError as exc:
+        # Degenerate MATCH (e.g. all-punctuation after defang) raises
+        # "fts5: syntax error near ..."; treat as zero hits. Anything
+        # else (missing table, IO) is a real failure.
+        if "fts5" not in str(exc).lower():
+            raise
+        _LOG.warning(
+            "terms_fts MATCH syntax error for query=%r: %s", query, exc,
+        )
+        rows = []
+
+    hits: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for term_id, dom, term_type, entity_type, canonical_name in rows:
+        if term_id in seen:
+            continue
+        seen.add(term_id)
+
+        aliases_rows = conn.execute(
+            "SELECT DISTINCT alias, source_paper FROM term_aliases "
+            " WHERE term_id = ? ORDER BY alias, source_paper",
             (term_id,),
         ).fetchall()
-        result["papers"] = [{"paper_name": r[0]} for r in prows]
-    elif kind_enum is TaxonomyKind.TOPIC:
-        prows = conn.execute(
-            "SELECT DISTINCT p.paper_name "
-            "  FROM paper_topics pt "
-            "  JOIN papers p ON p.id = pt.paper_id "
-            " WHERE pt.topic = ? AND pt.domain = ? ORDER BY p.paper_name",
-            (canonical_name, dom),
-        ).fetchall()
-        result["papers"] = [{"paper_name": r[0]} for r in prows]
-    else:  # TaxonomyKind.COLLECTION
-        prows = conn.execute(
-            "SELECT paper_name FROM papers "
-            " WHERE collection = ? AND domain = ? ORDER BY paper_name",
-            (canonical_name, dom),
-        ).fetchall()
-        result["papers"] = [{"paper_name": r[0]} for r in prows]
+        aliases = [
+            {"alias": a, "source_paper": s} for a, s in aliases_rows
+        ]
 
-    _attach_code_repo_to_papers(conn, result["papers"])
-    return result
+        if term_type == TaxonomyKind.ENTITY.value:
+            prows = conn.execute(
+                "SELECT DISTINCT source_paper FROM term_aliases "
+                " WHERE term_id = ? ORDER BY source_paper",
+                (term_id,),
+            ).fetchall()
+        elif term_type == TaxonomyKind.TOPIC.value:
+            prows = conn.execute(
+                "SELECT DISTINCT p.paper_name "
+                "  FROM paper_topics pt "
+                "  JOIN papers p ON p.id = pt.paper_id "
+                " WHERE pt.topic = ? AND pt.domain = ? "
+                " ORDER BY p.paper_name",
+                (canonical_name, dom),
+            ).fetchall()
+        else:  # collection
+            prows = conn.execute(
+                "SELECT paper_name FROM papers "
+                " WHERE collection = ? AND domain = ? "
+                " ORDER BY paper_name",
+                (canonical_name, dom),
+            ).fetchall()
+        papers = [{"paper_name": r[0]} for r in prows]
+        _attach_code_repo_to_papers(conn, papers)
+
+        type_label = (
+            entity_type
+            if term_type == TaxonomyKind.ENTITY.value
+            else term_type
+        )
+
+        hit_payload: dict[str, Any] = {
+            "canonical_name": canonical_name,
+            "kind": term_type,
+            "type": type_label,
+            "entity_type": entity_type,
+            "domain": dom,
+            "aliases": aliases,
+            "papers": papers,
+        }
+        # papers_count is only honest for topics/collections, whose
+        # papers list is derived from a complete per-paper binding
+        # (paper_topics / papers.collection). Entity papers come from
+        # term_aliases — a synonym index that misses tier-1 mentions
+        # written under the canonical surface form. Publishing a count
+        # there would lie, so we omit the field for entities; callers
+        # who want a lower bound can len(papers) themselves and treat
+        # it as such.
+        if term_type != TaxonomyKind.ENTITY.value:
+            hit_payload["papers_count"] = len(papers)
+        hits.append(hit_payload)
+
+    return {
+        "mode": "lookup",
+        "query": query,
+        "domain": domain or None,
+        "kind": kind_filter,
+        "hits": hits,
+    }
 
 
 def _attach_code_repo_to_papers(
@@ -1115,83 +1154,6 @@ def _attach_code_repo_to_papers(
         }
     for entry in papers:
         entry["code_repo"] = by_name.get(entry.get("paper_name"))
-
-
-def _taxonomy_tier_a(
-    conn: sqlite3.Connection,
-    *,
-    term: str,
-    kind: TaxonomyKind,
-    domain: str | None,
-) -> tuple[int, str, str, str, str] | None:
-    """Tier A: porter-stemmed match against ``terms_fts`` narrowed by
-    ``term_type`` / ``domain``.
-
-    Returns ``(term_id, domain, term_type, entity_type, canonical_name)`` or
-    ``None``.
-    """
-    # FTS5 treats the MATCH expression as a query. The user's term may
-    # include phrase-breakers (spaces); quote it as a phrase to keep the
-    # porter tokenizer's stemming while avoiding column-scoped / operator
-    # parsing of punctuation.
-    fts_query = '"' + term.replace('"', '""') + '"'
-
-    # ``term_type`` / ``domain`` are indexed (non-UNINDEXED) columns in
-    # terms_fts — FTS5 accepts them as auxiliary WHERE predicates applied
-    # after the MATCH.
-    sql = (
-        "SELECT term_id, domain, term_type, entity_type, canonical_name "
-        "  FROM terms_fts "
-        " WHERE terms_fts MATCH ? "
-        "   AND term_type = ? "
-    )
-    params: list[Any] = [fts_query, kind.value]
-    # Topic / collection canonicals store entity_type=''; without this
-    # narrowing, porter-stemmed matches against an entity row's aliases
-    # could surface as a topic/collection hit.
-    if kind in (TaxonomyKind.TOPIC, TaxonomyKind.COLLECTION):
-        sql += " AND entity_type = ? "
-        params.append("")
-    if domain:
-        sql += " AND domain = ? "
-        params.append(domain)
-    sql += " ORDER BY rank LIMIT 1"
-    try:
-        row = conn.execute(sql, params).fetchone()
-    except sqlite3.OperationalError as exc:
-        # Degenerate MATCH queries (all punctuation, empty after quoting,
-        # etc.) raise "fts5: syntax error near ...". Treat as a miss so
-        # Tier B can take over. Any other OperationalError (missing table,
-        # disk IO, corruption) is a real failure — re-raise.
-        if "fts5" not in str(exc).lower():
-            raise
-        _LOG.warning(
-            "terms_fts MATCH syntax error for term=%r; falling through to "
-            "Tier B KNN: %s",
-            term, exc,
-        )
-        return None
-    return row
-
-
-def _classify_tier_a_match(
-    conn: sqlite3.Connection,
-    *,
-    term: str,
-    term_id: int,
-    canonical_name: str,
-) -> str:
-    """``exact`` if ``term == canonical_name``, ``alias`` if the term is a
-    stored alias, else ``fts`` (the porter stemmer matched via stem-fold)."""
-    if term == canonical_name:
-        return "exact"
-    alias_row = conn.execute(
-        "SELECT 1 FROM term_aliases WHERE term_id = ? AND alias = ? LIMIT 1",
-        (term_id, term),
-    ).fetchone()
-    if alias_row is not None:
-        return "alias"
-    return "fts"
 
 
 # ---------------------------------------------------------------------------
@@ -1634,6 +1596,38 @@ def mode_toc(conn: sqlite3.Connection, *, paper_name: str) -> dict[str, Any]:
         for chunk in split_sections(markdown)
     ]
     return {"mode": "toc", "paper_name": paper_name, "toc": toc}
+
+
+def mode_toc_many(
+    conn: sqlite3.Connection, *, paper_names: list[str]
+) -> dict[str, Any]:
+    """Multi-paper ToC. Resolves each name independently; missing names are
+    reported in ``missing`` rather than raising, so a typo in one name doesn't
+    abandon the rest. Empty list raises — that's a caller bug.
+    """
+    if not paper_names:
+        raise ValueError("paper_names must contain at least one paper name")
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for name in paper_names:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+
+    results: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for name in ordered:
+        try:
+            results.append(mode_toc(conn, paper_name=name))
+        except ValueError:
+            missing.append(name)
+    return {
+        "mode": "toc_many",
+        "paper_names": ordered,
+        "results": results,
+        "missing": missing,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2201,29 +2195,61 @@ def to_human(payload: dict[str, Any]) -> str:
                         f"(status={cr.get('status')}, files={cr.get('file_count')})"
                     )
 
-    elif mode in ("entity", "topic", "collection"):
-        if payload.get("error"):
-            lines.append(f"== {mode}: {payload.get('term')!r} — {payload['error']} ==")
+    elif mode == "lookup":
+        status = payload.get("status")
+        if status == "empty_query":
+            lines.append(f"empty lookup query: {payload.get('query')!r}")
+            hint = payload.get("hint")
+            if hint:
+                lines.append(hint)
+        elif status == "malformed_query":
+            lines.append(f"malformed lookup query: {payload.get('query')!r}")
+            err = payload.get("error")
+            if err:
+                lines.append(err)
+            hint = payload.get("hint")
+            if hint:
+                lines.append(hint)
         else:
-            can = payload.get("canonical", {})
+            hits = payload.get("hits") or []
+            kind_tag = payload.get("kind") or "any"
             lines.append(
-                f"== {mode}: {payload.get('term')!r} → "
-                f"{can.get('name')} ({can.get('type')}, {can.get('domain')}) "
-                f"[{payload.get('resolved_via')}] =="
+                f"== lookup: {payload.get('query')!r} "
+                f"(kind={kind_tag}, {len(hits)} hit"
+                f"{'' if len(hits) == 1 else 's'}) =="
             )
-            if payload.get("aliases"):
-                lines.append("aliases:")
-                for a in payload["aliases"]:
-                    lines.append(f"  - {a['alias']} ({a['source_paper']})")
-            if payload.get("papers"):
-                lines.append("papers:")
-                for p in payload["papers"]:
-                    if "sections" in p:
-                        lines.append(
-                            f"  - {p['paper_name']}: {', '.join(p['sections'])}"
-                        )
-                    else:
-                        lines.append(f"  - {p['paper_name']}")
+            if not hits:
+                lines.append("  (no canonical terms matched)")
+            # Show domain on the line only if hits straddle multiple domains;
+            # otherwise it's a constant we can drop (and surface once in the
+            # header instead, when relevant).
+            domains = {h.get("domain") for h in hits}
+            multi_domain = len(domains) > 1
+            for h in hits:
+                kind = h.get("kind")
+                # entity rows have a meaningful entity_type; topic/collection
+                # rows have term_type==entity_type==<kind> which is redundant.
+                if kind == "entity":
+                    label = f"entity:{h.get('entity_type') or '?'}"
+                else:
+                    label = kind or "?"
+                bits = [f"- {h['canonical_name']} ({label})"]
+                if multi_domain:
+                    bits.append(f"[{h.get('domain')}]")
+                papers_count = int(h.get("papers_count") or 0)
+                if papers_count:
+                    bits.append(f"papers={papers_count}")
+                lines.append(" ".join(bits))
+                aliases = h.get("aliases") or []
+                if aliases:
+                    alias_names = sorted({a["alias"] for a in aliases})
+                    lines.append(f"  aliases: {', '.join(alias_names)}")
+                papers = h.get("papers") or []
+                if papers:
+                    lines.append(
+                        "  papers: "
+                        + ", ".join(p["paper_name"] for p in papers)
+                    )
 
     elif mode == "collections":
         lines.append("== collections ==")
@@ -2261,6 +2287,23 @@ def to_human(payload: dict[str, Any]) -> str:
         for entry in payload.get("toc", []):
             indent = "  " * (entry["level"] - 1)
             lines.append(f"{indent}{'#' * entry['level']} {entry['title']}")
+
+    elif mode == "toc_many":
+        for sub in payload.get("results", []):
+            lines.append(f"== ToC {sub.get('paper_name')} ==")
+            for entry in sub.get("toc", []):
+                indent = "  " * (entry["level"] - 1)
+                lines.append(
+                    f"{indent}{'#' * entry['level']} {entry['title']}"
+                )
+        missing = payload.get("missing") or []
+        if missing:
+            lines.append("")
+            lines.append(
+                f"== missing ({len(missing)}) =="
+            )
+            for name in missing:
+                lines.append(f"  - {name}")
 
     elif mode == "read":
         status = payload.get("status", "ok")
@@ -2402,8 +2445,30 @@ def _build_parser() -> argparse.ArgumentParser:
                         "independently and the per-query payloads are "
                         "concatenated under one envelope.")
 
-    p.add_argument("--entity", default=None, help="taxonomy lookup: entity")
-    p.add_argument("--topic", default=None, help="taxonomy lookup: topic")
+    p.add_argument(
+        "--lookup", default=None,
+        help=(
+            "canonical-term FTS search. Accepts the same GitHub-flavored "
+            "syntax as --search/QUERY (bare tokens, \"phrase\", AND/OR/NOT, "
+            "parens, term*); honors kind:entity|topic|collection and "
+            "domain:NAME qualifiers. Returns ranked hits with aliases "
+            "inlined per hit."
+        ),
+    )
+    p.add_argument(
+        "--entity", default=None,
+        help=(
+            "shorthand for --lookup with kind:entity prepended. "
+            "Surface form term — extra GitHub syntax is supported."
+        ),
+    )
+    p.add_argument(
+        "--topic", default=None,
+        help=(
+            "shorthand for --lookup with kind:topic prepended. "
+            "Surface form term — extra GitHub syntax is supported."
+        ),
+    )
 
     p.add_argument("--collections", action="store_true",
                    help="browse: list distinct collections")
@@ -2416,7 +2481,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--needs-review", dest="needs_review",
                    action="store_true", help="browse: papers flagged for review")
 
-    p.add_argument("--toc", default=None, help="ToC of PAPER (paper_name)")
+    p.add_argument(
+        "--toc", default=None, action="append",
+        help=(
+            "ToC of PAPER (paper_name). Repeat the flag to fetch multiple "
+            "papers in one call: --toc paper_a --toc paper_b. Single use "
+            "returns a flat envelope; repeated use returns a toc_many "
+            "envelope with per-paper results plus a 'missing' list for "
+            "names that didn't resolve."
+        ),
+    )
 
     p.add_argument("--read", default=None,
                    help="read full markdown of PAPER (paper_name)")
@@ -2468,6 +2542,8 @@ def _check_mode_conflicts(
         modes.append("--search")
     # Mode 2 lookups — --collection is dual-use: only counts as Mode 2 when
     # there is no positional query.
+    if args.lookup is not None:
+        modes.append("--lookup")
     if args.entity is not None:
         modes.append("--entity")
     if args.topic is not None:
@@ -2541,9 +2617,13 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
     if args.read is not None:
         return mode_read(conn, paper_name=args.read, section=args.section)
 
-    # Mode 4: toc
-    if args.toc is not None:
-        return mode_toc(conn, paper_name=args.toc)
+    # Mode 4: toc. action='append' gives ['name'] for one --toc and
+    # ['a', 'b', ...] for repeated use. Single → flat mode_toc envelope;
+    # multi → mode_toc_many envelope.
+    if args.toc:
+        if len(args.toc) == 1:
+            return mode_toc(conn, paper_name=args.toc[0])
+        return mode_toc_many(conn, paper_names=args.toc)
 
     # Mode 3: browse
     domain_filter: dict[str, Any] = {"domain": args.domain}
@@ -2589,21 +2669,26 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
             limit=args.limit,
         )
 
-    # Mode 2: taxonomy lookup. --collection is DUAL-USE — it becomes a lookup
-    # term only when there is no positional query. Table-driven so the three
-    # near-identical branches share one call site.
-    for attr, kind in (
-        ("entity", TaxonomyKind.ENTITY),
-        ("topic", TaxonomyKind.TOPIC),
-        ("collection", TaxonomyKind.COLLECTION),
-    ):
-        value = getattr(args, attr)
-        if value is None:
-            continue
-        if attr == "collection" and args.query is not None:
-            continue
+    # Mode 2: taxonomy lookup. --lookup takes a GH-flavored query directly;
+    # --entity / --topic / --collection are shorthand that prepend the
+    # corresponding `kind:` qualifier to the query. --collection is DUAL-USE
+    # (Mode 1 filter when a positional query is set, lookup shorthand
+    # otherwise).
+    lookup_query: str | None = None
+    if args.lookup is not None:
+        lookup_query = args.lookup
+    elif args.entity is not None:
+        lookup_query = f"kind:entity {args.entity}"
+    elif args.topic is not None:
+        lookup_query = f"kind:topic {args.topic}"
+    elif args.collection is not None and args.query is None:
+        lookup_query = f"kind:collection {args.collection}"
+    if lookup_query is not None:
         return mode_taxonomy_lookup(
-            conn, term=value, kind=kind, filters=domain_filter,
+            conn,
+            query=lookup_query,
+            filters=domain_filter,
+            limit=args.limit,
         )
 
     # Mode 1: BM25 — defaults to `sections`; `--scope` switches to
@@ -2624,7 +2709,7 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
 
     raise SystemExit(
         "no action selected — pass a positional QUERY or one of the mode "
-        "flags (--search/--entity/--topic/--collection/--collections/"
+        "flags (--search/--lookup/--entity/--topic/--collection/--collections/"
         "--topics/--entity-type/--aliases/--needs-review/--toc/--read/"
         "--figure). Run with --help for details."
     )
