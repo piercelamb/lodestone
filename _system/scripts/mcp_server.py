@@ -7,8 +7,8 @@ content blocks for any ``(figure:N)`` markdown refs the response carries.
 
 Tools registered (all surface as ``mcp__lodestone__<name>`` in Claude Code):
 
-    search, bm25, lookup, browse, toc, toc_many, read, figure, repo_tree,
-    read_code
+    search, bm25, lookup, browse, overview, collection, toc, toc_many,
+    read, figure, repo_tree, read_code
 
 Transport notes (per spec §Transports):
 
@@ -38,10 +38,14 @@ from _system.db.connection import get_conn
 from _system.scripts.search import (
     Scope,
     _SOFT_FAILURE_STATUSES,
+    format_collection_text,
+    format_overview_tree,
     format_search_markdown,
     mode_bm25,
     mode_browse,
+    mode_collection,
     mode_figure,
+    mode_overview,
     mode_read,
     mode_read_code,
     mode_repo_tree,
@@ -456,6 +460,23 @@ def _browse_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
     return mode_browse(conn, which=which, filters=filters)
 
 
+def _overview_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
+    return mode_overview(conn, filters={"domain": args.get("domain")})
+
+
+def _collection_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
+    raw = args["collection"]
+    names = [raw] if isinstance(raw, str) else [str(x) for x in raw]
+    return mode_collection(
+        conn,
+        collection_names=names,
+        filters={"domain": args.get("domain")},
+        include_abstracts=bool(args.get("include_abstracts", True)),
+        include_topics=bool(args.get("include_topics", True)),
+        limit=int(args.get("limit") or 20),
+    )
+
+
 def _toc_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
     return mode_toc(conn, paper_name=args["paper_name"])
 
@@ -696,6 +717,80 @@ TOOLS: list[dict[str, Any]] = [
         },
         "dispatch": _browse_dispatch,
         "attach": AttachMode.NONE,
+    },
+    {
+        "name": "overview",
+        "description": (
+            "Top-down corpus map. Domains are broad research areas; each "
+            "domain contains collections that subdivide it by approach or "
+            "technique. This tool returns the nested domains → collections "
+            "tree with paper counts. Use it FIRST when you want to navigate "
+            "by structure rather than keywords (the complement to "
+            "'search'). Then drill into one or more collections via "
+            "'collection' to see papers with abstracts/topics, and feed "
+            "paper_names into 'toc_many' to inspect structures side-by-side. "
+            "The tree drops empty domains/collections (zero papers)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "domain": {
+                    "type": "string",
+                    "description": "Optional: restrict the tree to one domain.",
+                },
+            },
+        },
+        "dispatch": _overview_dispatch,
+        "attach": AttachMode.NONE,
+        "text_format": format_overview_tree,
+    },
+    {
+        "name": "collection",
+        "description": (
+            "Drill into one or more collections (typically picked from "
+            "'overview') and return their papers as a light tree. Default "
+            "response includes paper abstracts and per-paper topics — set "
+            "include_abstracts=false to slim to names+metadata, "
+            "include_topics=false to drop topics. Pass 'collection' as a "
+            "string or array of up to 16 names; missing names land in "
+            "'missing' rather than raising. If a collection name exists "
+            "under multiple domains and 'domain' is not set, all matches "
+            "are returned."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "collection": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                            "maxItems": 16,
+                        },
+                    ],
+                    "description": (
+                        "Collection name, or an array of 1-16 collection "
+                        "names to bundle in one call."
+                    ),
+                },
+                "domain": {"type": "string"},
+                "include_abstracts": {"type": "boolean", "default": True},
+                "include_topics": {"type": "boolean", "default": True},
+                "limit": {
+                    "type": "integer",
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 100,
+                    "description": "Max papers per collection.",
+                },
+            },
+            "required": ["collection"],
+        },
+        "dispatch": _collection_dispatch,
+        "attach": AttachMode.NONE,
+        "text_format": format_collection_text,
     },
     {
         "name": "toc",

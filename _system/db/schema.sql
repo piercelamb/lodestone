@@ -46,6 +46,30 @@ CREATE INDEX IF NOT EXISTS idx_papers_collection ON papers(domain, collection);
 CREATE INDEX IF NOT EXISTS idx_papers_hash ON papers(content_hash);
 CREATE INDEX IF NOT EXISTS idx_papers_review ON papers(needs_review) WHERE needs_review = 1;
 
+-- Invariant: every classified-or-later paper must have BOTH a domain
+-- and a collection. classify_paper enforces this on the writeable side;
+-- these triggers are the database-level safety net so direct SQL writes
+-- (manual fixes, future migrations, third-party tools) cannot violate
+-- the invariant either. Pre-classify and terminal-failure rows are
+-- exempt — they don't yet have, or never will get, a domain/collection.
+CREATE TRIGGER IF NOT EXISTS papers_invariant_classified_has_domain_collection_insert
+BEFORE INSERT ON papers
+FOR EACH ROW
+WHEN NEW.status NOT IN ('fetched', 'converted', 'failed_html', 'failed_repo')
+ AND (NEW.domain IS NULL OR NEW.collection IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'papers invariant violated: classified+ rows must have both domain and collection set');
+END;
+
+CREATE TRIGGER IF NOT EXISTS papers_invariant_classified_has_domain_collection_update
+BEFORE UPDATE ON papers
+FOR EACH ROW
+WHEN NEW.status NOT IN ('fetched', 'converted', 'failed_html', 'failed_repo')
+ AND (NEW.domain IS NULL OR NEW.collection IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'papers invariant violated: classified+ rows must have both domain and collection set');
+END;
+
 CREATE TABLE IF NOT EXISTS figures (
     id INTEGER PRIMARY KEY,
     paper_id INTEGER NOT NULL REFERENCES papers(id),

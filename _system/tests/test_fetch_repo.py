@@ -30,23 +30,29 @@ def _seed_paper(
     paper_name: str = "demo_2026",
     code_repo: str | None = "https://github.com/owner/repo",
     domain: str = "rag",
+    collection: str = "demo_collection",
     status: PaperStatus = PaperStatus.INDEXED,
 ) -> int:
     conn.execute(
         "INSERT OR IGNORE INTO domains (name) VALUES (?)", (domain,)
     )
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "VALUES (?, ?, NULL)",
+        (domain, collection),
+    )
     cur = conn.execute(
         """
         INSERT INTO papers (
             arxiv_id, paper_name, title, authors, date, abstract,
-            pdf_url, ingested_at, status, domain, code_repo
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            pdf_url, ingested_at, status, domain, collection, code_repo
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             arxiv_id, paper_name, "Title", '["A"]', "2024-01-01", "Abs",
             f"https://arxiv.org/pdf/{arxiv_id}",
             "2024-01-02T00:00:00+00:00",
-            status.value, domain, code_repo,
+            status.value, domain, collection, code_repo,
         ),
     )
     return cur.lastrowid

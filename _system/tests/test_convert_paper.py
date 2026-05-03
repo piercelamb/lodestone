@@ -40,6 +40,14 @@ _TWO_FIGURE_HTML = """<!doctype html>
 """
 
 
+_PRE_CLASSIFY_STATUSES = {
+    PaperStatus.FETCHED.value,
+    PaperStatus.CONVERTED.value,
+    PaperStatus.FAILED_HTML.value,
+    PaperStatus.FAILED_REPO.value,
+}
+
+
 def _seed(
     conn: sqlite3.Connection,
     *,
@@ -51,13 +59,30 @@ def _seed(
     paper_name: str = "paper_name_2023",
 ) -> int:
     """Insert a papers row + `figure_count` figures rows; return paper_id."""
+    # Schema invariant: classified+ rows must carry both domain and
+    # collection. Auto-supply them for any status outside the exempt
+    # set (also covers test sentinels like ""/"not_a_real_status" that
+    # exercise unknown-status paths — those fall under the trigger).
+    if status in _PRE_CLASSIFY_STATUSES:
+        domain = None
+        collection = None
+    else:
+        domain = "rag"
+        collection = "demo_collection"
+        conn.execute(
+            "INSERT OR IGNORE INTO domains (name) VALUES ('rag')"
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO collections (domain, name, description) "
+            "VALUES ('rag', 'demo_collection', NULL)"
+        )
     cur = conn.execute(
         """
         INSERT INTO papers (
             arxiv_id, paper_name, title, authors, date, abstract,
             pdf_url, html_source, ingested_at, status, raw_html,
-            figure_count
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            figure_count, domain, collection
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             arxiv_id,
@@ -72,6 +97,8 @@ def _seed(
             status,
             raw_html,
             figure_count,
+            domain,
+            collection,
         ),
     )
     paper_id = cur.lastrowid

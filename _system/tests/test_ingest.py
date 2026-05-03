@@ -76,19 +76,36 @@ def _seed_paper(
     paper_name: str = "alice_2024_thing",
     status: PaperStatus = PaperStatus.FETCHED,
     needs_review: bool = False,
+    domain: str | None = None,
+    collection: str | None = None,
 ) -> int:
-    """Insert a minimal papers row and return its id."""
+    """Insert a minimal papers row and return its id.
+
+    Pre-classify statuses (FETCHED / CONVERTED / FAILED_*) leave domain
+    and collection NULL by default. For classified+ statuses the schema
+    invariant requires both columns set, so the caller can pass them or
+    rely on the post-insert UPDATE in :func:`_seed_full_paper`.
+    """
+    if domain is not None and collection is not None:
+        conn.execute(
+            "INSERT OR IGNORE INTO domains (name) VALUES (?)", (domain,)
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO collections (domain, name, description) "
+            "VALUES (?, ?, NULL)",
+            (domain, collection),
+        )
     cur = conn.execute(
         """
         INSERT INTO papers (
             arxiv_id, paper_name, title, authors, date, abstract,
-            pdf_url, ingested_at, status, needs_review
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            pdf_url, ingested_at, status, domain, collection, needs_review
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             arxiv_id, paper_name, "Title", "[\"A\"]", "2024-01-01", "Abs",
             f"https://arxiv.org/pdf/{arxiv_id}", "2024-01-02T00:00:00+00:00",
-            status.value, int(needs_review),
+            status.value, domain, collection, int(needs_review),
         ),
     )
     return cur.lastrowid
@@ -143,8 +160,17 @@ class _StageRecorder:
     def classify(self, **kwargs):
         self._record("classify", **kwargs)
         conn = kwargs["conn"]
+        # The schema invariant requires classified+ rows to carry both
+        # domain and collection. Real classify_paper always sets these;
+        # the mock mirrors that here.
+        conn.execute("INSERT OR IGNORE INTO domains (name) VALUES ('rag')")
         conn.execute(
-            "UPDATE papers SET status = ? WHERE paper_name = ?",
+            "INSERT OR IGNORE INTO collections (domain, name, description) "
+            "VALUES ('rag', 'demo', NULL)"
+        )
+        conn.execute(
+            "UPDATE papers SET status = ?, domain = 'rag', "
+            "collection = 'demo' WHERE paper_name = ?",
             (PaperStatus.CLASSIFIED.value, kwargs["paper_name"]),
         )
         return {"status": "classified"}
@@ -226,7 +252,8 @@ def test_resume_from_converted_skips_fetch_convert(conn, patched_stages):
 
 def test_resume_from_classified_runs_extract_index(conn, patched_stages):
     _seed_paper(conn, arxiv_id="2301.00004", paper_name="slug_2301.00004",
-                status=PaperStatus.CLASSIFIED)
+                status=PaperStatus.CLASSIFIED,
+                domain="rag", collection="demo")
     ingest.ingest(conn=conn, arxiv_id="2301.00004", force=False, domain=None)
     stages = [c[0] for c in patched_stages.calls]
     assert stages == ["extract", "index", "fetch_repo"]
@@ -234,7 +261,8 @@ def test_resume_from_classified_runs_extract_index(conn, patched_stages):
 
 def test_resume_from_extracted_runs_index_only(conn, patched_stages):
     _seed_paper(conn, arxiv_id="2301.00005", paper_name="slug_2301.00005",
-                status=PaperStatus.EXTRACTED)
+                status=PaperStatus.EXTRACTED,
+                domain="rag", collection="demo")
     ingest.ingest(conn=conn, arxiv_id="2301.00005", force=False, domain=None)
     stages = [c[0] for c in patched_stages.calls]
     assert stages == ["index", "fetch_repo"]
@@ -244,7 +272,8 @@ def test_resume_from_indexed_runs_fetch_repo_only(conn, patched_stages):
     """Previously-INDEXED papers advance to fetch_repo on next ingest run —
     natural backfill, intended side effect of adding the new stage."""
     _seed_paper(conn, arxiv_id="2301.00006", paper_name="slug_2301.00006",
-                status=PaperStatus.INDEXED)
+                status=PaperStatus.INDEXED,
+                domain="rag", collection="demo")
     ingest.ingest(conn=conn, arxiv_id="2301.00006", force=False, domain=None)
     stages = [c[0] for c in patched_stages.calls]
     assert stages == ["fetch_repo"]
@@ -252,7 +281,8 @@ def test_resume_from_indexed_runs_fetch_repo_only(conn, patched_stages):
 
 def test_repo_fetched_no_force_is_noop(conn, patched_stages):
     _seed_paper(conn, arxiv_id="2301.00006b", paper_name="slug_2301.00006b",
-                status=PaperStatus.REPO_FETCHED)
+                status=PaperStatus.REPO_FETCHED,
+                domain="rag", collection="demo")
     summary = ingest.ingest(
         conn=conn, arxiv_id="2301.00006b", force=False, domain=None
     )
@@ -303,7 +333,8 @@ def test_failed_html_with_force_cascades_then_fetches(conn, patched_stages):
 
 def test_force_on_indexed_cascades_then_runs_all(conn, patched_stages):
     _seed_paper(conn, arxiv_id="2301.00009", paper_name="slug_2301.00009",
-                status=PaperStatus.INDEXED)
+                status=PaperStatus.INDEXED,
+                domain="rag", collection="demo")
     ingest.ingest(conn=conn, arxiv_id="2301.00009", force=True, domain=None)
     stages = [c[0] for c in patched_stages.calls]
     assert stages == [
@@ -323,11 +354,13 @@ def _seed_full_paper(conn: sqlite3.Connection, arxiv_id: str, paper_name: str,
     Returns the new paper_id.
     """
     conn.execute("INSERT OR IGNORE INTO domains (name) VALUES (?)", (domain,))
-    paper_id = _seed_paper(conn, arxiv_id=arxiv_id, paper_name=paper_name,
-                           status=PaperStatus.INDEXED)
-    conn.execute(
-        "UPDATE papers SET domain = ?, collection = ? WHERE id = ?",
-        (domain, "tree-search", paper_id),
+    paper_id = _seed_paper(
+        conn,
+        arxiv_id=arxiv_id,
+        paper_name=paper_name,
+        status=PaperStatus.INDEXED,
+        domain=domain,
+        collection="tree-search",
     )
     # sections (FTS5)
     conn.execute(
@@ -473,12 +506,14 @@ def test_force_cascade_preserves_entity_canonicals(conn):
     ).fetchone()[0] == emb_before
 
 
-def test_force_cascade_gcs_orphan_topic_and_collection_canonicals(conn):
-    """Cascade GCs topic and collection canonicals whose only binding was
-    the deleted paper, alongside their satellites in ``terms_fts``,
-    ``term_embeddings``, ``term_aliases``, and the first-class
-    ``collections`` registry. A topic canonical also bound by another
-    paper survives; same for a collection canonical."""
+def test_force_cascade_gcs_orphan_topic_canonicals(conn):
+    """Cascade GCs topic canonicals whose only binding was the deleted
+    paper, alongside their satellites in ``terms_fts``,
+    ``term_embeddings``, and ``term_aliases``. A topic canonical also
+    bound by another paper survives. **Collection canonicals and the
+    first-class ``collections`` registry survive even when no paper
+    references them** — categories are curated and outlive any single
+    paper; only humans delete them."""
     paper_id = _seed_full_paper(conn, "2301.55555", "paper_solo", domain="rag")
     keep_id = _seed_full_paper(conn, "2301.55556", "paper_keep", domain="rag")
     # _seed_full_paper sets papers.collection='tree-search' but doesn't
@@ -522,7 +557,9 @@ def test_force_cascade_gcs_orphan_topic_and_collection_canonicals(conn):
 
     # Seed a collection canonical + registry row. _seed_full_paper sets
     # papers.collection='tree-search' for both papers; only this paper's
-    # collection is unique. Switch paper_solo to a unique collection.
+    # collection is unique. Switch paper_solo to a unique collection so
+    # we can verify the category survives even after its only paper is
+    # gone.
     conn.execute(
         "UPDATE papers SET collection = ? WHERE id = ?",
         ("solo-cluster", paper_id),
@@ -553,15 +590,17 @@ def test_force_cascade_gcs_orphan_topic_and_collection_canonicals(conn):
         "SELECT COUNT(*) FROM canonical_terms WHERE canonical_name = ?",
         ("shared_topic_abc",),
     ).fetchone()[0] == 1
-    # Orphan collection canonical + registry row gone.
+    # Solo collection canonical + registry row both SURVIVE despite
+    # paper_solo having been the only binding — categories outlive
+    # papers.
     assert conn.execute(
         "SELECT COUNT(*) FROM canonical_terms WHERE id = ?", (solo_coll_id,),
-    ).fetchone()[0] == 0
+    ).fetchone()[0] == 1
     assert conn.execute(
         "SELECT COUNT(*) FROM collections WHERE name = ?", ("solo-cluster",),
-    ).fetchone()[0] == 0
-    # The shared 'tree-search' registry row from _seed_full_paper survives
-    # because paper_keep still references it.
+    ).fetchone()[0] == 1
+    # The shared 'tree-search' registry row from _seed_full_paper also
+    # survives (paper_keep still references it).
     assert conn.execute(
         "SELECT COUNT(*) FROM collections WHERE name = ?", ("tree-search",),
     ).fetchone()[0] == 1
@@ -625,7 +664,8 @@ def test_summary_needs_review_reflects_flag(conn, patched_stages):
     # Pre-flag the paper with needs_review=1; ingest's no-op INDEXED path
     # should report it.
     _seed_paper(conn, arxiv_id="2301.67002", paper_name="slug_2301.67002",
-                status=PaperStatus.INDEXED, needs_review=True)
+                status=PaperStatus.INDEXED, needs_review=True,
+                domain="rag", collection="demo")
     summary2 = ingest.ingest(conn=conn, arxiv_id="2301.67002", force=False, domain=None)
     assert summary2["needs_review"] is True
 

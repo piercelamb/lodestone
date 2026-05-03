@@ -25,9 +25,7 @@ from _system.scripts.classify_paper import (
     ClassifyStateError,
     _COLLECTIONS_PER_DOMAIN_LIMIT,
     _head_slice_paper_content,
-    _render_taxonomy_tree,
     _sanitize_domain,
-    _truncate_collections,
     classify,
 )
 
@@ -184,94 +182,6 @@ def tmp_db_with_domain(conn: sqlite3.Connection):
 def seeded(tmp_db_with_domain):
     _seed_paper(tmp_db_with_domain)
     return tmp_db_with_domain
-
-
-# ===========================================================================
-# Taxonomy tree renderer
-# ===========================================================================
-
-
-def test_tree_empty_returns_helpful_sentinel():
-    out = _render_taxonomy_tree([], {})
-    assert "taxonomy is empty" in out
-    # Mentions both proposal sentinels — with no existing taxonomy, the LLM
-    # must propose both a new domain and a new collection.
-    assert "domain_index to -1" in out
-    assert "collection_index to -1" in out
-
-
-def test_tree_renders_indexed_domains_with_integer_collections():
-    domains = [
-        ("rag", "retrieval augmented generation"),
-        ("agents", "multi-agent systems"),
-    ]
-    collections = {
-        "rag": [
-            ("hybrid_search", "dense+sparse retrieval fusion"),
-            ("rag_systems", None),
-        ],
-        "agents": [],
-    }
-    out = _render_taxonomy_tree(domains, collections)
-    assert "0. rag — retrieval augmented generation" in out
-    # Collection with description shows it; without falls back to bare name.
-    assert "├── 0: hybrid_search — dense+sparse retrieval fusion" in out
-    assert "└── 1: rag_systems" in out
-    assert "└── 1: rag_systems — " not in out  # no trailing em-dash when NULL
-    # Empty domain shown inline as a hint, not as a child leaf.
-    assert "1. agents" in out
-    assert "(no existing collections)" in out
-
-
-def test_tree_resets_collection_indices_per_domain():
-    domains = [("d0", None), ("d1", None)]
-    collections = {
-        "d0": [("x", None), ("y", None)],
-        "d1": [("p", None), ("q", None)],
-    }
-    out = _render_taxonomy_tree(domains, collections)
-    # Each domain's children restart at 0.
-    assert "   ├── 0: x" in out
-    assert "   └── 1: y" in out
-    assert "   ├── 0: p" in out
-    assert "   └── 1: q" in out
-
-
-def test_tree_renders_domain_without_description():
-    out = _render_taxonomy_tree([("foo", None)], {"foo": [("bar", None)]})
-    lines = out.splitlines()
-    assert lines[0] == "0. foo"
-    assert lines[1] == "   └── 0: bar"
-
-
-def test_tree_truncates_at_limit_with_overflow_leaf():
-    cap = _COLLECTIONS_PER_DOMAIN_LIMIT
-    colls = [(f"c{i}", None) for i in range(cap + 5)]
-    truncated, overflow = _truncate_collections({"d": colls})
-    out = _render_taxonomy_tree([("d", None)], truncated, overflow)
-    # First `cap` visible with their indices.
-    for i in range(cap):
-        assert f"{i}: c{i}" in out
-    # Hidden entries aren't in the rendered tree.
-    for i in range(cap, cap + 5):
-        assert f"c{i}" not in out
-    # Overflow leaf is last, no index, uses └──.
-    tail = out.splitlines()[-1]
-    assert tail.startswith("   └──")
-    assert "+ 5 more exist" in tail
-
-
-def test_truncate_collections_marks_overflow_per_domain():
-    cap = _COLLECTIONS_PER_DOMAIN_LIMIT
-    raw = {
-        "small": [("a", None), ("b", None)],
-        "big": [(f"c{i}", None) for i in range(cap + 4)],
-    }
-    truncated, overflow = _truncate_collections(raw)
-    assert truncated["small"] == [("a", None), ("b", None)]
-    assert "small" not in overflow
-    assert len(truncated["big"]) == cap
-    assert overflow["big"] == 4
 
 
 # ===========================================================================

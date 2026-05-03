@@ -1,0 +1,265 @@
+"""Shared taxonomy loader + tree renderer.
+
+Single source of truth for two consumers:
+
+* ``classify_paper`` — primes the classification LLM prompt with a
+  numbered tree (``style=INDEX``); needs empty collections kept (so the
+  LLM can pick a registered-but-unused collection) and a per-domain cap
+  to bound prompt size.
+* ``mode_overview`` (search.py) — Claude's top-down corpus map
+  (``style=COUNT``); drops empty rows so the tree reflects actual
+  content, no truncation, and surfaces paper counts plus an
+  ``uncategorized`` count for papers with ``collection IS NULL``.
+
+The two consumers run the same SQL (one LEFT JOIN per level) and the
+same renderer; only the policy toggles differ.
+"""
+from __future__ import annotations
+
+import sqlite3
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Iterable
+
+
+class TaxonomyTreeStyle(StrEnum):
+    INDEX = "index"   # numbered prefixes for LLM index-replace selection
+    COUNT = "count"   # paper-count annotations for human/agent orientation
+
+
+@dataclass(frozen=True)
+class CollectionNode:
+    name: str
+    description: str | None
+    paper_count: int
+
+
+@dataclass(frozen=True)
+class DomainNode:
+    name: str
+    description: str | None
+    paper_count: int
+    collections: tuple[CollectionNode, ...]
+    overflow: int = 0
+
+
+def load_taxonomy(
+    conn: sqlite3.Connection,
+    *,
+    domain: str | None = None,
+    include_empty_collections: bool = True,
+    include_empty_domains: bool = True,
+    collections_per_domain_limit: int | None = None,
+) -> list[DomainNode]:
+    """Load the full taxonomy tree from the DB as ``list[DomainNode]``.
+
+    ``include_empty_collections=False`` drops collections with zero papers
+    in their domain — used by ``mode_overview`` so the tree reflects
+    content. ``include_empty_domains=False`` drops domains whose
+    ``paper_count`` sums to zero — same rationale.
+    ``collections_per_domain_limit`` truncates each domain's collection
+    list (preserving popularity order), recording the count of hidden
+    rows in ``DomainNode.overflow`` — used by ``classify_paper`` to bound
+    prompt size. ``None`` means no cap.
+
+    SQL is a single LEFT JOIN per level; empty-row filtering and
+    truncation are Python-side so the same source data can be sliced
+    different ways by different callers.
+    """
+    if domain is not None:
+        domain_rows = conn.execute(
+            """
+            SELECT d.name, d.description, COUNT(p.id) AS paper_count
+              FROM domains d
+              LEFT JOIN papers p ON p.domain = d.name
+             WHERE d.name = ?
+             GROUP BY d.name, d.description
+            """,
+            (domain,),
+        ).fetchall()
+    else:
+        domain_rows = conn.execute(
+            """
+            SELECT d.name, d.description, COUNT(p.id) AS paper_count
+              FROM domains d
+              LEFT JOIN papers p ON p.domain = d.name
+             GROUP BY d.name, d.description
+            """,
+        ).fetchall()
+
+    if domain is not None:
+        coll_rows = conn.execute(
+            """
+            SELECT c.domain, c.name, c.description, COUNT(p.id) AS paper_count
+              FROM collections c
+              LEFT JOIN papers p
+                ON p.domain = c.domain AND p.collection = c.name
+             WHERE c.domain = ?
+             GROUP BY c.domain, c.name, c.description
+            """,
+            (domain,),
+        ).fetchall()
+    else:
+        coll_rows = conn.execute(
+            """
+            SELECT c.domain, c.name, c.description, COUNT(p.id) AS paper_count
+              FROM collections c
+              LEFT JOIN papers p
+                ON p.domain = c.domain AND p.collection = c.name
+             GROUP BY c.domain, c.name, c.description
+            """,
+        ).fetchall()
+
+    by_domain: dict[str, list[CollectionNode]] = {}
+    for d, name, description, count in coll_rows:
+        if not include_empty_collections and (count or 0) == 0:
+            continue
+        by_domain.setdefault(d, []).append(
+            CollectionNode(
+                name=name,
+                description=description,
+                paper_count=int(count or 0),
+            )
+        )
+
+    # Sort each domain's collections: most-popular first, then alpha by name.
+    for d, colls in by_domain.items():
+        colls.sort(key=lambda c: (-c.paper_count, c.name))
+
+    nodes: list[DomainNode] = []
+    for d_name, d_desc, d_count in domain_rows:
+        d_count = int(d_count or 0)
+        if not include_empty_domains and d_count == 0:
+            continue
+        colls = by_domain.get(d_name, [])
+        overflow = 0
+        if (
+            collections_per_domain_limit is not None
+            and len(colls) > collections_per_domain_limit
+        ):
+            overflow = len(colls) - collections_per_domain_limit
+            colls = colls[:collections_per_domain_limit]
+        nodes.append(
+            DomainNode(
+                name=d_name,
+                description=d_desc,
+                paper_count=d_count,
+                collections=tuple(colls),
+                overflow=overflow,
+            )
+        )
+
+    # Sort domains: most-papers first, then alpha.
+    nodes.sort(key=lambda n: (-n.paper_count, n.name))
+    return nodes
+
+
+def _format_count(n: int, *, label: str) -> str:
+    return f"{n} {label}" if n == 1 else f"{n} {label}s"
+
+
+def render_taxonomy_tree(
+    domains: list[DomainNode],
+    *,
+    style: TaxonomyTreeStyle = TaxonomyTreeStyle.COUNT,
+    overflow_message: str = "(+ {n} more)",
+) -> str:
+    """Render a list of ``DomainNode`` as tree text.
+
+    ``style=INDEX`` — classify_paper format::
+
+        0. rag — desc
+           ├── 0: hybrid_search — desc
+           └── 1: rag_systems
+
+    ``style=COUNT`` — overview format::
+
+        rag — desc  (23 papers, 4 uncategorized)
+        ├── hybrid_search — desc  (8 papers)
+        └── rag_systems  (3 papers)
+
+    The overflow leaf renders as ``└── (+ N more...)`` in both styles
+    via ``overflow_message`` (``{n}`` is replaced with the hidden count).
+    """
+    if not domains:
+        if style is TaxonomyTreeStyle.INDEX:
+            return (
+                "(taxonomy is empty — propose a new domain by setting "
+                "domain_index to -1, and a new collection under it by "
+                "setting collection_index to -1)"
+            )
+        return "(no domains)"
+
+    if style is TaxonomyTreeStyle.INDEX:
+        return _render_index(domains, overflow_message=overflow_message)
+    return _render_count(domains, overflow_message=overflow_message)
+
+
+def _render_index(
+    domains: list[DomainNode], *, overflow_message: str
+) -> str:
+    lines: list[str] = []
+    for i, node in enumerate(domains):
+        head = (
+            f"{i}. {node.name} — {node.description}"
+            if node.description
+            else f"{i}. {node.name}"
+        )
+        if not node.collections:
+            lines.append(f"{head}   (no existing collections)")
+            continue
+
+        lines.append(head)
+        has_overflow = node.overflow > 0
+        n_leaves = len(node.collections) + (1 if has_overflow else 0)
+        for j, coll in enumerate(node.collections):
+            connector = "└──" if j == n_leaves - 1 else "├──"
+            leaf = (
+                f"{j}: {coll.name} — {coll.description}"
+                if coll.description
+                else f"{j}: {coll.name}"
+            )
+            lines.append(f"   {connector} {leaf}")
+        if has_overflow:
+            tail = overflow_message.format(n=node.overflow)
+            lines.append(f"   └── {tail}")
+    return "\n".join(lines)
+
+
+def _render_count(
+    domains: list[DomainNode], *, overflow_message: str
+) -> str:
+    blocks: list[list[str]] = []
+    for node in domains:
+        block: list[str] = []
+        suffix = f"({_format_count(node.paper_count, label='paper')})"
+        head = (
+            f"{node.name} — {node.description}  {suffix}"
+            if node.description
+            else f"{node.name}  {suffix}"
+        )
+        block.append(head)
+
+        if not node.collections:
+            block.append("└── (no collections yet)")
+            blocks.append(block)
+            continue
+
+        has_overflow = node.overflow > 0
+        n_leaves = len(node.collections) + (1 if has_overflow else 0)
+        for j, coll in enumerate(node.collections):
+            connector = "└──" if j == n_leaves - 1 else "├──"
+            c_count = _format_count(coll.paper_count, label="paper")
+            leaf = (
+                f"{coll.name} — {coll.description}  ({c_count})"
+                if coll.description
+                else f"{coll.name}  ({c_count})"
+            )
+            block.append(f"{connector} {leaf}")
+        if has_overflow:
+            tail = overflow_message.format(n=node.overflow)
+            block.append(f"└── {tail}")
+        blocks.append(block)
+
+    # Blank line between domains.
+    return "\n\n".join("\n".join(b) for b in blocks)
