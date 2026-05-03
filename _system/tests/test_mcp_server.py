@@ -440,14 +440,14 @@ class TestProtocolValidation:
 
 
 class TestToolsList:
-    def test_tools_list_returns_nine_tools(self):
+    def test_tools_list_returns_ten_tools(self):
         out = mcp_server._handle_tools_list({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         tools = out["result"]["tools"]
-        assert len(tools) == 9
+        assert len(tools) == 10
         names = {t["name"] for t in tools}
         assert names == {
-            "search", "bm25", "lookup", "browse", "toc", "read",
-            "figure", "repo_tree", "read_code",
+            "search", "bm25", "lookup", "browse", "toc", "toc_many",
+            "read", "figure", "repo_tree", "read_code",
         }
         for t in tools:
             assert isinstance(t["description"], str) and t["description"]
@@ -654,6 +654,130 @@ class TestBm25SyntaxAtMcp:
 
 
 # ===========================================================================
+# lookup tool — GH-syntax canonical FTS through the MCP boundary
+# ===========================================================================
+
+
+class TestLookupTool:
+    """The `lookup` tool is text-only (AttachMode.NONE) and FTS5-only —
+    no embedder loading. It accepts the same GitHub-flavored query syntax
+    as `search`/`bm25` plus the `kind:` qualifier."""
+
+    def test_lookup_schema_only_requires_query(self):
+        tools = {t["name"]: t for t in mcp_server.TOOLS}
+        schema = tools["lookup"]["inputSchema"]
+        assert schema["required"] == ["query"]
+        assert "query" in schema["properties"]
+        assert "domain" in schema["properties"]
+        assert "limit" in schema["properties"]
+        # The old `kind` arg is gone — kind is now a `kind:` qualifier
+        # inside the query string.
+        assert "kind" not in schema["properties"]
+        # The old `term` arg is gone — replaced by `query`.
+        assert "term" not in schema["properties"]
+
+    def test_lookup_returns_lookup_envelope(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(state, "lookup", {"query": "tree"})
+        assert not _is_error(resp)
+        assert not _has_image(resp), "lookup must not attach figure images"
+        payload = resp["result"]["structuredContent"]
+        assert payload["mode"] == "lookup"
+        assert payload["query"] == "tree"
+        assert "hits" in payload
+        assert isinstance(payload["hits"], list)
+
+    def test_lookup_missing_query_argument(self, fig_db):
+        state = _make_state(fig_db)
+        resp = mcp_server._handle_tools_call(
+            state,
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "lookup", "arguments": {}}},
+        )
+        assert "error" in resp
+        assert resp["error"]["code"] == -32602
+
+    def test_lookup_empty_query_soft_fail(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(state, "lookup", {"query": ""})
+        assert not _is_error(resp)
+        payload = resp["result"]["structuredContent"]
+        assert payload["status"] == "empty_query"
+
+    def test_lookup_paper_qualifier_rejected(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(state, "lookup", {"query": "paper:tot_2023 tree"})
+        assert not _is_error(resp)
+        payload = resp["result"]["structuredContent"]
+        assert payload["status"] == "malformed_query"
+        assert "paper" in payload["error"]
+
+    def test_lookup_kind_qualifier_passes_through(self, fig_db):
+        # `kind:` is the canonical narrowing qualifier on lookup. Even with
+        # no canonicals seeded in fig_db, the structured envelope should
+        # still come back well-formed (empty hits is normal).
+        state = _make_state(fig_db)
+        resp = _call(state, "lookup", {"query": "kind:entity tree"})
+        assert not _is_error(resp)
+        payload = resp["result"]["structuredContent"]
+        assert payload["mode"] == "lookup"
+        assert payload["kind"] == "entity"
+
+
+# ===========================================================================
+# toc_many tool — multi-paper TOC through the MCP boundary
+# ===========================================================================
+
+
+class TestTocManyTool:
+    def test_toc_many_returns_per_paper_results(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(
+            state, "toc_many", {"paper_names": ["tot_2023", "plain_2024"]},
+        )
+        assert not _is_error(resp)
+        assert not _has_image(resp), "toc_many must not attach figure images"
+        payload = resp["result"]["structuredContent"]
+        assert payload["mode"] == "toc_many"
+        assert payload["paper_names"] == ["tot_2023", "plain_2024"]
+        assert {r["paper_name"] for r in payload["results"]} == {
+            "tot_2023", "plain_2024",
+        }
+        assert payload["missing"] == []
+
+    def test_toc_many_collects_missing(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(
+            state, "toc_many",
+            {"paper_names": ["tot_2023", "no_such_paper"]},
+        )
+        assert not _is_error(resp)
+        payload = resp["result"]["structuredContent"]
+        assert {r["paper_name"] for r in payload["results"]} == {"tot_2023"}
+        assert payload["missing"] == ["no_such_paper"]
+
+    def test_toc_many_dedupes_duplicates(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(
+            state, "toc_many",
+            {"paper_names": ["tot_2023", "tot_2023", "plain_2024"]},
+        )
+        payload = resp["result"]["structuredContent"]
+        assert payload["paper_names"] == ["tot_2023", "plain_2024"]
+        assert len(payload["results"]) == 2
+
+    def test_toc_many_missing_args_is_invalid_params(self, fig_db):
+        state = _make_state(fig_db)
+        resp = mcp_server._handle_tools_call(
+            state,
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "toc_many", "arguments": {}}},
+        )
+        assert "error" in resp
+        assert resp["error"]["code"] == -32602
+
+
+# ===========================================================================
 # Subprocess protocol smoke test
 # ===========================================================================
 
@@ -752,7 +876,7 @@ class TestProtocolHandshake:
         list_reply = responses[1]
         assert list_reply["id"] == 2
         tools = list_reply["result"]["tools"]
-        assert len(tools) == 9
+        assert len(tools) == 10
         for t in tools:
             assert t["name"].replace("_", "").isalnum()
 

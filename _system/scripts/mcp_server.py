@@ -7,7 +7,8 @@ content blocks for any ``(figure:N)`` markdown refs the response carries.
 
 Tools registered (all surface as ``mcp__lodestone__<name>`` in Claude Code):
 
-    search, bm25, lookup, browse, toc, read, figure, repo_tree, read_code
+    search, bm25, lookup, browse, toc, toc_many, read, figure, repo_tree,
+    read_code
 
 Transport notes (per spec §Transports):
 
@@ -48,6 +49,7 @@ from _system.scripts.search import (
     mode_search_multi,
     mode_taxonomy_lookup,
     mode_toc,
+    mode_toc_many,
 )
 from _system.utils.logging import get_logger
 
@@ -438,9 +440,9 @@ def _search_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
 def _lookup_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
     return mode_taxonomy_lookup(
         conn,
-        term=args["term"],
-        kind=args["kind"],
+        query=args["query"],
         filters={"domain": args.get("domain")},
+        limit=int(args.get("limit") or 10),
     )
 
 
@@ -456,6 +458,10 @@ def _browse_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
 
 def _toc_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
     return mode_toc(conn, paper_name=args["paper_name"])
+
+
+def _toc_many_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
+    return mode_toc_many(conn, paper_names=list(args["paper_names"]))
 
 
 def _read_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
@@ -620,22 +626,41 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "lookup",
         "description": (
-            "Resolve a surface-form term to its canonical taxonomy row. "
-            "Tier A: porter-stemmed FTS5 match. Tier B: KNN over sentence "
-            "embeddings (cosine ≥ 0.80). Returns canonical metadata, "
-            "aliases, and the papers that mention it."
+            "Canonical-term FTS5 search across the taxonomy (entities, "
+            "topics, collections), with aliases inlined per hit. Use this "
+            "when 'search' has surfaced a canonical row you want to drill "
+            "into, or when you want to enumerate every alias for a term.\n"
+            "\n"
+            "Accepts the same GitHub-flavored query syntax as 'search' / "
+            "'bm25': bare tokens (implicit AND), \"phrase\", AND/OR/NOT "
+            "(uppercase), parens, term* prefix. Two qualifiers apply:\n"
+            "  - kind:entity|topic|collection — narrow the term_type\n"
+            "  - domain:NAME — restrict to one domain\n"
+            "paper:, collection:, surface: are rejected (no meaning here).\n"
+            "\n"
+            "Returns up to `limit` ranked hits. Each hit carries "
+            "canonical_name, kind, type/entity_type, domain, an aliases "
+            "array ([{alias, source_paper}]), and papers "
+            "([{paper_name, code_repo}]). For topic/collection hits a "
+            "`papers_count` field is also included; entity hits omit it "
+            "because the underlying papers list comes from a synonym "
+            "index that misses canonical-surface mentions, so any count "
+            "would underreport. FTS5-only — no semantic fallback; use "
+            "'search' for a wider sweep."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "term": {"type": "string"},
-                "kind": {
-                    "type": "string",
-                    "enum": ["entity", "topic", "collection"],
-                },
+                "query": {"type": "string"},
                 "domain": {"type": "string"},
+                "limit": {
+                    "type": "integer",
+                    "default": 10,
+                    "minimum": 1,
+                    "maximum": 50,
+                },
             },
-            "required": ["term", "kind"],
+            "required": ["query"],
         },
         "dispatch": _lookup_dispatch,
         "attach": AttachMode.NONE,
@@ -683,6 +708,30 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["paper_name"],
         },
         "dispatch": _toc_dispatch,
+        "attach": AttachMode.NONE,
+    },
+    {
+        "name": "toc_many",
+        "description": (
+            "Return the level-1..3 ATX header table of contents for multiple "
+            "papers in one call. Use this after 'search' / 'bm25' / 'lookup' "
+            "surfaces several candidate papers and you want to scan their "
+            "structures side-by-side before deciding where to 'read'. "
+            "Names that don't resolve are reported in 'missing' instead of "
+            "raising — a typo in one name doesn't abandon the rest."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "paper_names": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                },
+            },
+            "required": ["paper_names"],
+        },
+        "dispatch": _toc_many_dispatch,
         "attach": AttachMode.NONE,
     },
     {

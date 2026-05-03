@@ -225,11 +225,18 @@ def test_taxonomy_lookup_envelope_carries_code_repo_per_paper(conn):
     )
 
     payload = search_mod.mode_taxonomy_lookup(
-        conn, term="hierarchical indexing", kind="collection",
+        conn,
+        query="kind:collection \"hierarchical indexing\"",
         filters={"domain": "rag"},
     )
-    assert payload.get("error") is None, payload
-    papers = payload.get("papers") or []
+    assert payload.get("status") is None, payload
+    hits = payload.get("hits") or []
+    hit = next(
+        (h for h in hits if h["canonical_name"] == "hierarchical indexing"),
+        None,
+    )
+    assert hit is not None, payload
+    papers = hit.get("papers") or []
     assert any(p["paper_name"] == "collected_paper_2026" for p in papers)
     target = next(p for p in papers if p["paper_name"] == "collected_paper_2026")
     assert target["code_repo"] is not None
