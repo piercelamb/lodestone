@@ -749,6 +749,214 @@ class TestModeBM25:
 
 
 # ===========================================================================
+# Mode 1 — BM25 pagination
+# ===========================================================================
+
+
+def _seed_paginated_sections(
+    conn: sqlite3.Connection,
+    *,
+    paper_id: int,
+    paper_name: str,
+    domain: str,
+    count: int,
+    body_token: str,
+    title_prefix: str = "Page Section",
+) -> None:
+    """Insert ``count`` extra sections whose body all carry ``body_token``
+    so a BM25 query for ``body_token`` matches every one of them. Lets
+    pagination tests build a deterministic-sized result set without
+    fighting FTS5 ranking edge cases."""
+    rows = [
+        (
+            paper_id,
+            domain,
+            paper_name,
+            f"{title_prefix} {i:02d}",
+            "1",
+            f"{body_token} payload {i} {body_token}",
+        )
+        for i in range(count)
+    ]
+    conn.executemany(
+        """
+        INSERT INTO sections
+            (paper_id, domain, paper_name, section_title, section_level, body)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
+class TestModeBM25Pagination:
+    """Pagination contract for ``mode_bm25``: offset slicing,
+    total_hits / has_more echo, soft-fail on negative offset, and the
+    skip-COUNT optimization on the first-page-undersize case."""
+
+    def _seed_15_matches(self, seeded_db) -> None:
+        p1_id = seeded_db.execute(
+            "SELECT id FROM papers WHERE paper_name = ?", ("bookrag_2024",)
+        ).fetchone()[0]
+        _seed_paginated_sections(
+            seeded_db,
+            paper_id=p1_id,
+            paper_name="bookrag_2024",
+            domain="rag",
+            count=15,
+            body_token="paginatortoken",
+        )
+
+    def test_total_hits_matches_full_result_count(self, seeded_db):
+        self._seed_15_matches(seeded_db)
+        r = search_mod.mode_bm25(
+            seeded_db, query="paginatortoken", filters={}, limit=100
+        )
+        assert r["total_hits"] == 15
+        assert r["offset"] == 0
+        assert r["limit"] == 100
+        assert r["has_more"] is False
+        # All 15 hits live under one paper (bookrag_2024); the result
+        # rows are 15 sections, not 1 paper.
+        all_rows = sum(int(g["hit_count"]) for g in r["results"])
+        assert all_rows == 15
+
+    def test_offset_slices_correctly(self, seeded_db):
+        self._seed_15_matches(seeded_db)
+        page1 = search_mod.mode_bm25(
+            seeded_db, query="paginatortoken", filters={},
+            limit=5, offset=0,
+        )
+        page2 = search_mod.mode_bm25(
+            seeded_db, query="paginatortoken", filters={},
+            limit=5, offset=5,
+        )
+
+        def _titles(payload):
+            return {
+                s["section_title"]
+                for g in payload["results"]
+                for s in g.get("sections", [])
+            }
+
+        t1, t2 = _titles(page1), _titles(page2)
+        assert t1, page1
+        assert t2, page2
+        assert t1.isdisjoint(t2), (t1, t2)
+
+    def test_has_more_true_when_more_pages(self, seeded_db):
+        self._seed_15_matches(seeded_db)
+        r = search_mod.mode_bm25(
+            seeded_db, query="paginatortoken", filters={},
+            limit=5, offset=0,
+        )
+        assert r["has_more"] is True
+        assert r["total_hits"] == 15
+
+    def test_has_more_false_at_end(self, seeded_db):
+        self._seed_15_matches(seeded_db)
+        r = search_mod.mode_bm25(
+            seeded_db, query="paginatortoken", filters={},
+            limit=5, offset=10,
+        )
+        assert r["has_more"] is False
+        rows = sum(int(g["hit_count"]) for g in r["results"])
+        assert rows == 5
+
+    def test_offset_beyond_total_returns_empty(self, seeded_db):
+        self._seed_15_matches(seeded_db)
+        r = search_mod.mode_bm25(
+            seeded_db, query="paginatortoken", filters={},
+            limit=5, offset=100,
+        )
+        # Recoverable: empty page, total still reported, has_more false.
+        assert r["results"] == []
+        assert r["total_hits"] == 15
+        assert r["has_more"] is False
+        # Not a soft-fail — Claude can recover by paging back.
+        assert "status" not in r
+
+    def test_negative_offset_soft_fails(self, seeded_db):
+        r = search_mod.mode_bm25(
+            seeded_db, query="paginatortoken", filters={},
+            limit=5, offset=-1,
+        )
+        assert r["status"] == "invalid_pagination"
+        assert ">= 0" in r["error"]
+        assert r["offset"] == -1
+        assert r["limit"] == 5
+        assert "total_hits" not in r
+        assert r["status"] in search_mod._SOFT_FAILURE_STATUSES
+
+    def test_offset_with_filters(self, seeded_db):
+        # Seed 15 hits in 'rag', then 3 hits in a new domain. Domain
+        # filter must narrow BOTH the page AND the total.
+        self._seed_15_matches(seeded_db)
+        seeded_db.execute(
+            "INSERT OR IGNORE INTO domains (name, description) VALUES (?, ?)",
+            ("solo", "solo domain"),
+        )
+        seeded_db.execute(
+            "INSERT OR IGNORE INTO collections (domain, name, description) "
+            "VALUES ('solo', 'misc', NULL)"
+        )
+        solo_id = _insert_paper(
+            seeded_db,
+            arxiv_id="2403.00003",
+            paper_name="solo_2024",
+            title="Solo",
+            abstract="abstract",
+            markdown=None,
+            domain="solo",
+            collection="misc",
+            needs_review=0,
+            ingested_at="2024-03-01T00:00:00+00:00",
+        )
+        _seed_paginated_sections(
+            seeded_db,
+            paper_id=solo_id,
+            paper_name="solo_2024",
+            domain="solo",
+            count=3,
+            body_token="paginatortoken",
+        )
+
+        r = search_mod.mode_bm25(
+            seeded_db, query="paginatortoken", filters={"domain": "rag"},
+            limit=5, offset=5,
+        )
+        assert r["total_hits"] == 15
+        names = {g["paper_name"] for g in r["results"]}
+        assert "solo_2024" not in names
+        assert "bookrag_2024" in names
+
+    def test_skip_count_optimization_when_first_page_undersize(
+        self, seeded_db
+    ):
+        """When ``offset == 0`` and the page came back smaller than
+        ``limit``, COUNT(*) is skipped — total_hits is exactly
+        page_size. We verify the optimization by attaching a sqlite
+        trace callback and asserting no COUNT(*) statement fires."""
+        seen_sql: list[str] = []
+        seeded_db.set_trace_callback(seen_sql.append)
+        try:
+            # 'BookRAG' hits the abstract chunk only (1 row); limit=10
+            # leaves plenty of headroom — skip-COUNT applies.
+            r = search_mod.mode_bm25(
+                seeded_db, query="BookRAG", filters={}, limit=10, offset=0,
+            )
+        finally:
+            seeded_db.set_trace_callback(None)
+        assert r["total_hits"] == sum(
+            int(g["hit_count"]) for g in r["results"]
+        )
+        count_stmts = [
+            sql for sql in seen_sql
+            if "FROM sections" in sql and "COUNT(*)" in sql
+        ]
+        assert count_stmts == [], count_stmts
+
+
+# ===========================================================================
 # GitHub-code-search-style query parser
 # ===========================================================================
 
@@ -1071,6 +1279,119 @@ class TestModeTaxonomy:
         search_mod.mode_taxonomy_lookup(
             seeded_db, query="zzznosuchterm", filters={}
         )
+
+
+class TestModeTaxonomyPagination:
+    """Pagination contract for ``mode_taxonomy_lookup``: total_hits +
+    has_more, offset slicing, ``kind:`` qualifier honored across pages."""
+
+    def _seed_n_entity_canonicals(
+        self, seeded_db, count: int, prefix: str = "PagingEntity"
+    ) -> None:
+        """Seed ``count`` extra entity canonicals all containing
+        ``"PagingEntity"`` so a single FTS MATCH hits all of them."""
+        for i in range(count):
+            tid = _insert_canonical(
+                seeded_db,
+                domain="rag",
+                term_type="entity",
+                entity_type="method",
+                canonical_name=f"{prefix} {i:02d}",
+                first_seen_in="bookrag_2024",
+            )
+            _insert_terms_fts(
+                seeded_db,
+                term_id=tid,
+                domain="rag",
+                term_type="entity",
+                entity_type="method",
+                canonical_name=f"{prefix} {i:02d}",
+                aliases="",
+            )
+
+    def test_total_hits_and_paging(self, seeded_db):
+        self._seed_n_entity_canonicals(seeded_db, 12)
+        page1 = search_mod.mode_taxonomy_lookup(
+            seeded_db, query="PagingEntity", filters={},
+            limit=5, offset=0,
+        )
+        page2 = search_mod.mode_taxonomy_lookup(
+            seeded_db, query="PagingEntity", filters={},
+            limit=5, offset=5,
+        )
+        assert page1["total_hits"] == 12
+        assert page1["has_more"] is True
+        assert page2["total_hits"] == 12
+        assert page2["has_more"] is True
+        names1 = {h["canonical_name"] for h in page1["hits"]}
+        names2 = {h["canonical_name"] for h in page2["hits"]}
+        assert names1.isdisjoint(names2), (names1, names2)
+        assert len(page1["hits"]) == 5
+        assert len(page2["hits"]) == 5
+
+        # Final page reaches end_of_results
+        last = search_mod.mode_taxonomy_lookup(
+            seeded_db, query="PagingEntity", filters={},
+            limit=5, offset=10,
+        )
+        assert last["has_more"] is False
+        assert len(last["hits"]) == 2
+
+    def test_offset_with_kind_filter(self, seeded_db):
+        # Seed 6 entity canonicals + 4 topic canonicals all sharing the
+        # token "PagingMixed". With kind:entity, total_hits should be 6.
+        self._seed_n_entity_canonicals(
+            seeded_db, 6, prefix="PagingMixed"
+        )
+        for i in range(4):
+            tid = _insert_canonical(
+                seeded_db,
+                domain="rag",
+                term_type="topic",
+                entity_type="",
+                canonical_name=f"PagingMixed topic {i:02d}",
+                first_seen_in="bookrag_2024",
+            )
+            _insert_terms_fts(
+                seeded_db,
+                term_id=tid,
+                domain="rag",
+                term_type="topic",
+                entity_type="",
+                canonical_name=f"PagingMixed topic {i:02d}",
+                aliases="",
+            )
+
+        r = search_mod.mode_taxonomy_lookup(
+            seeded_db,
+            query="kind:entity PagingMixed",
+            filters={},
+            limit=3,
+            offset=0,
+        )
+        assert r["total_hits"] == 6
+        assert r["has_more"] is True
+        assert all(h["kind"] == "entity" for h in r["hits"])
+
+        r2 = search_mod.mode_taxonomy_lookup(
+            seeded_db,
+            query="kind:entity PagingMixed",
+            filters={},
+            limit=3,
+            offset=3,
+        )
+        assert r2["total_hits"] == 6
+        assert r2["has_more"] is False
+        assert all(h["kind"] == "entity" for h in r2["hits"])
+
+    def test_negative_offset_soft_fails(self, seeded_db):
+        r = search_mod.mode_taxonomy_lookup(
+            seeded_db, query="RAPTOR", filters={},
+            limit=5, offset=-1,
+        )
+        assert r["status"] == "invalid_pagination"
+        assert ">= 0" in r["error"]
+        assert r["status"] in search_mod._SOFT_FAILURE_STATUSES
 
 
 # ===========================================================================
@@ -2301,3 +2622,75 @@ def test_to_human_routes_overview_and_collection(seeded_db):
         filters={},
     )
     assert "bookrag_2024" in search_mod.to_human(coll_payload)
+
+
+# ===========================================================================
+# Pagination footer rendering
+# ===========================================================================
+
+
+class TestPagingFooter:
+    def test_bm25_renders_paging_footer_when_more(self, seeded_db):
+        p1_id = seeded_db.execute(
+            "SELECT id FROM papers WHERE paper_name = ?", ("bookrag_2024",)
+        ).fetchone()[0]
+        _seed_paginated_sections(
+            seeded_db, paper_id=p1_id, paper_name="bookrag_2024",
+            domain="rag", count=15, body_token="footertoken",
+        )
+        r = search_mod.mode_bm25(
+            seeded_db, query="footertoken", filters={}, limit=5, offset=0,
+        )
+        assert r["has_more"] is True
+        out = search_mod.to_human(r)
+        assert "Re-call with --offset 5" in out, out
+        assert "of 15" in out, out
+
+    def test_bm25_renders_end_marker_when_no_more(self, seeded_db):
+        p1_id = seeded_db.execute(
+            "SELECT id FROM papers WHERE paper_name = ?", ("bookrag_2024",)
+        ).fetchone()[0]
+        _seed_paginated_sections(
+            seeded_db, paper_id=p1_id, paper_name="bookrag_2024",
+            domain="rag", count=8, body_token="endtoken",
+        )
+        r = search_mod.mode_bm25(
+            seeded_db, query="endtoken", filters={}, limit=5, offset=5,
+        )
+        assert r["has_more"] is False
+        out = search_mod.to_human(r)
+        assert "end of results" in out, out
+
+    def test_lookup_footer_when_paging(self, seeded_db):
+        for i in range(7):
+            tid = _insert_canonical(
+                seeded_db,
+                domain="rag",
+                term_type="entity",
+                entity_type="method",
+                canonical_name=f"FooterEntity {i:02d}",
+                first_seen_in="bookrag_2024",
+            )
+            _insert_terms_fts(
+                seeded_db,
+                term_id=tid,
+                domain="rag",
+                term_type="entity",
+                entity_type="method",
+                canonical_name=f"FooterEntity {i:02d}",
+                aliases="",
+            )
+        r = search_mod.mode_taxonomy_lookup(
+            seeded_db, query="FooterEntity", filters={}, limit=3, offset=0,
+        )
+        out = search_mod.to_human(r)
+        assert "Re-call with --offset 3" in out, out
+        assert "of 7" in out, out
+
+    def test_invalid_pagination_renders_error(self, seeded_db):
+        r = search_mod.mode_bm25(
+            seeded_db, query="anything", filters={}, limit=5, offset=-1,
+        )
+        out = search_mod.to_human(r)
+        assert "invalid pagination" in out.lower(), out
+        assert ">= 0" in out, out

@@ -444,10 +444,23 @@ _EMPTY_QUERY_HINT = (
 )
 
 
+_INVALID_PAGINATION_HINT = (
+    "Pagination uses non-negative integers: offset >= 0, limit >= 1. "
+    "Page forward by raising `offset` by `limit` once `has_more` "
+    "is true; the response carries `total_hits` and `offset`."
+)
+
+
+_SOFT_FAIL_HINTS: dict[str, str] = {
+    "empty_query": _EMPTY_QUERY_HINT,
+    "invalid_pagination": _INVALID_PAGINATION_HINT,
+}
+
+
 def _soft_fail_payload(
     *, mode: str, status: str, query: str, error: str, extra_hint: str = ""
 ) -> dict[str, Any]:
-    hint = _EMPTY_QUERY_HINT if status == "empty_query" else _BM25_SYNTAX_HINT
+    hint = _SOFT_FAIL_HINTS.get(status, _BM25_SYNTAX_HINT)
     if extra_hint:
         hint = f"{extra_hint} {hint}"
     return {
@@ -474,6 +487,23 @@ def _empty_query_payload(*, mode: str, query: str, error: str) -> dict[str, Any]
     )
 
 
+def _invalid_pagination_payload(
+    *, mode: str, query: str, offset: int, limit: int, error: str,
+) -> dict[str, Any]:
+    """Soft-fail envelope for negative offset / limit values.
+
+    Echoes the bad params for debug; pagination response keys
+    (``total_hits`` / ``has_more``) are intentionally absent — the
+    request never executed.
+    """
+    payload = _soft_fail_payload(
+        mode=mode, status="invalid_pagination", query=query, error=error,
+    )
+    payload["offset"] = offset
+    payload["limit"] = limit
+    return payload
+
+
 def _merge_qualifier_with_kwarg(
     qualifiers: dict[str, str], kwarg_value: Any, key: str
 ) -> Any:
@@ -496,8 +526,9 @@ def mode_bm25(
     query: str,
     filters: dict[str, Any],
     limit: int,
+    offset: int = 0,
     scope: Scope = Scope.SECTIONS,
-    snippet_tokens: int = 10,
+    snippet_tokens: int = 256,
 ) -> dict[str, Any]:
     """BM25 text search across ``sections`` and/or ``readmes_fts``.
 
@@ -514,12 +545,25 @@ def mode_bm25(
 
     ``snippet_tokens`` controls FTS5 ``snippet()`` window width.
 
+    ``offset`` (default 0) skips that many ranked hits before returning;
+    the response carries ``total_hits`` and ``has_more`` so callers can
+    walk forward by raising ``offset`` by ``limit``. For ``scope=BOTH``
+    each surface paginates independently with the same offset/limit;
+    ``total_hits`` is the cross-surface sum.
+
     Soft failures (no exception raised; soft-status payload):
 
     * ``empty_query`` — punctuation-only or qualifier-only query
     * ``malformed_query`` — quote/paren/operator mismatch, unknown
       qualifier, ``/regex/`` form, or qualifier↔kwarg conflict
+    * ``invalid_pagination`` — ``offset`` < 0
     """
+    if offset < 0:
+        return _invalid_pagination_payload(
+            mode="sections", query=query, offset=offset, limit=limit,
+            error="offset must be >= 0",
+        )
+
     try:
         parsed = _parse_github_query(query)
     except EmptyQueryError as e:
@@ -584,19 +628,19 @@ def mode_bm25(
         result = _bm25_sections(
             conn, fts_expression=parsed.fts_expression,
             domain=domain, collection=collection, paper_name=paper_name,
-            limit=limit, snippet_tokens=snippet_tokens,
+            limit=limit, offset=offset, snippet_tokens=snippet_tokens,
         )
     elif scope is Scope.READMES:
         result = _bm25_readmes(
             conn, fts_expression=parsed.fts_expression,
             domain=domain, collection=collection, paper_name=paper_name,
-            limit=limit, snippet_tokens=snippet_tokens,
+            limit=limit, offset=offset, snippet_tokens=snippet_tokens,
         )
     else:
         result = _bm25_both(
             conn, fts_expression=parsed.fts_expression,
             domain=domain, collection=collection, paper_name=paper_name,
-            limit=limit, snippet_tokens=snippet_tokens,
+            limit=limit, offset=offset, snippet_tokens=snippet_tokens,
         )
     result["query"] = query
     return result
@@ -610,6 +654,7 @@ def _bm25_sections(
     collection: str | None,
     paper_name: str | None,
     limit: int,
+    offset: int = 0,
     snippet_tokens: int = 10,
     enrich: bool = True,
 ) -> dict[str, Any]:
@@ -619,32 +664,44 @@ def _bm25_sections(
     # so first line of body == breadcrumb. We extract it explicitly so the
     # caller doesn't depend on whether snippet()'s token window happened to
     # land near the start of body.
+    join_sql = ""
+    wheres = ["sections MATCH ?"]
+    where_params: list[Any] = [fts_expression]
+    if domain:
+        wheres.append("s.domain = ?")
+        where_params.append(domain)
+    if paper_name:
+        wheres.append("s.paper_name = ?")
+        where_params.append(paper_name)
+    if collection:
+        # Join papers for the collection filter — sections does not carry
+        # collection in FTS5 (by design; the paper owns the collection).
+        join_sql = " JOIN papers p ON p.id = s.paper_id"
+        wheres.append("p.collection = ?")
+        where_params.append(collection)
+    where_clause = " WHERE " + " AND ".join(wheres)
+
     sql = (
         "SELECT s.paper_id, s.domain, s.paper_name, s.section_title, "
         "       s.section_level, "
         f"       snippet(sections, 5, '[', ']', '…', {int(snippet_tokens)}) AS snip, "
         "       substr(s.body, 1, instr(s.body || char(10), char(10)) - 1) AS breadcrumb "
         "  FROM sections s"
+        + join_sql
+        + where_clause
+        + " ORDER BY rank LIMIT ? OFFSET ?"
     )
-    wheres = ["sections MATCH ?"]
-    params: list[Any] = [fts_expression]
-    if domain:
-        wheres.append("s.domain = ?")
-        params.append(domain)
-    if paper_name:
-        wheres.append("s.paper_name = ?")
-        params.append(paper_name)
-    if collection:
-        # Join papers for the collection filter — sections does not carry
-        # collection in FTS5 (by design; the paper owns the collection).
-        sql += " JOIN papers p ON p.id = s.paper_id"
-        wheres.append("p.collection = ?")
-        params.append(collection)
-    sql += " WHERE " + " AND ".join(wheres)
-    sql += " ORDER BY rank LIMIT ?"
-    params.append(limit)
-
-    rows = conn.execute(sql, params).fetchall()
+    rows = conn.execute(sql, [*where_params, limit, offset]).fetchall()
+    total_hits = _bm25_total_hits(
+        conn,
+        count_sql=(
+            "SELECT COUNT(*) FROM sections s" + join_sql + where_clause
+        ),
+        count_params=where_params,
+        offset=offset,
+        limit=limit,
+        page_size=len(rows),
+    )
 
     # One bucket walk to build groups; enrichment then batched across all
     # distinct paper_ids in three queries regardless of result count.
@@ -679,6 +736,10 @@ def _bm25_sections(
     return {
         "mode": "sections",
         "results": list(grouped.values()),
+        "offset": offset,
+        "limit": limit,
+        "total_hits": total_hits,
+        "has_more": offset + len(rows) < total_hits,
     }
 
 
@@ -690,33 +751,47 @@ def _bm25_readmes(
     collection: str | None,
     paper_name: str | None,
     limit: int,
+    offset: int = 0,
     snippet_tokens: int = 10,
     enrich: bool = True,
 ) -> dict[str, Any]:
     """BM25 against ``readmes_fts``. Same envelope shape as ``_bm25_sections``
     so ``to_human`` / enrichment branches treat both uniformly."""
+    join_sql = ""
+    wheres = ["readmes_fts MATCH ?"]
+    where_params: list[Any] = [fts_expression]
+    if domain:
+        wheres.append("r.domain = ?")
+        where_params.append(domain)
+    if paper_name:
+        wheres.append("r.paper_name = ?")
+        where_params.append(paper_name)
+    if collection:
+        join_sql = " JOIN papers p ON p.id = r.paper_id"
+        wheres.append("p.collection = ?")
+        where_params.append(collection)
+    where_clause = " WHERE " + " AND ".join(wheres)
+
     sql = (
         "SELECT r.paper_id, r.domain, r.paper_name, r.path, "
         f"       snippet(readmes_fts, 4, '[', ']', '…', {int(snippet_tokens)}) AS snip "
         "  FROM readmes_fts r"
+        + join_sql
+        + where_clause
+        + " ORDER BY rank LIMIT ? OFFSET ?"
     )
-    wheres = ["readmes_fts MATCH ?"]
-    params: list[Any] = [fts_expression]
-    if domain:
-        wheres.append("r.domain = ?")
-        params.append(domain)
-    if paper_name:
-        wheres.append("r.paper_name = ?")
-        params.append(paper_name)
-    if collection:
-        sql += " JOIN papers p ON p.id = r.paper_id"
-        wheres.append("p.collection = ?")
-        params.append(collection)
-    sql += " WHERE " + " AND ".join(wheres)
-    sql += " ORDER BY rank LIMIT ?"
-    params.append(limit)
 
-    rows = conn.execute(sql, params).fetchall()
+    rows = conn.execute(sql, [*where_params, limit, offset]).fetchall()
+    total_hits = _bm25_total_hits(
+        conn,
+        count_sql=(
+            "SELECT COUNT(*) FROM readmes_fts r" + join_sql + where_clause
+        ),
+        count_params=where_params,
+        offset=offset,
+        limit=limit,
+        page_size=len(rows),
+    )
 
     grouped: dict[str, dict[str, Any]] = {}
     pid_order: list[int] = []
@@ -748,6 +823,10 @@ def _bm25_readmes(
         "mode": "sections",
         "scope": Scope.READMES.value,
         "results": list(grouped.values()),
+        "offset": offset,
+        "limit": limit,
+        "total_hits": total_hits,
+        "has_more": offset + len(rows) < total_hits,
     }
 
 
@@ -759,19 +838,27 @@ def _bm25_both(
     collection: str | None,
     paper_name: str | None,
     limit: int,
+    offset: int = 0,
     snippet_tokens: int = 10,
     enrich: bool = True,
 ) -> dict[str, Any]:
-    """Union of sections + READMES hits, merged by paper_name."""
+    """Union of sections + READMES hits, merged by paper_name.
+
+    Each surface paginates independently with the same ``offset`` /
+    ``limit``; ``total_hits`` is the sum across both surfaces and
+    ``has_more`` is true when either surface still has unread rows.
+    """
     sec = _bm25_sections(
         conn, fts_expression=fts_expression,
         domain=domain, collection=collection, paper_name=paper_name,
-        limit=limit, snippet_tokens=snippet_tokens, enrich=enrich,
+        limit=limit, offset=offset,
+        snippet_tokens=snippet_tokens, enrich=enrich,
     )
     rdm = _bm25_readmes(
         conn, fts_expression=fts_expression,
         domain=domain, collection=collection, paper_name=paper_name,
-        limit=limit, snippet_tokens=snippet_tokens, enrich=enrich,
+        limit=limit, offset=offset,
+        snippet_tokens=snippet_tokens, enrich=enrich,
     )
 
     by_name: dict[str, dict[str, Any]] = {}
@@ -788,11 +875,39 @@ def _bm25_both(
         if group.get("readme_hit") is not None:
             existing["readme_hit"] = group["readme_hit"]
 
+    total_hits = int(sec.get("total_hits", 0)) + int(rdm.get("total_hits", 0))
+    has_more = bool(sec.get("has_more")) or bool(rdm.get("has_more"))
     return {
         "mode": "sections",
         "scope": Scope.BOTH.value,
         "results": list(by_name.values()),
+        "offset": offset,
+        "limit": limit,
+        "total_hits": total_hits,
+        "has_more": has_more,
     }
+
+
+def _bm25_total_hits(
+    conn: sqlite3.Connection,
+    *,
+    count_sql: str,
+    count_params: list[Any],
+    offset: int,
+    limit: int,
+    page_size: int,
+) -> int:
+    """Return the total matching-row count for a BM25 query.
+
+    Optimization: when we asked for the first page (``offset == 0``)
+    and the page came back smaller than ``limit``, we already know the
+    total is exactly ``page_size`` — no COUNT(*) needed. This saves a
+    query on the typical "narrow query, fits in one page" case.
+    """
+    if offset == 0 and page_size < limit:
+        return page_size
+    row = conn.execute(count_sql, count_params).fetchone()
+    return int(row[0]) if row else 0
 
 
 def _attach_bm25_enrichment(
@@ -951,7 +1066,8 @@ def mode_taxonomy_lookup(
     *,
     query: str,
     filters: dict[str, Any],
-    limit: int = 10,
+    limit: int = 50,
+    offset: int = 0,
 ) -> dict[str, Any]:
     """Canonical-term FTS5 search with aliases inlined per hit.
 
@@ -963,10 +1079,14 @@ def mode_taxonomy_lookup(
     ``surface:`` are rejected — they have no meaning against canonical
     terms.
 
-    Returns up to ``limit`` ranked hits. Each hit carries the canonical
-    metadata, every alias for the term (with its source paper), and the
-    list of papers that mention it (papers per kind: aliases-source for
-    entities, paper_topics for topics, papers.collection for collections).
+    Returns up to ``limit`` ranked hits starting at ``offset`` (default
+    0). The response carries ``total_hits`` and ``has_more`` so callers
+    can walk forward by raising ``offset`` by ``limit``.
+
+    Each hit carries the canonical metadata, every alias for the term
+    (with its source paper), and the list of papers that mention it
+    (papers per kind: aliases-source for entities, paper_topics for
+    topics, papers.collection for collections).
 
     No KNN / vector fallback — this is the precise canonical-search path.
     Semantic broadening lives in the resolver / ingest pipeline; the
@@ -980,7 +1100,14 @@ def mode_taxonomy_lookup(
       qualifier (incl. ``paper:`` / ``collection:`` / ``surface:``),
       ``kind:`` value outside the allowed set, or qualifier↔kwarg
       conflict
+    * ``invalid_pagination`` — ``offset`` < 0
     """
+    if offset < 0:
+        return _invalid_pagination_payload(
+            mode="lookup", query=query, offset=offset, limit=limit,
+            error="offset must be >= 0",
+        )
+
     if not query or not query.strip():
         return _empty_query_payload(
             mode="lookup", query=query, error="empty query",
@@ -1020,23 +1147,26 @@ def mode_taxonomy_lookup(
             error="query held only qualifiers, no FTS body",
         )
 
+    where_sql = " WHERE terms_fts MATCH ? "
+    where_params: list[Any] = [parsed.fts_expression]
+    if kind_filter:
+        where_sql += " AND term_type = ? "
+        where_params.append(kind_filter)
+    if domain:
+        where_sql += " AND domain = ? "
+        where_params.append(domain)
+
     sql = (
         "SELECT term_id, domain, term_type, entity_type, canonical_name "
         "  FROM terms_fts "
-        " WHERE terms_fts MATCH ? "
+        + where_sql
+        + " ORDER BY rank LIMIT ? OFFSET ?"
     )
-    params: list[Any] = [parsed.fts_expression]
-    if kind_filter:
-        sql += " AND term_type = ? "
-        params.append(kind_filter)
-    if domain:
-        sql += " AND domain = ? "
-        params.append(domain)
-    sql += " ORDER BY rank LIMIT ?"
-    params.append(limit)
 
     try:
-        rows = conn.execute(sql, params).fetchall()
+        rows = conn.execute(
+            sql, [*where_params, limit, offset]
+        ).fetchall()
     except sqlite3.OperationalError as exc:
         # Degenerate MATCH (e.g. all-punctuation after defang) raises
         # "fts5: syntax error near ..."; treat as zero hits. Anything
@@ -1047,6 +1177,16 @@ def mode_taxonomy_lookup(
             "terms_fts MATCH syntax error for query=%r: %s", query, exc,
         )
         rows = []
+        total_hits = 0
+    else:
+        total_hits = _bm25_total_hits(
+            conn,
+            count_sql="SELECT COUNT(*) FROM terms_fts " + where_sql,
+            count_params=where_params,
+            offset=offset,
+            limit=limit,
+            page_size=len(rows),
+        )
 
     hits: list[dict[str, Any]] = []
     seen: set[int] = set()
@@ -1122,6 +1262,10 @@ def mode_taxonomy_lookup(
         "domain": domain or None,
         "kind": kind_filter,
         "hits": hits,
+        "offset": offset,
+        "limit": limit,
+        "total_hits": total_hits,
+        "has_more": offset + len(rows) < total_hits,
     }
 
 
@@ -2530,6 +2674,31 @@ def format_collection_text(payload: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _paging_footer(payload: dict[str, Any], *, page_size: int) -> str | None:
+    """Render the "showing hits N-M of T" footer for paged results.
+
+    ``page_size`` is the number of result *rows* (not groups) on this
+    page — the caller computes it because the unit varies between
+    surfaces (BM25 sums hit_count across paper groups; lookup uses the
+    hit count directly).
+    """
+    if "total_hits" not in payload:
+        return None
+    total = int(payload.get("total_hits") or 0)
+    offset = int(payload.get("offset") or 0)
+    limit = int(payload.get("limit") or 0)
+    if total == 0 and page_size == 0:
+        return "-- no hits --"
+    first = offset + 1 if page_size else offset
+    last = offset + page_size
+    if payload.get("has_more") and limit > 0:
+        return (
+            f"-- showing hits {first}-{last} of {total} (offset={offset}). "
+            f"Re-call with --offset {offset + limit} for next page. --"
+        )
+    return f"-- showing hits {first}-{last} of {total} (end of results). --"
+
+
 def to_human(payload: dict[str, Any]) -> str:
     """Short plaintext rendering per mode. Designed for terminal eyeballing,
     not programmatic reuse — pipelines should consume ``to_json``.
@@ -2562,10 +2731,24 @@ def to_human(payload: dict[str, Any]) -> str:
             hint = payload.get("hint")
             if hint:
                 lines.append(hint)
+        elif payload.get("status") == "invalid_pagination":
+            lines.append(
+                f"invalid pagination on BM25 query: {payload.get('query')!r}"
+            )
+            err = payload.get("error")
+            if err:
+                lines.append(err)
+            hint = payload.get("hint")
+            if hint:
+                lines.append(hint)
         else:
             scope_label = payload.get("scope") or "sections"
             lines.append(
                 f"== BM25 {scope_label}: {payload.get('query')!r} =="
+            )
+            row_count = sum(
+                int(h.get("hit_count", 0))
+                for h in payload.get("results", [])
             )
             for hit in payload.get("results", []):
                 lines.append(
@@ -2586,6 +2769,9 @@ def to_human(payload: dict[str, Any]) -> str:
                         f"    code_repo: {cr.get('url')} "
                         f"(status={cr.get('status')}, files={cr.get('file_count')})"
                     )
+            footer = _paging_footer(payload, page_size=row_count)
+            if footer:
+                lines.append(footer)
 
     elif mode == "lookup":
         status = payload.get("status")
@@ -2596,6 +2782,16 @@ def to_human(payload: dict[str, Any]) -> str:
                 lines.append(hint)
         elif status == "malformed_query":
             lines.append(f"malformed lookup query: {payload.get('query')!r}")
+            err = payload.get("error")
+            if err:
+                lines.append(err)
+            hint = payload.get("hint")
+            if hint:
+                lines.append(hint)
+        elif status == "invalid_pagination":
+            lines.append(
+                f"invalid pagination on lookup query: {payload.get('query')!r}"
+            )
             err = payload.get("error")
             if err:
                 lines.append(err)
@@ -2642,6 +2838,9 @@ def to_human(payload: dict[str, Any]) -> str:
                         "  papers: "
                         + ", ".join(p["paper_name"] for p in papers)
                     )
+            footer = _paging_footer(payload, page_size=len(hits))
+            if footer:
+                lines.append(footer)
 
     elif mode == "collections":
         lines.append("== collections ==")
@@ -2825,8 +3024,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--collection", default=None,
                    help="collection name — filter when QUERY is set, "
                         "otherwise Mode 2 lookup term")
-    p.add_argument("--limit", type=int, default=10,
-                   help="max BM25 hits (default: 10)")
+    p.add_argument(
+        "--limit", type=int, default=None,
+        help=(
+            "max hits per response. Default is mode-specific to mirror "
+            "the MCP defaults: 15 for BM25 (positional QUERY), 50 for "
+            "--lookup, 5 for --search, 20 for --collection-name. Pass "
+            "--limit explicitly to override."
+        ),
+    )
+    p.add_argument(
+        "--offset", type=int, default=0,
+        help=(
+            "skip this many ranked hits (default 0). Pair with --limit "
+            "to page deeper into a query. Applies to BM25 and --lookup; "
+            "ignored elsewhere. Negative values surface an "
+            "`invalid_pagination` soft-fail."
+        ),
+    )
 
     p.add_argument("--search", default=None, action="append",
                    help="generic first-pass search: returns three buckets "
@@ -3093,18 +3308,19 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
         search_filters: dict[str, Any] = {}
         if args.domain:
             search_filters["domain"] = args.domain
+        search_limit = 5 if args.limit is None else args.limit
         if len(args.search) == 1:
             return mode_search(
                 conn,
                 query=args.search[0],
                 filters=search_filters,
-                limit=args.limit,
+                limit=search_limit,
             )
         return mode_search_multi(
             conn,
             queries=args.search,
             filters=search_filters,
-            limit=args.limit,
+            limit=search_limit,
         )
 
     # Mode 2: taxonomy lookup. --lookup takes a GH-flavored query directly;
@@ -3126,7 +3342,8 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
             conn,
             query=lookup_query,
             filters=domain_filter,
-            limit=args.limit,
+            limit=50 if args.limit is None else args.limit,
+            offset=args.offset,
         )
 
     # Mode 1: BM25 — defaults to `sections`; `--scope` switches to
@@ -3141,7 +3358,8 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
             conn,
             query=args.query,
             filters=filters,
-            limit=args.limit,
+            limit=15 if args.limit is None else args.limit,
+            offset=args.offset,
             scope=Scope(args.scope),
         )
 
@@ -3158,6 +3376,7 @@ _SOFT_FAILURE_STATUSES = frozenset({
     "malformed_section_query",
     "empty_query",
     "malformed_query",
+    "invalid_pagination",
     "no_repo",
     "failed_repo",
     "file_not_found",

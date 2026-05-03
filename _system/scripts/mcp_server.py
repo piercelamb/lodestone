@@ -420,7 +420,8 @@ def _bm25_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
         conn,
         query=query,
         filters=filters,
-        limit=int(args.get("limit", 10)),
+        limit=int(args.get("limit", 15)),
+        offset=int(args.get("offset", 0)),
         scope=Scope(scope_val),
     )
 
@@ -446,7 +447,8 @@ def _lookup_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
         conn,
         query=args["query"],
         filters={"domain": args.get("domain")},
-        limit=int(args.get("limit") or 10),
+        limit=int(args.get("limit") or 50),
+        offset=int(args.get("offset", 0)),
     )
 
 
@@ -620,7 +622,14 @@ TOOLS: list[dict[str, Any]] = [
             "  paper:bookrag_2024 indexing\n"
             "  \"hierarchical retrieval\" OR HiRe\n"
             "  tree* NOT supervised\n"
-            "  surface:readmes embedding"
+            "  surface:readmes embedding\n\n"
+            "Pagination: pass `offset` (default 0) to skip ranked hits. "
+            "The response carries `total_hits` (total matches for this "
+            "query) and `has_more` (whether `offset + len(results) < "
+            "total_hits`); raise `offset` by `limit` to walk forward. "
+            "For scope=both each surface paginates independently with "
+            "the same offset/limit, and `total_hits` is the sum across "
+            "both surfaces."
         ),
         "inputSchema": {
             "type": "object",
@@ -637,7 +646,19 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "domain": {"type": "string"},
                 "collection": {"type": "string"},
-                "limit": {"type": "integer", "default": 10, "minimum": 1},
+                "limit": {"type": "integer", "default": 15, "minimum": 1},
+                "offset": {
+                    "type": "integer",
+                    "default": 0,
+                    "minimum": 0,
+                    "description": (
+                        "Skip this many ranked hits before returning. "
+                        "Pair with `limit` to page deeper into a query: "
+                        "offset=10, limit=10 returns hits 11-20. The "
+                        "response carries `total_hits` and `has_more` "
+                        "so you know whether another page exists."
+                    ),
+                },
             },
             "required": ["query"],
         },
@@ -667,7 +688,12 @@ TOOLS: list[dict[str, Any]] = [
             "because the underlying papers list comes from a synonym "
             "index that misses canonical-surface mentions, so any count "
             "would underreport. FTS5-only — no semantic fallback; use "
-            "'search' for a wider sweep."
+            "'search' for a wider sweep.\n\n"
+            "Pagination: pass `offset` (default 0) to skip ranked hits. "
+            "The response carries `total_hits` (total canonical-term "
+            "matches for this query) and `has_more` (whether "
+            "`offset + len(hits) < total_hits`); raise `offset` by "
+            "`limit` to walk forward."
         ),
         "inputSchema": {
             "type": "object",
@@ -676,9 +702,20 @@ TOOLS: list[dict[str, Any]] = [
                 "domain": {"type": "string"},
                 "limit": {
                     "type": "integer",
-                    "default": 10,
+                    "default": 50,
                     "minimum": 1,
                     "maximum": 50,
+                },
+                "offset": {
+                    "type": "integer",
+                    "default": 0,
+                    "minimum": 0,
+                    "description": (
+                        "Skip this many ranked hits before returning. "
+                        "Pair with `limit` to page deeper. The response "
+                        "carries `total_hits` and `has_more` to drive "
+                        "the next call."
+                    ),
                 },
             },
             "required": ["query"],

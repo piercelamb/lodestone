@@ -1122,3 +1122,119 @@ def test_collection_tool_missing_required_collection(overview_db):
     # the dispatcher's KeyError translation.
     assert "error" in resp
     assert resp["error"]["code"] == mcp_server._ERR_INVALID_PARAMS
+
+
+# ===========================================================================
+# Pagination — bm25 + lookup tools
+# ===========================================================================
+
+
+def _seed_paged_bm25_corpus(conn: sqlite3.Connection) -> None:
+    """Seed 12 sections in fig_db's tot_2023 paper that all match the
+    token "pageme" — enough to exercise multi-page paging."""
+    p_id = conn.execute(
+        "SELECT id FROM papers WHERE paper_name = ?", ("tot_2023",)
+    ).fetchone()[0]
+    rows = [
+        (p_id, "rag", "tot_2023", f"Pageable Section {i:02d}", "1",
+         f"pageme content {i} pageme")
+        for i in range(12)
+    ]
+    conn.executemany(
+        """
+        INSERT INTO sections
+            (paper_id, domain, paper_name, section_title, section_level, body)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+
+
+class TestBm25Pagination:
+    def test_default_offset_is_zero_and_payload_echoes_pagination(
+        self, fig_db
+    ):
+        _seed_paged_bm25_corpus(fig_db)
+        state = _make_state(fig_db)
+        resp = _call(state, "bm25", {"query": "pageme", "limit": 5})
+        assert not _is_error(resp)
+        sc = resp["result"]["structuredContent"]
+        assert sc["offset"] == 0
+        assert sc["limit"] == 5
+        assert sc["total_hits"] == 12
+        assert sc["has_more"] is True
+
+    def test_offset_walks_forward(self, fig_db):
+        _seed_paged_bm25_corpus(fig_db)
+        state = _make_state(fig_db)
+        resp = _call(state, "bm25", {
+            "query": "pageme", "limit": 5, "offset": 5,
+        })
+        assert not _is_error(resp)
+        sc = resp["result"]["structuredContent"]
+        assert sc["offset"] == 5
+        assert sc["total_hits"] == 12
+        assert sc["has_more"] is True
+
+    def test_negative_offset_soft_fails(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(state, "bm25", {"query": "deliberate", "offset": -1})
+        # Soft-failure: payload carries the diagnostic, isError stays false.
+        assert not _is_error(resp)
+        sc = resp["result"]["structuredContent"]
+        assert sc["status"] == "invalid_pagination"
+        assert sc["offset"] == -1
+
+
+class TestLookupPagination:
+    def _seed_n_canonicals(
+        self, conn: sqlite3.Connection, n: int, prefix: str
+    ) -> None:
+        for i in range(n):
+            cur = conn.execute(
+                """
+                INSERT INTO canonical_terms
+                    (domain, term_type, entity_type, canonical_name, first_seen_in)
+                VALUES ('rag', 'entity', 'method', ?, 'tot_2023')
+                """,
+                (f"{prefix} {i:02d}",),
+            )
+            tid = cur.lastrowid
+            conn.execute(
+                """
+                INSERT INTO terms_fts
+                    (term_id, domain, term_type, entity_type, canonical_name, aliases)
+                VALUES (?, 'rag', 'entity', 'method', ?, '')
+                """,
+                (tid, f"{prefix} {i:02d}"),
+            )
+
+    def test_default_offset_zero_in_payload(self, fig_db):
+        self._seed_n_canonicals(fig_db, 3, "LookupPager")
+        state = _make_state(fig_db)
+        resp = _call(state, "lookup", {"query": "LookupPager"})
+        assert not _is_error(resp)
+        sc = resp["result"]["structuredContent"]
+        assert sc["offset"] == 0
+        assert sc["total_hits"] == 3
+        assert sc["has_more"] is False
+
+    def test_offset_walks_forward(self, fig_db):
+        self._seed_n_canonicals(fig_db, 8, "LookupPager")
+        state = _make_state(fig_db)
+        resp = _call(state, "lookup", {
+            "query": "LookupPager", "limit": 3, "offset": 3,
+        })
+        assert not _is_error(resp)
+        sc = resp["result"]["structuredContent"]
+        assert sc["offset"] == 3
+        assert sc["limit"] == 3
+        assert sc["total_hits"] == 8
+        assert sc["has_more"] is True
+
+    def test_negative_offset_soft_fails(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(state, "lookup", {"query": "RAPTOR", "offset": -1})
+        assert not _is_error(resp)
+        sc = resp["result"]["structuredContent"]
+        assert sc["status"] == "invalid_pagination"
