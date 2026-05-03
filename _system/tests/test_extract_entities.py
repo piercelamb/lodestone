@@ -132,14 +132,24 @@ def _seed_paper(
     abstract: str = "We propose BookRAG.",
     markdown: str | None = _DEFAULT_MARKDOWN,
     domain: str | None = "rag",
+    collection: str | None = "demo_collection",
 ) -> int:
+    # The schema-level invariant requires every classified+ paper to
+    # carry both domain and collection. Seed the registry row when both
+    # are provided so the trigger sees a valid state.
+    if domain is not None and collection is not None:
+        conn.execute(
+            "INSERT OR IGNORE INTO collections (domain, name, description) "
+            "VALUES (?, ?, NULL)",
+            (domain, collection),
+        )
     cur = conn.execute(
         """
         INSERT INTO papers (
             arxiv_id, paper_name, title, authors, date, abstract,
             pdf_url, html_source, ingested_at, status, markdown,
-            domain, needs_review
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            domain, collection, needs_review
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             arxiv_id,
@@ -154,6 +164,7 @@ def _seed_paper(
             status,
             markdown,
             domain,
+            collection,
             0,
         ),
     )

@@ -46,6 +46,13 @@ from typing import Any
 # function that needs it.
 from _system.db.connection import get_conn
 from _system.schemas.paper_metadata import PaperStatus
+from _system.scripts.taxonomy_tree import (
+    CollectionNode,
+    DomainNode,
+    TaxonomyTreeStyle,
+    load_taxonomy,
+    render_taxonomy_tree,
+)
 from _system.utils.logging import get_logger
 from _system.utils.sections import (
     SectionQueryError,
@@ -1575,6 +1582,256 @@ def mode_browse(
 
 
 # ---------------------------------------------------------------------------
+# Top-down: overview + collection drill-down
+# ---------------------------------------------------------------------------
+
+
+def _serialize_collection(node: CollectionNode) -> dict[str, Any]:
+    return {
+        "name": node.name,
+        "description": node.description,
+        "paper_count": node.paper_count,
+    }
+
+
+def _serialize_domain(node: DomainNode) -> dict[str, Any]:
+    return {
+        "name": node.name,
+        "description": node.description,
+        "paper_count": node.paper_count,
+        "collection_count": len(node.collections),
+        "collections": [_serialize_collection(c) for c in node.collections],
+    }
+
+
+def _domain_node_from_dict(d: dict[str, Any]) -> DomainNode:
+    """Adapter: rebuild a ``DomainNode`` from its serialized JSON form.
+
+    Used by ``format_overview_tree`` so the formatter can run the shared
+    renderer against the same payload that's shipped as ``structuredContent``
+    — no DB connection threaded into the format step.
+    """
+    colls = [
+        CollectionNode(
+            name=c["name"],
+            description=c.get("description"),
+            paper_count=int(c.get("paper_count") or 0),
+        )
+        for c in (d.get("collections") or [])
+    ]
+    return DomainNode(
+        name=d["name"],
+        description=d.get("description"),
+        paper_count=int(d.get("paper_count") or 0),
+        collections=tuple(colls),
+        overflow=int(d.get("overflow") or 0),
+    )
+
+
+def mode_overview(
+    conn: sqlite3.Connection,
+    *,
+    filters: dict[str, Any],
+) -> dict[str, Any]:
+    """Top-down corpus map. Returns the nested ``domains → collections``
+    tree with paper counts; empty rows are dropped so the response
+    reflects content, not registry.
+    """
+    domain_filter = filters.get("domain")
+    domains = load_taxonomy(
+        conn,
+        domain=domain_filter,
+        include_empty_collections=False,
+        include_empty_domains=False,
+        collections_per_domain_limit=None,
+    )
+    return {
+        "mode": "overview",
+        "domain": domain_filter,
+        "domains": [_serialize_domain(d) for d in domains],
+    }
+
+
+def _resolve_collection_targets(
+    conn: sqlite3.Connection,
+    *,
+    names: list[str],
+    domain_filter: str | None,
+) -> tuple[list[tuple[str, str, str | None]], list[str]]:
+    """Resolve each collection name to ``(domain, name, description)`` rows.
+
+    Returns ``(targets, missing)``. Each target is a unique
+    ``(domain, name, description)`` triple in input order. A collection
+    name found in multiple domains (PK is ``(domain, name)``) without a
+    ``domain_filter`` returns one target per matching domain.
+
+    Names are also looked up in ``papers.collection`` so legacy rows
+    that aren't registered in ``collections`` still resolve. A name that
+    is found in neither is appended to ``missing``.
+    """
+    seen_pairs: set[tuple[str, str]] = set()
+    targets: list[tuple[str, str, str | None]] = []
+    missing: list[str] = []
+
+    for name in names:
+        if not name:
+            missing.append(name)
+            continue
+        if domain_filter:
+            row = conn.execute(
+                "SELECT domain, name, description FROM collections "
+                " WHERE domain = ? AND name = ?",
+                (domain_filter, name),
+            ).fetchone()
+            if row is None:
+                # Fall back to papers — legacy rows may not be registered.
+                fallback = conn.execute(
+                    "SELECT 1 FROM papers WHERE domain = ? AND collection = ? LIMIT 1",
+                    (domain_filter, name),
+                ).fetchone()
+                if fallback is None:
+                    missing.append(name)
+                    continue
+                pair = (domain_filter, name)
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                targets.append((domain_filter, name, None))
+                continue
+            pair = (row[0], row[1])
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            targets.append((row[0], row[1], row[2]))
+            continue
+
+        rows = conn.execute(
+            "SELECT domain, name, description FROM collections WHERE name = ? "
+            " ORDER BY domain",
+            (name,),
+        ).fetchall()
+        if not rows:
+            # Fallback to legacy paper-side rows.
+            paper_rows = conn.execute(
+                "SELECT DISTINCT domain FROM papers "
+                " WHERE collection = ? AND domain IS NOT NULL "
+                " ORDER BY domain",
+                (name,),
+            ).fetchall()
+            if not paper_rows:
+                missing.append(name)
+                continue
+            for (d,) in paper_rows:
+                pair = (d, name)
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                targets.append((d, name, None))
+            continue
+        for d, n, desc in rows:
+            pair = (d, n)
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            targets.append((d, n, desc))
+
+    return targets, missing
+
+
+def mode_collection(
+    conn: sqlite3.Connection,
+    *,
+    collection_names: list[str],
+    filters: dict[str, Any],
+    include_abstracts: bool = True,
+    include_topics: bool = True,
+    limit: int = 20,
+) -> dict[str, Any]:
+    """Drill into one or more collections; return their papers (with
+    abstracts/topics by default).
+
+    Cross-domain name collisions return one entry per matching
+    ``(domain, name)`` pair — Claude can re-call with ``domain`` to
+    narrow. Names that don't resolve land in ``missing`` rather than
+    raising. Empty input is a caller bug — raises ``ValueError``.
+    """
+    if not collection_names:
+        raise ValueError("collection_names must contain at least one name")
+
+    domain_filter = filters.get("domain")
+    targets, missing = _resolve_collection_targets(
+        conn, names=collection_names, domain_filter=domain_filter
+    )
+
+    abstract_col = ", abstract" if include_abstracts else ""
+    entries: list[dict[str, Any]] = []
+    for d_name, c_name, c_desc in targets:
+        total_row = conn.execute(
+            "SELECT COUNT(*) FROM papers WHERE domain = ? AND collection = ?",
+            (d_name, c_name),
+        ).fetchone()
+        total = int(total_row[0] or 0) if total_row else 0
+
+        rows = conn.execute(
+            f"""
+            SELECT id, paper_name, title, authors, date, code_repo,
+                   section_count, figure_count{abstract_col}
+              FROM papers
+             WHERE domain = ? AND collection = ?
+             ORDER BY date DESC, paper_name
+             LIMIT ?
+            """,
+            (d_name, c_name, limit),
+        ).fetchall()
+
+        paper_ids = [int(r[0]) for r in rows]
+        topics_by_id: dict[int, list[str]] = {pid: [] for pid in paper_ids}
+        if include_topics and paper_ids:
+            placeholders = ",".join("?" for _ in paper_ids)
+            for pid, topic in conn.execute(
+                f"SELECT paper_id, topic FROM paper_topics "
+                f" WHERE paper_id IN ({placeholders}) "
+                f" ORDER BY topic",
+                paper_ids,
+            ).fetchall():
+                topics_by_id.setdefault(int(pid), []).append(topic)
+
+        papers: list[dict[str, Any]] = []
+        for r in rows:
+            pid = int(r[0])
+            paper: dict[str, Any] = {
+                "paper_name": r[1],
+                "title": r[2],
+                "authors": r[3],
+                "date": r[4],
+                "code_repo": r[5],
+                "section_count": int(r[6] or 0),
+                "figure_count": int(r[7] or 0),
+            }
+            if include_abstracts:
+                paper["abstract"] = r[8]
+            if include_topics:
+                paper["topics"] = topics_by_id.get(pid, [])
+            papers.append(paper)
+
+        entries.append({
+            "domain": d_name,
+            "collection": c_name,
+            "description": c_desc,
+            "paper_count": total,
+            "papers_truncated": total > len(papers),
+            "papers": papers,
+        })
+
+    return {
+        "mode": "collection",
+        "domain": domain_filter,
+        "collections": entries,
+        "missing": missing,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Mode 4 — ToC
 # ---------------------------------------------------------------------------
 
@@ -2142,6 +2399,137 @@ def _format_search_multi_markdown(payload: dict[str, Any]) -> str:
     return "\n".join(parts).rstrip() + "\n"
 
 
+def format_overview_tree(payload: dict[str, Any]) -> str:
+    """Render a ``mode_overview`` payload as count-style tree text.
+
+    Adapter pulls the JSON payload back into ``DomainNode``s and runs
+    the shared :func:`render_taxonomy_tree`. Tree text is the primary
+    surface for ``overview`` — JSON wrapping bloats the per-row token
+    count 3-4x; tree connectors carry the same structure for free. JSON
+    stays in ``structuredContent`` for programmatic consumers.
+    """
+    domain_filter = payload.get("domain")
+    domain_dicts = payload.get("domains") or []
+    nodes = [_domain_node_from_dict(d) for d in domain_dicts]
+
+    header = "# overview"
+    if domain_filter:
+        header += f"  [domain={domain_filter}]"
+    legend = (
+        "_Domains = broad research areas. Collections = subdivisions of a "
+        "domain by approach or technique. Drill in via the 'collection' "
+        "tool, then inspect papers with 'toc_many' / 'read'._"
+    )
+    if not nodes:
+        scope = (
+            f" under domain={domain_filter!r}" if domain_filter else ""
+        )
+        return f"{header}\n\n{legend}\n\n(no domains with content{scope})"
+
+    body = render_taxonomy_tree(nodes, style=TaxonomyTreeStyle.COUNT)
+    return f"{header}\n\n{legend}\n\n{body}"
+
+
+def _format_count_label(n: int, *, label: str) -> str:
+    return f"{n} {label}" if n == 1 else f"{n} {label}s"
+
+
+def format_collection_text(payload: dict[str, Any]) -> str:
+    """Render a ``mode_collection`` payload as a light tree.
+
+    Each (domain, collection) bundle is a header line with paper rows
+    hung off it via ``├──``/``└──`` connectors. Continuation lines (date
+    / authors / topics / abstract) use ``│   ``/``    `` indents so the
+    tree shape stays legible. Missing names are listed under a trailing
+    section so a typo doesn't sink the response.
+    """
+    domain_filter = payload.get("domain")
+    entries = payload.get("collections") or []
+    missing = payload.get("missing") or []
+
+    header = "# collection"
+    if domain_filter:
+        header += f"  [domain={domain_filter}]"
+    lines: list[str] = [header, ""]
+
+    if not entries:
+        lines.append("(no matching collections)")
+    for entry in entries:
+        d = entry.get("domain", "?")
+        c = entry.get("collection", "?")
+        desc = entry.get("description")
+        n_total = int(entry.get("paper_count") or 0)
+        count_label = _format_count_label(n_total, label="paper")
+        head = f"{d} / {c}"
+        if desc:
+            head += f" — {desc}"
+        head += f"  ({count_label})"
+        lines.append(head)
+
+        papers = entry.get("papers") or []
+        truncated = bool(entry.get("papers_truncated"))
+        n_leaves = len(papers) + (1 if truncated else 0)
+
+        for i, p in enumerate(papers):
+            is_last = (i == n_leaves - 1)
+            top = "└──" if is_last else "├──"
+            cont = "    " if is_last else "│   "
+            paper_name = p.get("paper_name", "?")
+            title = p.get("title") or ""
+            head_line = f"{top} {paper_name}"
+            if title:
+                head_line += f" — {title}"
+            lines.append(head_line)
+
+            meta_bits: list[str] = []
+            date = p.get("date")
+            if date:
+                meta_bits.append(str(date))
+            authors = p.get("authors")
+            if authors:
+                meta_bits.append(str(authors))
+            code_repo = p.get("code_repo")
+            if code_repo:
+                meta_bits.append(str(code_repo))
+            sec_n = int(p.get("section_count") or 0)
+            fig_n = int(p.get("figure_count") or 0)
+            counts = []
+            if sec_n:
+                counts.append(f"{sec_n}§")
+            if fig_n:
+                counts.append(
+                    f"{fig_n} fig" if fig_n == 1 else f"{fig_n} figs"
+                )
+            if counts:
+                meta_bits.append(" ".join(counts))
+            if meta_bits:
+                lines.append(f"{cont}{' · '.join(meta_bits)}")
+
+            topics = p.get("topics")
+            if topics:
+                lines.append(f"{cont}topics: {', '.join(topics)}")
+
+            abstract = p.get("abstract")
+            if abstract:
+                snippet = " ".join(str(abstract).split())
+                lines.append(f"{cont}abstract: {snippet}")
+
+        if truncated:
+            hidden = n_total - len(papers)
+            lines.append(
+                f"└── (+ {hidden} more not shown; raise limit or call again)"
+            )
+
+        lines.append("")
+
+    if missing:
+        lines.append(f"## missing ({len(missing)})")
+        for name in missing:
+            lines.append(f"- {name}")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def to_human(payload: dict[str, Any]) -> str:
     """Short plaintext rendering per mode. Designed for terminal eyeballing,
     not programmatic reuse — pipelines should consume ``to_json``.
@@ -2149,6 +2537,10 @@ def to_human(payload: dict[str, Any]) -> str:
     mode = payload.get("mode", "?")
     if mode == "search":
         return format_search_markdown(payload)
+    if mode == "overview":
+        return format_overview_tree(payload)
+    if mode == "collection":
+        return format_collection_text(payload)
 
     lines: list[str] = []
 
@@ -2470,6 +2862,35 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    p.add_argument(
+        "--overview", action="store_true",
+        help=(
+            "top-down corpus map: nested domains → collections with paper "
+            "counts. Use --domain to narrow. Empty domains/collections are "
+            "dropped."
+        ),
+    )
+    p.add_argument(
+        "--collection-name", dest="collection_name", default=None,
+        action="append",
+        help=(
+            "drill into one or more collections by name. Repeat the flag "
+            "to bundle multiple collections in one call."
+        ),
+    )
+    p.add_argument(
+        "--no-abstracts", dest="no_abstracts", action="store_true",
+        help="for --collection-name: omit paper abstracts.",
+    )
+    p.add_argument(
+        "--no-topics", dest="no_topics", action="store_true",
+        help="for --collection-name: omit per-paper topics.",
+    )
+    p.add_argument(
+        "--collection-limit", dest="collection_limit", type=int, default=20,
+        help="for --collection-name: max papers per collection (default 20).",
+    )
+
     p.add_argument("--collections", action="store_true",
                    help="browse: list distinct collections")
     p.add_argument("--topics", action="store_true",
@@ -2572,6 +2993,10 @@ def _check_mode_conflicts(
         modes.append("--repo-tree")
     if args.read_code is not None:
         modes.append("--read-code")
+    if args.overview:
+        modes.append("--overview")
+    if args.collection_name is not None:
+        modes.append("--collection-name")
 
     if len(modes) > 1:
         parser.error(
@@ -2597,6 +3022,19 @@ def _check_mode_conflicts(
 
 
 def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, Any]:
+    # Top-down: overview / collection
+    if args.overview:
+        return mode_overview(conn, filters={"domain": args.domain})
+    if args.collection_name is not None:
+        return mode_collection(
+            conn,
+            collection_names=list(args.collection_name),
+            filters={"domain": args.domain},
+            include_abstracts=not args.no_abstracts,
+            include_topics=not args.no_topics,
+            limit=args.collection_limit,
+        )
+
     # Mode 6: repo tree / read code
     if args.repo_tree is not None:
         return mode_repo_tree(conn, paper_name=args.repo_tree)

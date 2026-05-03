@@ -23,6 +23,7 @@ def _seed_paper(
     arxiv_id: str,
     paper_name: str,
     domain: str = "rag",
+    collection: str = "demo_collection",
     code_repo: str | None = "https://github.com/owner/repo",
     status: str = "repo_fetched",
     abstract: str = "Demo abstract.",
@@ -30,19 +31,24 @@ def _seed_paper(
     conn.execute(
         "INSERT OR IGNORE INTO domains (name) VALUES (?)", (domain,)
     )
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "VALUES (?, ?, NULL)",
+        (domain, collection),
+    )
     cur = conn.execute(
         """
         INSERT INTO papers (
             arxiv_id, paper_name, title, authors, date, abstract,
-            pdf_url, ingested_at, status, domain, code_repo,
+            pdf_url, ingested_at, status, domain, collection, code_repo,
             code_repo_commit, code_repo_fetched_at, markdown
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             arxiv_id, paper_name, "T", '["A"]', "2024-01-01", abstract,
             f"https://arxiv.org/pdf/{arxiv_id}",
             "2024-01-02T00:00:00+00:00",
-            status, domain, code_repo,
+            status, domain, collection, code_repo,
             "abc123" if code_repo else None,
             "2024-01-03T00:00:00+00:00" if code_repo else None,
             "# Abstract\n\n" + abstract + "\n",

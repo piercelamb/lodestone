@@ -3,6 +3,12 @@
 Seeds canonical_terms / paper_topics / collections / term_aliases /
 term_embeddings / terms_fts directly, calls the helper, and asserts the
 expected rows go (or stay).
+
+GC scope is intentionally narrow: **topics only**. Domains and
+collections are curated organizational categories that exist
+independently of any single paper — only humans delete them — so the
+helper leaves them (and their canonical_terms / registry rows) alone
+even when no paper references them.
 """
 from __future__ import annotations
 
@@ -11,7 +17,7 @@ import struct
 
 import pytest
 
-from _system.db.orphan_gc import gc_orphan_topic_collection_canonicals
+from _system.db.orphan_gc import gc_orphan_topic_canonicals
 
 
 # ---------------------------------------------------------------------------
@@ -86,15 +92,25 @@ def _seed_paper(
     paper_name: str,
     arxiv_id: str,
     domain: str,
-    collection: str | None = None,
+    collection: str | None = "demo_collection",
 ) -> int:
+    """Insert a CLASSIFIED row. Defaults to a non-NULL collection so the
+    schema invariant trigger is satisfied; callers that specifically
+    want to test pre-classify state should pass a different status path
+    (none of the orphan-GC tests need that)."""
+    if collection is not None:
+        conn.execute(
+            "INSERT OR IGNORE INTO collections (domain, name, description) "
+            "VALUES (?, ?, NULL)",
+            (domain, collection),
+        )
     cur = conn.execute(
         """
         INSERT INTO papers (
             arxiv_id, paper_name, title, authors, date, abstract,
             pdf_url, ingested_at, status, domain, collection
         ) VALUES (?, ?, 'T', '[]', '2024-01-01', 'A',
-                  ?, '2024-01-02T00:00:00+00:00', 'CLASSIFIED', ?, ?)
+                  ?, '2024-01-02T00:00:00+00:00', 'classified', ?, ?)
         """,
         (arxiv_id, paper_name, f"https://arxiv.org/pdf/{arxiv_id}",
          domain, collection),
@@ -113,7 +129,7 @@ def test_orphan_topic_canonical_is_deleted(conn):
         conn, domain="rag", term_type="topic", canonical_name="orphan_topic",
     )
 
-    counts = gc_orphan_topic_collection_canonicals(conn)
+    counts = gc_orphan_topic_canonicals(conn)
 
     assert counts["topics"] == 1
     assert conn.execute(
@@ -140,7 +156,7 @@ def test_topic_with_paper_topics_row_survives(conn):
         (paper_id, "rag", "bound_topic"),
     )
 
-    counts = gc_orphan_topic_collection_canonicals(conn)
+    counts = gc_orphan_topic_canonicals(conn)
 
     assert counts["topics"] == 0
     assert conn.execute(
@@ -149,15 +165,14 @@ def test_topic_with_paper_topics_row_survives(conn):
 
 
 # ===========================================================================
-# Collection GC
+# Collections survive — categories are curated, not per-paper
 # ===========================================================================
 
 
-def test_orphan_collection_canonical_is_deleted(conn):
+def test_collection_with_no_paper_references_survives(conn):
+    """A collection whose only paper just got removed is NOT GC'd. Only
+    humans delete categories — future papers can populate them."""
     _seed_domain(conn)
-    # Seed the registry row for an orphan collection — a collection
-    # canonical normally lands alongside a `collections` registry row
-    # (classify_paper INSERT OR IGNOREs both). The GC should remove both.
     conn.execute(
         "INSERT INTO collections (domain, name, description) "
         "VALUES (?, ?, NULL)",
@@ -170,23 +185,21 @@ def test_orphan_collection_canonical_is_deleted(conn):
         canonical_name="orphan_coll",
     )
 
-    counts = gc_orphan_topic_collection_canonicals(conn)
+    counts = gc_orphan_topic_canonicals(conn)
 
-    assert counts["collections"] == 1
-    assert counts["collections_registry"] == 1
+    # Helper reports topics only — collections aren't its concern.
+    assert counts == {"topics": 0}
+    # Both the canonical and the registry row are still present.
     assert conn.execute(
         "SELECT COUNT(*) FROM canonical_terms WHERE id = ?", (term_id,)
-    ).fetchone()[0] == 0
+    ).fetchone()[0] == 1
     assert conn.execute(
         "SELECT COUNT(*) FROM collections WHERE domain = ? AND name = ?",
         ("rag", "orphan_coll"),
-    ).fetchone()[0] == 0
+    ).fetchone()[0] == 1
     assert conn.execute(
         "SELECT COUNT(*) FROM terms_fts WHERE term_id = ?", (term_id,)
-    ).fetchone()[0] == 0
-    assert conn.execute(
-        "SELECT COUNT(*) FROM term_embeddings WHERE term_id = ?", (term_id,)
-    ).fetchone()[0] == 0
+    ).fetchone()[0] == 1
 
 
 def test_collection_with_papers_collection_reference_survives(conn):
@@ -210,10 +223,9 @@ def test_collection_with_papers_collection_reference_survives(conn):
         collection="bound_coll",
     )
 
-    counts = gc_orphan_topic_collection_canonicals(conn)
+    counts = gc_orphan_topic_canonicals(conn)
 
-    assert counts["collections"] == 0
-    assert counts["collections_registry"] == 0
+    assert counts == {"topics": 0}
     assert conn.execute(
         "SELECT COUNT(*) FROM canonical_terms WHERE id = ?", (term_id,)
     ).fetchone()[0] == 1
@@ -241,7 +253,7 @@ def test_entity_canonical_never_gcd_even_when_orphaned(conn):
         entity_type="method",
     )
 
-    counts = gc_orphan_topic_collection_canonicals(conn)
+    counts = gc_orphan_topic_canonicals(conn)
 
     assert "entities" not in counts
     assert conn.execute(
@@ -272,7 +284,7 @@ def test_term_aliases_rows_for_orphan_topic_are_also_deleted(conn):
         (term_id, "fuzzy_form", "some_paper", 2),
     )
 
-    gc_orphan_topic_collection_canonicals(conn)
+    gc_orphan_topic_canonicals(conn)
 
     assert conn.execute(
         "SELECT COUNT(*) FROM term_aliases WHERE term_id = ?", (term_id,)
@@ -304,7 +316,7 @@ def test_returns_counts_dict(conn):
     _seed_canonical(
         conn, domain="rag", term_type="topic", canonical_name="orphan_t2",
     )
-    # one orphan collection (registry row + canonical)
+    # An orphan collection — must NOT be counted or removed.
     conn.execute(
         "INSERT INTO collections (domain, name, description) "
         "VALUES (?, ?, NULL)",
@@ -317,14 +329,18 @@ def test_returns_counts_dict(conn):
         canonical_name="orphan_c1",
     )
 
-    counts = gc_orphan_topic_collection_canonicals(conn)
+    counts = gc_orphan_topic_canonicals(conn)
 
-    assert counts == {
-        "topics": 2,
-        "collections": 1,
-        "collections_registry": 1,
-    }
+    assert counts == {"topics": 2}
     # Bound topic survives.
     assert conn.execute(
         "SELECT COUNT(*) FROM canonical_terms WHERE id = ?", (bound_topic_id,)
+    ).fetchone()[0] == 1
+    # Collection canonical + registry row both survive.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM canonical_terms "
+        " WHERE term_type = 'collection' AND canonical_name = 'orphan_c1'"
+    ).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM collections WHERE name = 'orphan_c1'"
     ).fetchone()[0] == 1

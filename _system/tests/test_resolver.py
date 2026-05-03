@@ -74,12 +74,23 @@ def _seed_entity_row(
     kept in the signature for caller readability.
     """
     del entity_type  # kept in signature for caller readability; unused
+    # Schema invariant: classified+ rows (status='extracted' here) must
+    # carry both domain and collection. Auto-supply them so the trigger
+    # is satisfied; tests don't otherwise touch these columns.
+    conn.execute(
+        "INSERT OR IGNORE INTO domains (name) VALUES (?)", (domain,)
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "VALUES (?, 'demo_collection', NULL)",
+        (domain,),
+    )
     cur = conn.execute(
         """
         INSERT INTO papers (
             arxiv_id, paper_name, title, authors, date, abstract,
-            pdf_url, html_source, ingested_at, status
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            pdf_url, html_source, ingested_at, status, domain, collection
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             f"arxiv_{paper_name}",
@@ -92,6 +103,8 @@ def _seed_entity_row(
             "arxiv",
             "2024-01-01T00:00:00+00:00",
             "extracted",
+            domain,
+            "demo_collection",
         ),
     )
     paper_id = cur.lastrowid

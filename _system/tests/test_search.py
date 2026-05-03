@@ -337,7 +337,14 @@ def seeded_db(conn: sqlite3.Connection) -> sqlite3.Connection:
         markdown=_PAPER1_MD,
     )
 
-    # Paper 2: stale_2024 with needs_review=1
+    # Paper 2: stale_2024 with needs_review=1. needs_review is set when
+    # classify_paper proposes a brand-new domain name and asks a human
+    # to confirm it; the paper still has both domain and collection
+    # (system invariant for classified+ rows).
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "VALUES ('other', 'misc', NULL)"
+    )
     p2_id = _insert_paper(
         conn,
         arxiv_id="2402.00002",
@@ -346,7 +353,7 @@ def seeded_db(conn: sqlite3.Connection) -> sqlite3.Connection:
         abstract="A paper that needs review.",
         markdown=None,
         domain="other",
-        collection=None,
+        collection="misc",
         needs_review=1,
         ingested_at="2024-02-01T00:00:00+00:00",
     )
@@ -2022,3 +2029,275 @@ class TestOutputFormatting:
             out = search_mod.to_human(payload)
             assert isinstance(out, str)
             assert out.strip(), f"empty to_human for payload={payload!r}"
+
+
+# ===========================================================================
+# mode_overview
+# ===========================================================================
+
+
+def _seed_collection_row(
+    conn: sqlite3.Connection,
+    domain: str,
+    name: str,
+    description: str | None = None,
+) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "VALUES (?, ?, ?)",
+        (domain, name, description),
+    )
+
+
+def test_mode_overview_basic(seeded_db):
+    _seed_collection_row(
+        seeded_db, "rag", "hierarchical indexing", "multi-level toc"
+    )
+    payload = search_mod.mode_overview(seeded_db, filters={})
+    assert payload["mode"] == "overview"
+    assert payload["domain"] is None
+
+    domains = payload["domains"]
+    names = [d["name"] for d in domains]
+    # "rag" has bookrag_2024 (1 paper); "other" has stale_2024 (1 paper).
+    assert "rag" in names
+    assert "other" in names
+
+    rag = next(d for d in domains if d["name"] == "rag")
+    assert rag["paper_count"] == 1
+    assert rag["collection_count"] == 1
+    assert rag["collections"][0]["name"] == "hierarchical indexing"
+    assert rag["collections"][0]["paper_count"] == 1
+    # uncategorized_count was a leak that violated the system invariant
+    # (every classified paper has a domain AND a collection); the field
+    # is no longer surfaced.
+    assert "uncategorized_count" not in rag
+
+
+def test_mode_overview_skips_empty_collections(seeded_db):
+    _seed_collection_row(seeded_db, "rag", "hierarchical indexing")
+    _seed_collection_row(seeded_db, "rag", "ghost_collection")  # no papers
+
+    payload = search_mod.mode_overview(seeded_db, filters={})
+    rag = next(d for d in payload["domains"] if d["name"] == "rag")
+    coll_names = [c["name"] for c in rag["collections"]]
+    assert "hierarchical indexing" in coll_names
+    assert "ghost_collection" not in coll_names
+
+
+def test_mode_overview_no_uncategorized_field(seeded_db):
+    """The system invariant is that every classified paper has both a
+    domain and a collection. ``uncategorized_count`` was a leak from
+    an earlier draft and must not surface."""
+    payload = search_mod.mode_overview(seeded_db, filters={})
+    for d in payload["domains"]:
+        assert "uncategorized_count" not in d
+
+
+def test_mode_overview_domain_filter(seeded_db):
+    _seed_collection_row(seeded_db, "rag", "hierarchical indexing")
+    payload = search_mod.mode_overview(seeded_db, filters={"domain": "rag"})
+    assert payload["domain"] == "rag"
+    names = [d["name"] for d in payload["domains"]]
+    assert names == ["rag"]
+
+
+# ===========================================================================
+# mode_collection
+# ===========================================================================
+
+
+def test_mode_collection_single_string(seeded_db):
+    _seed_collection_row(
+        seeded_db, "rag", "hierarchical indexing", "multi-level toc"
+    )
+    _insert_paper_topic(
+        seeded_db,
+        paper_id=seeded_db.execute(
+            "SELECT id FROM papers WHERE paper_name = 'bookrag_2024'"
+        ).fetchone()[0],
+        domain="rag",
+        topic="hierarchical retrieval",
+    )
+
+    payload = search_mod.mode_collection(
+        seeded_db,
+        collection_names=["hierarchical indexing"],
+        filters={},
+    )
+    assert payload["mode"] == "collection"
+    assert payload["missing"] == []
+    assert len(payload["collections"]) == 1
+    entry = payload["collections"][0]
+    assert entry["domain"] == "rag"
+    assert entry["collection"] == "hierarchical indexing"
+    assert entry["description"] == "multi-level toc"
+    assert entry["paper_count"] == 1
+    assert entry["papers_truncated"] is False
+    assert len(entry["papers"]) == 1
+    paper = entry["papers"][0]
+    assert paper["paper_name"] == "bookrag_2024"
+    assert "abstract" in paper
+    assert paper["abstract"]
+    # Topic was inserted with topic="hierarchical retrieval" plus the seeded
+    # "entity resolution" topic — both should surface.
+    assert set(paper["topics"]) >= {"hierarchical retrieval", "entity resolution"}
+
+
+def test_mode_collection_multi(seeded_db):
+    _seed_collection_row(seeded_db, "rag", "hierarchical indexing")
+    # Add a second collection with its own paper.
+    p_id = _insert_paper(
+        seeded_db,
+        arxiv_id="2403.00003",
+        paper_name="hybrid_2024",
+        title="Hybrid Search",
+        abstract="dense+sparse fusion.",
+        markdown=None,
+        domain="rag",
+        collection="hybrid",
+        needs_review=0,
+        ingested_at="2024-03-01T00:00:00+00:00",
+    )
+    _seed_collection_row(seeded_db, "rag", "hybrid")
+    del p_id
+
+    payload = search_mod.mode_collection(
+        seeded_db,
+        collection_names=["hierarchical indexing", "hybrid"],
+        filters={},
+    )
+    coll_names = [e["collection"] for e in payload["collections"]]
+    assert set(coll_names) == {"hierarchical indexing", "hybrid"}
+    assert payload["missing"] == []
+
+
+def test_mode_collection_missing_name(seeded_db):
+    _seed_collection_row(seeded_db, "rag", "hierarchical indexing")
+    payload = search_mod.mode_collection(
+        seeded_db,
+        collection_names=["hierarchical indexing", "no_such_collection"],
+        filters={},
+    )
+    coll_names = [e["collection"] for e in payload["collections"]]
+    assert coll_names == ["hierarchical indexing"]
+    assert payload["missing"] == ["no_such_collection"]
+
+
+def test_mode_collection_cross_domain_no_filter(seeded_db):
+    # Same name "shared" registered under two domains.
+    _seed_collection_row(seeded_db, "rag", "shared")
+    _seed_collection_row(seeded_db, "other", "shared")
+
+    payload = search_mod.mode_collection(
+        seeded_db, collection_names=["shared"], filters={}
+    )
+    pairs = {(e["domain"], e["collection"]) for e in payload["collections"]}
+    assert pairs == {("rag", "shared"), ("other", "shared")}
+
+
+def test_mode_collection_cross_domain_with_filter(seeded_db):
+    _seed_collection_row(seeded_db, "rag", "shared")
+    _seed_collection_row(seeded_db, "other", "shared")
+
+    payload = search_mod.mode_collection(
+        seeded_db,
+        collection_names=["shared"],
+        filters={"domain": "rag"},
+    )
+    assert len(payload["collections"]) == 1
+    assert payload["collections"][0]["domain"] == "rag"
+
+
+def test_mode_collection_include_flags_off(seeded_db):
+    _seed_collection_row(seeded_db, "rag", "hierarchical indexing")
+    payload = search_mod.mode_collection(
+        seeded_db,
+        collection_names=["hierarchical indexing"],
+        filters={},
+        include_abstracts=False,
+        include_topics=False,
+    )
+    paper = payload["collections"][0]["papers"][0]
+    assert "abstract" not in paper
+    assert "topics" not in paper
+
+
+def test_mode_collection_limit_truncates(seeded_db):
+    _seed_collection_row(seeded_db, "rag", "big")
+    for i in range(15):
+        _insert_paper(
+            seeded_db,
+            arxiv_id=f"2410.{i:05d}",
+            paper_name=f"big_{i:02d}",
+            title=f"Paper {i}",
+            abstract="abs",
+            markdown=None,
+            domain="rag",
+            collection="big",
+            needs_review=0,
+            ingested_at=f"2024-10-{(i % 28) + 1:02d}T00:00:00+00:00",
+        )
+
+    payload = search_mod.mode_collection(
+        seeded_db,
+        collection_names=["big"],
+        filters={},
+        limit=5,
+    )
+    entry = payload["collections"][0]
+    assert entry["paper_count"] == 15
+    assert len(entry["papers"]) == 5
+    assert entry["papers_truncated"] is True
+
+
+def test_mode_collection_empty_input_raises(seeded_db):
+    with pytest.raises(ValueError):
+        search_mod.mode_collection(
+            seeded_db, collection_names=[], filters={}
+        )
+
+
+# ===========================================================================
+# Formatters / to_human integration for the new modes
+# ===========================================================================
+
+
+def test_format_overview_tree_renders_count_style(seeded_db):
+    _seed_collection_row(
+        seeded_db, "rag", "hierarchical indexing", "multi-level toc"
+    )
+    payload = search_mod.mode_overview(seeded_db, filters={})
+    text = search_mod.format_overview_tree(payload)
+    assert "# overview" in text
+    assert "rag" in text
+    # Tree connector + count annotation.
+    assert "├──" in text or "└──" in text
+    assert "paper" in text
+
+
+def test_format_collection_text_renders_papers(seeded_db):
+    _seed_collection_row(seeded_db, "rag", "hierarchical indexing")
+    payload = search_mod.mode_collection(
+        seeded_db,
+        collection_names=["hierarchical indexing"],
+        filters={},
+    )
+    text = search_mod.format_collection_text(payload)
+    assert "rag / hierarchical indexing" in text
+    assert "bookrag_2024" in text
+    # Tree connector for the single paper.
+    assert "└──" in text or "├──" in text
+
+
+def test_to_human_routes_overview_and_collection(seeded_db):
+    _seed_collection_row(seeded_db, "rag", "hierarchical indexing")
+    overview_payload = search_mod.mode_overview(seeded_db, filters={})
+    assert "rag" in search_mod.to_human(overview_payload)
+
+    coll_payload = search_mod.mode_collection(
+        seeded_db,
+        collection_names=["hierarchical indexing"],
+        filters={},
+    )
+    assert "bookrag_2024" in search_mod.to_human(coll_payload)

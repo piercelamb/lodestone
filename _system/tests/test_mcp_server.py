@@ -69,6 +69,14 @@ def fig_db(conn: sqlite3.Connection) -> sqlite3.Connection:
     focused.
     """
     _seed_domain(conn, "rag")
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "VALUES ('rag', 'reasoning', NULL)"
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "VALUES ('rag', 'misc', NULL)"
+    )
     p_id = _insert_paper(
         conn,
         arxiv_id="2305.10601",
@@ -117,7 +125,7 @@ def fig_db(conn: sqlite3.Connection) -> sqlite3.Connection:
         abstract="No figures here.",
         markdown=_MD_NO_FIGS,
         domain="rag",
-        collection=None,
+        collection="misc",
         needs_review=0,
         ingested_at="2024-01-01T00:00:00+00:00",
     )
@@ -440,14 +448,14 @@ class TestProtocolValidation:
 
 
 class TestToolsList:
-    def test_tools_list_returns_ten_tools(self):
+    def test_tools_list_returns_twelve_tools(self):
         out = mcp_server._handle_tools_list({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         tools = out["result"]["tools"]
-        assert len(tools) == 10
+        assert len(tools) == 12
         names = {t["name"] for t in tools}
         assert names == {
-            "search", "bm25", "lookup", "browse", "toc", "toc_many",
-            "read", "figure", "repo_tree", "read_code",
+            "search", "bm25", "lookup", "browse", "overview", "collection",
+            "toc", "toc_many", "read", "figure", "repo_tree", "read_code",
         }
         for t in tools:
             assert isinstance(t["description"], str) and t["description"]
@@ -876,7 +884,7 @@ class TestProtocolHandshake:
         list_reply = responses[1]
         assert list_reply["id"] == 2
         tools = list_reply["result"]["tools"]
-        assert len(tools) == 10
+        assert len(tools) == 12
         for t in tools:
             assert t["name"].replace("_", "").isalnum()
 
@@ -966,3 +974,151 @@ class TestProtocolHandshake:
             if r.get("error", {}).get("code") == mcp_server._ERR_PARSE
         )
         assert parse_err["id"] is None
+
+
+# ===========================================================================
+# overview / collection MCP tools
+# ===========================================================================
+
+
+def _seed_overview_db(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """Tiny corpus used by the overview/collection tool tests: one domain
+    with one populated collection plus one paper. Independent of fig_db /
+    seeded_db so these tests stay focused.
+    """
+    _seed_domain(conn, "rag")
+    p_id = _insert_paper(
+        conn,
+        arxiv_id="2401.99001",
+        paper_name="ov_paper",
+        title="Overview Test Paper",
+        abstract="An abstract.",
+        markdown=None,
+        domain="rag",
+        collection="hier_indexing",
+        needs_review=0,
+        ingested_at="2024-01-01T00:00:00+00:00",
+    )
+    del p_id
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "VALUES (?, ?, ?)",
+        ("rag", "hier_indexing", "multi-level toc"),
+    )
+    return conn
+
+
+@pytest.fixture
+def overview_db(conn: sqlite3.Connection) -> sqlite3.Connection:
+    return _seed_overview_db(conn)
+
+
+def test_overview_tool_returns_tree_text(overview_db):
+    state = _make_state(overview_db)
+    resp = _call(state, "overview", {})
+    assert not _is_error(resp)
+    blocks = _content(resp)
+    text = blocks[0]["text"]
+    # Tree connectors prove this is rendered as a tree, not raw JSON.
+    assert "├──" in text or "└──" in text
+    assert "rag" in text
+    assert "hier_indexing" in text
+    structured = resp["result"].get("structuredContent")
+    assert structured is not None
+    assert isinstance(structured.get("domains"), list)
+
+
+def test_overview_tool_domain_filter(overview_db):
+    # Add a second domain (with a populated collection so the schema
+    # invariant is satisfied) that should NOT appear when filter narrows.
+    _seed_domain(overview_db, "agents")
+    overview_db.execute(
+        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "VALUES ('agents', 'tool_use', NULL)"
+    )
+    overview_db.execute(
+        "INSERT INTO papers (arxiv_id, paper_name, title, authors, date, "
+        "abstract, pdf_url, html_source, ingested_at, status, domain, "
+        "collection, needs_review) VALUES "
+        "(?, 'a_paper', 't', '[]', '2024-01-01', 'a', "
+        "'https://x', 'arxiv', '2024-01-01T00:00:00+00:00', 'classified', "
+        "'agents', 'tool_use', 0)",
+        ("2401.99002",),
+    )
+
+    state = _make_state(overview_db)
+    resp = _call(state, "overview", {"domain": "rag"})
+    assert not _is_error(resp)
+    structured = resp["result"]["structuredContent"]
+    assert structured["domain"] == "rag"
+    names = [d["name"] for d in structured["domains"]]
+    assert names == ["rag"]
+    text = _content(resp)[0]["text"]
+    assert "agents" not in text
+
+
+def test_collection_tool_string_arg(overview_db):
+    state = _make_state(overview_db)
+    resp = _call(state, "collection", {"collection": "hier_indexing"})
+    assert not _is_error(resp)
+    structured = resp["result"]["structuredContent"]
+    assert len(structured["collections"]) == 1
+    assert structured["collections"][0]["collection"] == "hier_indexing"
+
+
+def test_collection_tool_array_arg(overview_db):
+    overview_db.execute(
+        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "VALUES ('rag', 'hybrid', NULL)"
+    )
+    overview_db.execute(
+        "INSERT INTO papers (arxiv_id, paper_name, title, authors, date, "
+        "abstract, pdf_url, html_source, ingested_at, status, domain, "
+        "collection, needs_review) VALUES "
+        "(?, 'hybrid_paper', 't', '[]', '2024-02-01', 'a', "
+        "'https://x', 'arxiv', '2024-02-01T00:00:00+00:00', 'classified', "
+        "'rag', 'hybrid', 0)",
+        ("2402.99003",),
+    )
+
+    state = _make_state(overview_db)
+    resp = _call(state, "collection", {
+        "collection": ["hier_indexing", "hybrid"],
+    })
+    assert not _is_error(resp)
+    structured = resp["result"]["structuredContent"]
+    names = {c["collection"] for c in structured["collections"]}
+    assert names == {"hier_indexing", "hybrid"}
+
+
+def test_collection_tool_text_renders_tree(overview_db):
+    state = _make_state(overview_db)
+    resp = _call(state, "collection", {"collection": "hier_indexing"})
+    text = _content(resp)[0]["text"]
+    assert "rag / hier_indexing" in text
+    assert "ov_paper" in text
+
+
+def test_collection_tool_no_image_blocks(overview_db):
+    state = _make_state(overview_db)
+    resp = _call(state, "collection", {"collection": "hier_indexing"})
+    assert not _has_image(resp)
+    blocks = _content(resp)
+    assert all(b.get("type") == "text" for b in blocks)
+
+
+def test_collection_tool_missing_required_collection(overview_db):
+    state = _make_state(overview_db)
+    resp = mcp_server._handle_tools_call(
+        state,
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "collection", "arguments": {}},
+        },
+    )
+    # Missing required arg surfaces as JSON-RPC error (InvalidParams) per
+    # the dispatcher's KeyError translation.
+    assert "error" in resp
+    assert resp["error"]["code"] == mcp_server._ERR_INVALID_PARAMS

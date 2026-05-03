@@ -556,3 +556,121 @@ def test_term_embeddings_metadata_filters(conn):
             f"metadata filter on {col}={expected_val!r} returned {ids}, "
             f"expected exactly {{{expected_id}}}"
         )
+
+
+# ===========================================================================
+# papers invariant: classified+ rows must have domain AND collection
+# ===========================================================================
+
+
+def _insert_paper_raw(
+    conn: sqlite3.Connection,
+    *,
+    paper_name: str,
+    arxiv_id: str,
+    status: str,
+    domain: str | None,
+    collection: str | None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO papers (
+            arxiv_id, paper_name, title, authors, date, abstract,
+            pdf_url, ingested_at, status, domain, collection
+        ) VALUES (?, ?, 't', '[]', '2024-01-01', 'abs',
+                  ?, '2024-01-01T00:00:00+00:00', ?, ?, ?)
+        """,
+        (
+            arxiv_id, paper_name,
+            f"https://arxiv.org/pdf/{arxiv_id}",
+            status, domain, collection,
+        ),
+    )
+
+
+def test_invariant_classified_paper_requires_domain_and_collection_on_insert(conn):
+    """A direct INSERT of a CLASSIFIED+ row missing domain or collection
+    must be rejected by the schema-level trigger."""
+    conn.execute("INSERT OR IGNORE INTO domains (name) VALUES ('rag')")
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "VALUES ('rag', 'hier', NULL)"
+    )
+
+    with pytest.raises(sqlite3.IntegrityError) as exc:
+        _insert_paper_raw(
+            conn, paper_name="bad1", arxiv_id="2401.10001",
+            status="classified", domain=None, collection="hier",
+        )
+    assert "invariant" in str(exc.value).lower()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_paper_raw(
+            conn, paper_name="bad2", arxiv_id="2401.10002",
+            status="classified", domain="rag", collection=None,
+        )
+
+    # Indexed-status row with both NULL is rejected too.
+    with pytest.raises(sqlite3.IntegrityError):
+        _insert_paper_raw(
+            conn, paper_name="bad3", arxiv_id="2401.10003",
+            status="indexed", domain=None, collection=None,
+        )
+
+
+def test_invariant_pre_classify_paper_can_have_null_domain_collection(conn):
+    """FETCHED / CONVERTED rows are allowed to have NULL domain and
+    collection — that's the natural state before classify_paper runs."""
+    _insert_paper_raw(
+        conn, paper_name="ok_fetched", arxiv_id="2401.10010",
+        status="fetched", domain=None, collection=None,
+    )
+    _insert_paper_raw(
+        conn, paper_name="ok_converted", arxiv_id="2401.10011",
+        status="converted", domain=None, collection=None,
+    )
+
+
+def test_invariant_failed_paper_can_have_null_domain_collection(conn):
+    """Terminal FAILED_HTML / FAILED_REPO rows can carry NULLs — they
+    will never be classified."""
+    _insert_paper_raw(
+        conn, paper_name="ok_failed_html", arxiv_id="2401.10020",
+        status="failed_html", domain=None, collection=None,
+    )
+
+
+def test_invariant_update_to_classified_without_domain_collection_rejected(conn):
+    """Promoting a paper to CLASSIFIED via UPDATE without setting domain
+    AND collection violates the invariant and is rejected."""
+    conn.execute("INSERT OR IGNORE INTO domains (name) VALUES ('rag')")
+    _insert_paper_raw(
+        conn, paper_name="upd1", arxiv_id="2401.10030",
+        status="converted", domain=None, collection=None,
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "UPDATE papers SET status = 'classified' WHERE paper_name = 'upd1'"
+        )
+
+    # Setting only domain still leaves collection NULL — must reject.
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "UPDATE papers SET status = 'classified', domain = 'rag' "
+            " WHERE paper_name = 'upd1'"
+        )
+
+    # Setting both succeeds.
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "VALUES ('rag', 'hier', NULL)"
+    )
+    conn.execute(
+        "UPDATE papers SET status = 'classified', domain = 'rag', "
+        "collection = 'hier' WHERE paper_name = 'upd1'"
+    )
+    row = conn.execute(
+        "SELECT status, domain, collection FROM papers WHERE paper_name = 'upd1'"
+    ).fetchone()
+    assert row == ("classified", "rag", "hier")

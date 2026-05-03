@@ -1,45 +1,44 @@
-"""Orphan GC for topic and collection canonicals.
+"""Orphan GC for topic canonicals.
 
-Topic and collection canonicals can become orphaned in two situations:
+Topic canonicals can become orphaned in two situations:
 
 1. Re-classifying a paper. ``classify_paper`` deletes the paper's
    ``paper_topics`` rows up front and re-runs the LLM. If the second run
    emits different topic phrasings, the first run's topic canonicals are
    left in ``canonical_terms`` with zero remaining ``paper_topics``
    references.
-2. Deleting a paper. The per-paper cascade deletes ``paper_topics`` and
-   resets ``papers.collection`` but leaves the canonical taxonomy alone.
-   A topic or collection that only appeared in the deleted paper becomes
-   orphaned.
+2. Deleting a paper. The per-paper cascade deletes ``paper_topics``
+   alongside the paper, so a topic that only appeared in the deleted
+   paper becomes orphaned.
 
-Unlike entities (which have no per-paper binding under the synonym-index
-regime), topic and collection canonicals have complete bindings:
-``paper_topics`` for topics and ``papers.collection`` for collections. So
-orphan detection is exact and cheap.
+Topics are per-paper tags — once no paper references one, it carries no
+meaning and should disappear. **Domains and collections are different.**
+They are curated organizational categories that exist independently of
+any single paper; future papers can populate them. Deleting the last
+paper in a collection must not delete the collection — only humans
+delete categories. So the GC here is intentionally narrow: topics only.
 
-Entities are deliberately out of scope.
+Entities are deliberately out of scope — under the synonym-index regime,
+tier-1 mentions leave no per-paper trace, so substantiation can't be
+proven.
 """
 from __future__ import annotations
 
 import sqlite3
 
 
-def gc_orphan_topic_collection_canonicals(
-    conn: sqlite3.Connection,
-) -> dict[str, int]:
-    """Delete orphan topic/collection canonicals plus their satellites.
+def gc_orphan_topic_canonicals(conn: sqlite3.Connection) -> dict[str, int]:
+    """Delete orphan topic canonicals plus their satellites.
 
-    Removes ``canonical_terms`` rows of ``term_type IN ('topic',
-    'collection')`` that have zero remaining bindings, plus their
-    matching rows in ``terms_fts``, ``term_embeddings``,
-    ``term_aliases``, and (for collections) the first-class
-    ``collections`` registry.
+    Removes ``canonical_terms`` rows of ``term_type='topic'`` that have
+    zero remaining ``paper_topics`` bindings, plus their matching rows
+    in ``terms_fts``, ``term_embeddings``, and ``term_aliases``.
 
     Caller owns the enclosing transaction.
 
     Returns a counts dict::
 
-        {"topics": N, "collections": M, "collections_registry": K}
+        {"topics": N}
     """
     orphan_topic_ids = [
         row[0]
@@ -56,52 +55,25 @@ def gc_orphan_topic_collection_canonicals(
         )
     ]
 
-    orphan_collections = conn.execute(
-        """
-        SELECT id, domain, canonical_name FROM canonical_terms ct
-         WHERE term_type = 'collection'
-           AND NOT EXISTS (
-               SELECT 1 FROM papers p
-                WHERE p.collection = ct.canonical_name
-                  AND p.domain = ct.domain
-           )
-        """
-    ).fetchall()
-    orphan_collection_ids = [row[0] for row in orphan_collections]
-    orphan_collection_pairs = [(row[1], row[2]) for row in orphan_collections]
-
-    all_ids = orphan_topic_ids + orphan_collection_ids
-    if all_ids:
-        placeholders = ",".join("?" * len(all_ids))
+    if orphan_topic_ids:
+        placeholders = ",".join("?" * len(orphan_topic_ids))
         # FTS5 / vec0 virtual tables have no FK cascade; satellites
         # must be deleted explicitly. Pattern mirrors index_paper.py:306.
         conn.execute(
             f"DELETE FROM term_aliases WHERE term_id IN ({placeholders})",
-            all_ids,
+            orphan_topic_ids,
         )
         conn.execute(
             f"DELETE FROM terms_fts WHERE term_id IN ({placeholders})",
-            all_ids,
+            orphan_topic_ids,
         )
         conn.execute(
             f"DELETE FROM term_embeddings WHERE term_id IN ({placeholders})",
-            all_ids,
+            orphan_topic_ids,
         )
         conn.execute(
             f"DELETE FROM canonical_terms WHERE id IN ({placeholders})",
-            all_ids,
+            orphan_topic_ids,
         )
 
-    registry_deleted = 0
-    for domain, name in orphan_collection_pairs:
-        cur = conn.execute(
-            "DELETE FROM collections WHERE domain = ? AND name = ?",
-            (domain, name),
-        )
-        registry_deleted += cur.rowcount or 0
-
-    return {
-        "topics": len(orphan_topic_ids),
-        "collections": len(orphan_collection_ids),
-        "collections_registry": registry_deleted,
-    }
+    return {"topics": len(orphan_topic_ids)}
