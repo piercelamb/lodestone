@@ -1,14 +1,20 @@
 """Per-paper cascade-delete helper used by both ``fetch_paper`` (force-refetch
 path) and ``ingest`` (``--force`` cascade).
 
-Canonical taxonomy rows (``canonical_terms``, ``term_embeddings``,
-``terms_fts``) are not touched — those are cross-paper. ``term_aliases``
-rows ARE per-paper (they're the synonym index keyed by ``source_paper``)
-and are deleted alongside the rest of the paper's children.
+Per-paper rows (figures, sections, paper_topics, term_aliases, ...) are
+removed alongside the ``papers`` row. Canonical taxonomy rows are touched
+**only via orphan-GC** at the end of the cascade: any topic/collection
+canonical with zero remaining bindings is removed alongside its
+satellites in ``terms_fts``, ``term_embeddings``, ``term_aliases``, and
+the first-class ``collections`` registry. Entity canonicals are never
+GC'd — under the synonym-index regime, tier-1 mentions leave no
+per-paper trace, so substantiation can't be proven.
 """
 from __future__ import annotations
 
 import sqlite3
+
+from _system.db.orphan_gc import gc_orphan_topic_collection_canonicals
 
 
 def delete_paper_cascade(conn: sqlite3.Connection, *, paper_id: int) -> None:
@@ -16,7 +22,9 @@ def delete_paper_cascade(conn: sqlite3.Connection, *, paper_id: int) -> None:
 
     The caller owns the enclosing transaction. Order matters: FK-backed
     children before the papers row (PRAGMA foreign_keys=ON); FTS5 tables
-    have no FK cascade, so their rows must be deleted explicitly.
+    have no FK cascade, so their rows must be deleted explicitly. Orphan
+    topic/collection canonicals are GC'd at the end, after the paper is
+    gone, when "zero remaining bindings" is a clean truth.
     """
     # paper_references is FK'd both inward (paper_id) and outward
     # (cited_paper_id). When deleting paper P we drop P's own refs AND
@@ -45,3 +53,4 @@ def delete_paper_cascade(conn: sqlite3.Connection, *, paper_id: int) -> None:
     conn.execute("DELETE FROM code_files   WHERE paper_id = ?", (paper_id,))
     conn.execute("DELETE FROM readmes_fts  WHERE paper_id = ?", (paper_id,))
     conn.execute("DELETE FROM papers       WHERE id       = ?", (paper_id,))
+    gc_orphan_topic_collection_canonicals(conn)

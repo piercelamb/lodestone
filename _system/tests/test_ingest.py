@@ -437,13 +437,14 @@ def test_force_cascade_clears_sections_fts_for_paper(conn):
     assert rows == 0
 
 
-def test_force_cascade_preserves_canonical_taxonomy(conn):
-    """Cascade preserves the canonical taxonomy (canonical_terms,
-    term_embeddings) — those rows are cross-paper. ``term_aliases`` is
-    no longer cross-paper after the merge: it's the per-paper
-    appearance log keyed by source_paper, so the cascade DOES wipe
-    this paper's alias rows. A second paper's aliases referencing the
-    same canonical must survive."""
+def test_force_cascade_preserves_entity_canonicals(conn):
+    """Cascade preserves entity canonicals (``canonical_terms`` rows of
+    term_type='entity') and their ``term_embeddings``. Entities are out
+    of scope for orphan-GC under the synonym-index regime — tier-1
+    mentions leave no per-paper trace, so substantiation can't be proven.
+    ``term_aliases`` is per-paper (keyed by source_paper), so this paper's
+    alias rows ARE wiped; a second paper's aliases referencing the same
+    canonical must survive."""
     paper_id = _seed_full_paper(conn, "2301.44444", "paper_def")
     other_paper_id = _seed_full_paper(conn, "2301.44445", "paper_other")
     terms_before = conn.execute("SELECT COUNT(*) FROM canonical_terms").fetchone()[0]
@@ -470,6 +471,100 @@ def test_force_cascade_preserves_canonical_taxonomy(conn):
     assert conn.execute(
         "SELECT COUNT(*) FROM term_embeddings"
     ).fetchone()[0] == emb_before
+
+
+def test_force_cascade_gcs_orphan_topic_and_collection_canonicals(conn):
+    """Cascade GCs topic and collection canonicals whose only binding was
+    the deleted paper, alongside their satellites in ``terms_fts``,
+    ``term_embeddings``, ``term_aliases``, and the first-class
+    ``collections`` registry. A topic canonical also bound by another
+    paper survives; same for a collection canonical."""
+    paper_id = _seed_full_paper(conn, "2301.55555", "paper_solo", domain="rag")
+    keep_id = _seed_full_paper(conn, "2301.55556", "paper_keep", domain="rag")
+    # _seed_full_paper sets papers.collection='tree-search' but doesn't
+    # touch the first-class registry; mirror what classify_paper would
+    # have done so we can assert a referenced registry row survives.
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "VALUES (?, ?, NULL)",
+        ("rag", "tree-search"),
+    )
+
+    # Seed a topic canonical bound only to paper_solo (orphans on delete).
+    conn.execute(
+        "INSERT INTO canonical_terms (domain, term_type, entity_type, "
+        " canonical_name, first_seen_in) VALUES (?, ?, '', ?, ?)",
+        ("rag", "topic", "solo_topic_xyz", "paper_solo"),
+    )
+    conn.execute(
+        "INSERT INTO paper_topics (paper_id, domain, topic) VALUES (?, ?, ?)",
+        (paper_id, "rag", "solo_topic_xyz"),
+    )
+    solo_topic_id = conn.execute(
+        "SELECT id FROM canonical_terms WHERE canonical_name = ? AND term_type = 'topic'",
+        ("solo_topic_xyz",),
+    ).fetchone()[0]
+
+    # Seed a topic canonical bound to BOTH papers (must survive).
+    conn.execute(
+        "INSERT INTO canonical_terms (domain, term_type, entity_type, "
+        " canonical_name, first_seen_in) VALUES (?, ?, '', ?, ?)",
+        ("rag", "topic", "shared_topic_abc", "paper_solo"),
+    )
+    conn.execute(
+        "INSERT INTO paper_topics (paper_id, domain, topic) VALUES (?, ?, ?)",
+        (paper_id, "rag", "shared_topic_abc"),
+    )
+    conn.execute(
+        "INSERT INTO paper_topics (paper_id, domain, topic) VALUES (?, ?, ?)",
+        (keep_id, "rag", "shared_topic_abc"),
+    )
+
+    # Seed a collection canonical + registry row. _seed_full_paper sets
+    # papers.collection='tree-search' for both papers; only this paper's
+    # collection is unique. Switch paper_solo to a unique collection.
+    conn.execute(
+        "UPDATE papers SET collection = ? WHERE id = ?",
+        ("solo-cluster", paper_id),
+    )
+    conn.execute(
+        "INSERT INTO collections (domain, name, description) VALUES (?, ?, NULL)",
+        ("rag", "solo-cluster"),
+    )
+    conn.execute(
+        "INSERT INTO canonical_terms (domain, term_type, entity_type, "
+        " canonical_name, first_seen_in) VALUES (?, ?, '', ?, ?)",
+        ("rag", "collection", "solo-cluster", "paper_solo"),
+    )
+    solo_coll_id = conn.execute(
+        "SELECT id FROM canonical_terms WHERE canonical_name = ? "
+        "AND term_type = 'collection'",
+        ("solo-cluster",),
+    ).fetchone()[0]
+
+    ingest._force_delete_paper(conn, paper_id=paper_id)
+
+    # Orphan topic canonical gone.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM canonical_terms WHERE id = ?", (solo_topic_id,),
+    ).fetchone()[0] == 0
+    # Shared topic canonical survives.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM canonical_terms WHERE canonical_name = ?",
+        ("shared_topic_abc",),
+    ).fetchone()[0] == 1
+    # Orphan collection canonical + registry row gone.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM canonical_terms WHERE id = ?", (solo_coll_id,),
+    ).fetchone()[0] == 0
+    assert conn.execute(
+        "SELECT COUNT(*) FROM collections WHERE name = ?", ("solo-cluster",),
+    ).fetchone()[0] == 0
+    # The shared 'tree-search' registry row from _seed_full_paper survives
+    # because paper_keep still references it.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM collections WHERE name = ?", ("tree-search",),
+    ).fetchone()[0] == 1
 
 
 # ---------------------------------------------------------------------------

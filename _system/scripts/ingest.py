@@ -71,15 +71,12 @@ def _get_paper_row(conn: sqlite3.Connection, arxiv_id: str) -> _PaperRow | None:
 def _force_delete_paper(conn: sqlite3.Connection, *, paper_id: int) -> None:
     """Cascade-delete one paper inside its own transaction.
 
-    Global taxonomy (``canonical_terms``, ``term_aliases``,
-    ``term_embeddings``, ``terms_fts``) is preserved — those rows are
-    cross-paper. A force-delete can orphan a canonical term whose only
-    producer was this paper; cleanup is deferred to a future "gardening"
-    pass (phase 2).
-
-    TODO(phase-2 gardening): reconcile orphaned rows across the four
-    global-taxonomy tables once no paper references a given term_id /
-    alias — until then orphans accumulate silently.
+    Per-paper children are wiped; entity canonicals stay (synonym-index
+    regime — tier-1 mentions leave no per-paper trace). Topic and
+    collection canonicals whose only binding was this paper are GC'd by
+    ``delete_paper_cascade`` at the end of the cascade, alongside their
+    satellites in ``terms_fts``, ``term_embeddings``, ``term_aliases``,
+    and the first-class ``collections`` registry.
     """
     with transaction(conn):
         delete_paper_cascade(conn, paper_id=paper_id)
