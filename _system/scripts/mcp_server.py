@@ -46,12 +46,15 @@ from _system.scripts.search import (
     mode_collection,
     mode_figure,
     mode_overview,
+    mode_query,
     mode_read,
     mode_read_code,
     mode_repo,
     mode_repo_tree,
+    mode_schema,
     mode_search,
     mode_search_multi,
+    mode_tables,
     mode_taxonomy_lookup,
     mode_toc,
     mode_toc_many,
@@ -522,6 +525,22 @@ def _repo_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
     return mode_repo(conn, repo=args["repo"])
 
 
+def _tables_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
+    return mode_tables(
+        conn, include_internal=bool(args.get("include_internal", False))
+    )
+
+
+def _schema_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
+    raw = args["tables"]
+    names = [raw] if isinstance(raw, str) else [str(x) for x in raw]
+    return mode_schema(conn, table_names=names)
+
+
+def _query_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
+    return mode_query(conn, sql=args["sql"])
+
+
 class AttachMode(StrEnum):
     """Controls which figure-attach packer wraps a tool's payload."""
 
@@ -986,6 +1005,119 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["repo"],
         },
         "dispatch": _repo_dispatch,
+        "attach": AttachMode.NONE,
+    },
+    {
+        "name": "tables",
+        "description": (
+            "List every user table / view / virtual table in lodestone.db. "
+            "Use this as the first step of the SQL escape hatch ('I don't "
+            "know what's in here yet'); follow up with 'schema' on the "
+            "tables that look interesting, then 'query' to read rows. "
+            "Prefer the curated tools (bm25, lookup, read, toc, "
+            "collection, etc.) for everything they cover — this triple is "
+            "for cases none of those fit.\n\n"
+            "Virtual tables (FTS5 / vec0) are tagged 'virtual' so they're "
+            "easy to spot. FTS5 / vec0 shadow tables (suffixed _data, "
+            "_idx, _content, _docsize, _config) are filtered out by "
+            "default; pass include_internal=true to see them."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "include_internal": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Also return FTS5 / vec0 shadow tables. Off by "
+                        "default — they're noise for most questions."
+                    ),
+                },
+            },
+        },
+        "dispatch": _tables_dispatch,
+        "attach": AttachMode.NONE,
+    },
+    {
+        "name": "schema",
+        "description": (
+            "Return CREATE DDL + columns + indexes for one or more tables. "
+            "Pass 'tables' as a string or array of names. Names that don't "
+            "resolve land in 'missing' rather than raising. If you don't "
+            "know which tables exist, call 'tables' first.\n\n"
+            "Each entry carries: name, type (table/virtual/view), sql "
+            "(the CREATE statement), columns (cid/name/type/notnull/"
+            "dflt_value/pk), and indexes (name/unique/origin/partial). "
+            "This is the second step of the SQL escape hatch — feed the "
+            "DDL into 'query' to write a precise SELECT."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tables": {
+                    "oneOf": [
+                        {"type": "string"},
+                        {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "minItems": 1,
+                        },
+                    ],
+                    "description": (
+                        "Table name, or an array of table names to "
+                        "fetch in one call."
+                    ),
+                },
+            },
+            "required": ["tables"],
+        },
+        "dispatch": _schema_dispatch,
+        "attach": AttachMode.NONE,
+    },
+    {
+        "name": "query",
+        "description": (
+            "Run a single read-only SQL statement against lodestone.db. "
+            "This is the SQL escape hatch — reach for the curated tools "
+            "FIRST (bm25, lookup, read, toc, collection, overview, "
+            "repo_tree, read_code). Use 'query' only when none of those "
+            "fit your question. Call 'tables' / 'schema' first if you "
+            "don't already know the column layout.\n\n"
+            "Contract:\n"
+            "  - read-only is engine-enforced (mode=ro URI). Any DML / "
+            "    DDL (INSERT/UPDATE/DELETE/CREATE/DROP/etc.) returns a "
+            "    'read_only_violation' soft-fail.\n"
+            "  - exactly one statement per call. Multiple statements "
+            "    return 'multiple_statements'.\n"
+            "  - hard ceiling of 1000 rows. Larger result sets surface "
+            "    truncated=true; paginate by writing LIMIT N OFFSET M "
+            "    with a stable ORDER BY in YOUR OWN SQL.\n"
+            "  - 5s wall-clock timeout. Slow queries return "
+            "    'query_timeout'.\n"
+            "  - BLOB columns are summarized as "
+            "    {'_blob': true, 'size_bytes': N} — use the 'figure' or "
+            "    'read_code' tools to fetch real binary content.\n\n"
+            "Example pagination (page through papers ordered by "
+            "ingested_at):\n"
+            "  page 1: SELECT paper_name, title FROM papers "
+            "ORDER BY ingested_at DESC LIMIT 50 OFFSET 0\n"
+            "  page 2: SELECT paper_name, title FROM papers "
+            "ORDER BY ingested_at DESC LIMIT 50 OFFSET 50\n"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "sql": {
+                    "type": "string",
+                    "description": (
+                        "A single read-only SQL statement. No trailing "
+                        "';' separator needed."
+                    ),
+                },
+            },
+            "required": ["sql"],
+        },
+        "dispatch": _query_dispatch,
         "attach": AttachMode.NONE,
     },
 ]

@@ -7,6 +7,7 @@ import re
 import pytest
 
 from _system.scripts import create_domain
+from _system.utils.slug import DOMAIN_MAX_LEN
 
 
 def test_create_domain_inserts_row(conn):
@@ -45,7 +46,9 @@ def test_create_domain_empty_name_raises(conn):
 
 def test_create_domain_long_name_raises(conn):
     with pytest.raises(ValueError):
-        create_domain.create_domain(conn=conn, name="a" * 64, description="x")
+        create_domain.create_domain(
+            conn=conn, name="a" * (DOMAIN_MAX_LEN + 1), description="x"
+        )
 
 
 def test_create_domain_accepts_hyphens_underscores_digits(conn):

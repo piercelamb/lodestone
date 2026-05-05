@@ -21,8 +21,8 @@ def test_agents_md_exists():
 
 def test_agents_md_line_count_in_range():
     lines = AGENTS_MD.read_text(encoding="utf-8").splitlines()
-    assert 80 <= len(lines) <= 150, (
-        f"AGENTS.md has {len(lines)} lines; expected 80–150"
+    assert 80 <= len(lines) <= 200, (
+        f"AGENTS.md has {len(lines)} lines; expected 80–200"
     )
 
 

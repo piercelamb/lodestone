@@ -36,7 +36,8 @@ def create_domain(
     Returns ``{"name": name, "created": bool}`` — ``created=False`` on an
     idempotent no-op. ``needs_review`` is 0 (manual creation is explicit;
     only classify's LLM-proposed domains flip that flag on the paper row).
-    Raises ``ValueError`` on a name that doesn't match ``[a-z0-9_-]{1,32}``.
+    Raises ``ValueError`` on a name that doesn't match
+    ``[a-z0-9_-]{1,DOMAIN_MAX_LEN}``.
     """
     if not _NAME_RE.match(name):
         raise ValueError(
@@ -58,7 +59,10 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description="Manually register a Lodestone domain (idempotent).",
     )
-    parser.add_argument("--name", required=True, help="domain slug, [a-z0-9_-]{1,32}")
+    parser.add_argument(
+        "--name", required=True,
+        help=f"domain slug, [a-z0-9_-]{{1,{DOMAIN_MAX_LEN}}}",
+    )
     parser.add_argument("--description", required=True, help="human-readable blurb")
     parser.add_argument("--db", default="lodestone.db", help="sqlite db path")
     args = parser.parse_args(argv)
