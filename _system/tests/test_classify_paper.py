@@ -25,9 +25,9 @@ from _system.scripts.classify_paper import (
     ClassifyStateError,
     _COLLECTIONS_PER_DOMAIN_LIMIT,
     _head_slice_paper_content,
-    _sanitize_domain,
     classify,
 )
+from _system.utils.slug import sanitize_domain
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "classify"
@@ -529,10 +529,10 @@ def test_paper_not_found_raises(tmp_db_with_domain):
 # ===========================================================================
 
 
-def test_rerun_deletes_existing_paper_topics_before_insert(tmp_db_with_domain):
+def test_rerun_deletes_existing_topics_before_insert(tmp_db_with_domain):
     paper_id = _seed_paper(tmp_db_with_domain)
     tmp_db_with_domain.execute(
-        "INSERT INTO paper_topics (paper_id, domain, topic) VALUES (?, ?, ?)",
+        "INSERT INTO topics (target_kind, target_id, domain, topic) VALUES ('paper', ?, ?, ?)",
         (paper_id, "rag", "stale topic"),
     )
 
@@ -542,7 +542,7 @@ def test_rerun_deletes_existing_paper_topics_before_insert(tmp_db_with_domain):
         call_llm=_fake_runner(),
     )
     rows = tmp_db_with_domain.execute(
-        "SELECT topic FROM paper_topics WHERE paper_id = ? ORDER BY topic",
+        "SELECT topic FROM topics WHERE target_kind='paper' AND target_id = ? ORDER BY topic",
         (paper_id,),
     ).fetchall()
     topics = [r[0] for r in rows]
@@ -573,12 +573,12 @@ class _OrthogonalEmbedder:
 
 
 def test_rerun_gcs_orphan_topic_canonicals_from_prior_run(tmp_db_with_domain):
-    """Re-classify wipes the paper's prior `paper_topics` rows up front.
+    """Re-classify wipes the paper's prior `topics` rows up front.
     If the second LLM run emits different topic phrasings, the first
     run's topic canonicals are orphaned in `canonical_terms`. The
     end-of-transaction GC must remove them once the new bindings are in
     place. Bound canonicals from a *different* paper survive (they still
-    have a paper_topics referent).
+    have a topics referent).
     """
     _seed_paper(tmp_db_with_domain)
     embedder = _OrthogonalEmbedder()
@@ -609,7 +609,7 @@ def test_rerun_gcs_orphan_topic_canonicals_from_prior_run(tmp_db_with_domain):
         collection="first cluster",
     )
     tmp_db_with_domain.execute(
-        "INSERT INTO paper_topics (paper_id, domain, topic) VALUES (?, ?, ?)",
+        "INSERT INTO topics (target_kind, target_id, domain, topic) VALUES ('paper', ?, ?, ?)",
         (other_paper_id, "rag", "unrelated cantaloupe"),
     )
     tmp_db_with_domain.execute(
@@ -661,7 +661,7 @@ def test_rerun_gcs_orphan_topic_canonicals_from_prior_run(tmp_db_with_domain):
     assert "unrelated cantaloupe" in post_topics
 
 
-def test_second_run_idempotent_paper_topics_set(tmp_db_with_domain):
+def test_second_run_idempotent_topics_set(tmp_db_with_domain):
     _seed_paper(tmp_db_with_domain)
     classify(
         paper_name="paper_name_2024",
@@ -669,7 +669,7 @@ def test_second_run_idempotent_paper_topics_set(tmp_db_with_domain):
         call_llm=_fake_runner(),
     )
     first_topics = tmp_db_with_domain.execute(
-        "SELECT topic FROM paper_topics ORDER BY topic"
+        "SELECT topic FROM topics ORDER BY topic"
     ).fetchall()
 
     classify(
@@ -678,7 +678,7 @@ def test_second_run_idempotent_paper_topics_set(tmp_db_with_domain):
         call_llm=_fake_runner(),
     )
     second_topics = tmp_db_with_domain.execute(
-        "SELECT topic FROM paper_topics ORDER BY topic"
+        "SELECT topic FROM topics ORDER BY topic"
     ).fetchall()
     assert first_topics == second_topics
 
@@ -689,22 +689,23 @@ def test_second_run_idempotent_paper_topics_set(tmp_db_with_domain):
 
 
 def test_sanitize_domain_lowercases_and_replaces_ws():
-    assert _sanitize_domain("Multi-Agent Systems") == "multi-agent_systems"
+    assert sanitize_domain("Multi-Agent Systems") == "multi-agent_systems"
 
 
 def test_sanitize_domain_strips_illegal_chars():
-    assert _sanitize_domain("Multi-Agent Systems!!") == "multi-agent_systems"
+    assert sanitize_domain("Multi-Agent Systems!!") == "multi-agent_systems"
 
 
-def test_sanitize_domain_truncates_at_32():
-    long = "a" * 100
-    out = _sanitize_domain(long)
-    assert len(out) == 32
+def test_sanitize_domain_truncates_at_max_len():
+    from _system.utils.slug import DOMAIN_MAX_LEN
+    long = "a" * (DOMAIN_MAX_LEN * 4)
+    out = sanitize_domain(long)
+    assert len(out) == DOMAIN_MAX_LEN
 
 
 def test_sanitize_domain_empty_input_returns_empty():
-    assert _sanitize_domain("   ") == ""
-    assert _sanitize_domain("!!!") == ""
+    assert sanitize_domain("   ") == ""
+    assert sanitize_domain("!!!") == ""
 
 
 def test_new_domain_inserts_into_domains_and_sets_paper_needs_review(tmp_db_with_domain):
@@ -889,7 +890,7 @@ def test_papers_collection_is_canonical_name_not_raw_llm(tmp_db_with_domain):
     assert collection == "hierarchical indexing"
 
 
-def test_paper_topics_uses_resolver_returned_canonical_names(tmp_db_with_domain):
+def test_topics_uses_resolver_returned_canonical_names(tmp_db_with_domain):
     _seed_paper(tmp_db_with_domain)
     classify(
         paper_name="paper_name_2024",
@@ -899,7 +900,7 @@ def test_paper_topics_uses_resolver_returned_canonical_names(tmp_db_with_domain)
     topics = {
         r[0]
         for r in tmp_db_with_domain.execute(
-            "SELECT topic FROM paper_topics WHERE domain = 'rag'"
+            "SELECT topic FROM topics WHERE domain = 'rag'"
         )
     }
     assert topics == {"tree retrieval", "long-context qa"}
@@ -929,7 +930,7 @@ def test_duplicate_topics_dedupe_by_term_id(tmp_db_with_domain):
         call_llm=runner,
     )
     rows = tmp_db_with_domain.execute(
-        "SELECT COUNT(*) FROM paper_topics WHERE paper_id = ?", (paper_id,)
+        "SELECT COUNT(*) FROM topics WHERE target_kind='paper' AND target_id = ?", (paper_id,)
     ).fetchone()[0]
     assert rows == 1
 

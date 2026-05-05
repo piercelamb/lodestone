@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import sqlite3
 from pathlib import Path
 from typing import Iterable, NamedTuple
@@ -43,6 +42,7 @@ from _system.llm import call_structured, load_prompt
 from _system.resolution.embeddings import Embedder
 from _system.resolution.resolver import pending_fts_rebuilds, resolve
 from _system.schemas.paper_metadata import PaperStatus, can_run_from
+from _system.schemas.repo_metadata import TopicTarget
 from _system.schemas.taxonomy import ClassificationLLMOutput, ClassificationOutput
 from _system.scripts.taxonomy_tree import (
     DomainNode,
@@ -51,6 +51,7 @@ from _system.scripts.taxonomy_tree import (
     render_taxonomy_tree,
 )
 from _system.utils.logging import get_logger
+from _system.utils.slug import sanitize_domain
 
 _LOG = get_logger("scripts.classify_paper")
 
@@ -59,10 +60,6 @@ _PAPER_CONTENT_MAX_CHARS = 8000
 # overflow surfaces as a sibling leaf that nudges the LLM to propose new
 # rather than guess at hidden entries.
 _COLLECTIONS_PER_DOMAIN_LIMIT = 30
-_DOMAIN_MAX_LEN = 32
-
-_WS_OR_SLASH_RE = re.compile(r"[\s/]+")
-_DOMAIN_ALLOWED_RE = re.compile(r"[^a-z0-9_-]")
 
 
 class ClassifyError(Exception):
@@ -225,7 +222,10 @@ def classify(
                 (decision.name, new_description),
             )
 
-        conn.execute("DELETE FROM paper_topics WHERE paper_id = ?", (paper_id,))
+        conn.execute(
+            "DELETE FROM topics WHERE target_kind = ? AND target_id = ?",
+            (TopicTarget.PAPER.value, paper_id),
+        )
 
         # Track every canonical this stage resolves so index_paper can
         # rebuild terms_fts for them. Under the synonym-index revert,
@@ -279,10 +279,13 @@ def classify(
             seen_term_ids.add(topic_hit.term_id)
             conn.execute(
                 """
-                INSERT INTO paper_topics (paper_id, domain, topic)
-                VALUES (?, ?, ?)
+                INSERT INTO topics (target_kind, target_id, domain, topic)
+                VALUES (?, ?, ?, ?)
                 """,
-                (paper_id, decision.name, topic_hit.canonical_name),
+                (
+                    TopicTarget.PAPER.value, paper_id,
+                    decision.name, topic_hit.canonical_name,
+                ),
             )
             inserted_topic_names.append(topic_hit.canonical_name)
 
@@ -306,7 +309,7 @@ def classify(
 
         pending_fts_rebuilds(conn).update(touched_term_ids)
 
-        # Re-classify deletes the paper's paper_topics rows up front and
+        # Re-classify deletes the paper's topics rows up front and
         # re-runs the LLM. Topic canonicals from the *previous* run that
         # the new run didn't re-bind are now orphaned in canonical_terms.
         # GC them here, after all new bindings are in place. A GC'd
@@ -491,14 +494,6 @@ def _head_slice_paper_content(*, markdown: str, abstract: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _sanitize_domain(proposed: str) -> str:
-    lowered = proposed.lower()
-    collapsed = _WS_OR_SLASH_RE.sub("_", lowered)
-    stripped = _DOMAIN_ALLOWED_RE.sub("", collapsed)
-    trimmed = stripped[:_DOMAIN_MAX_LEN]
-    return trimmed.strip("_-")
-
-
 def _choose_domain(
     *,
     proposed: str,
@@ -515,7 +510,7 @@ def _choose_domain(
 
     treat_as_new = domain_is_new or proposed not in existing_domains
     if treat_as_new:
-        sanitized = _sanitize_domain(proposed)
+        sanitized = sanitize_domain(proposed)
         if not sanitized:
             raise ClassifyDomainNameError(
                 f"proposed domain {proposed!r} sanitizes to empty string"

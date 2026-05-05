@@ -1,11 +1,10 @@
-"""Clone a paper's code repo and persist its source-file tree.
+"""Clone a repo and persist its source-file tree.
 
-The fifth-and-final pipeline stage: pull the repo URL stored on
-``papers.code_repo`` (set by ``fetch_paper._discover_code_repo``),
-``git clone --depth 1`` it into a tempdir, walk the file tree applying
-the skip filters defined below, and persist one row per kept file into
-``code_files``. The repo's top-level README also lands in ``readmes_fts``
-as a parallel BM25 surface.
+Pulls a repo's URL from the ``repos`` table, ``git clone --depth 1``
+clones it into a tempdir, walks the file tree applying the skip filters
+defined below, and persists one row per kept file into ``code_files``.
+The repo's top-level README also lands in ``readmes_fts`` as a parallel
+BM25 surface.
 
 Filtering is calibrated against what GitHub Linguist, repomix's
 ``defaultIgnore``, and gitingest's ``DEFAULT_IGNORE_PATTERNS`` converge
@@ -18,11 +17,9 @@ heuristic, ``followlinks=False`` (no symlink escape).
 
 Status outcomes:
 
-- ``REPO_FETCHED`` — clone succeeded, OR ``papers.code_repo`` was NULL
-  (clean no-op success).
+- ``REPO_FETCHED`` — clone succeeded.
 - ``FAILED_REPO`` — clone failed (404 / network / timeout / non-zero
-  git exit). Terminal-but-not-fatal: paper remains usable for prose
-  search; user can re-run with ``--force``.
+  git exit). Terminal-but-not-fatal: user can re-run with ``--force``.
 
 No new runtime dependencies — ``git`` is required at the system level.
 """
@@ -31,18 +28,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
-import sys
 import tempfile
 from datetime import datetime, timezone
-from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
 
 from _system.db.connection import get_conn, transaction
 from _system.db.migrations import init_db
-from _system.schemas.paper_metadata import PaperStatus, can_run_from
+from _system.schemas.repo_metadata import RepoStatus, can_run_from
 from _system.utils.logging import get_logger
 
 _LOG = get_logger("scripts.fetch_repo")
@@ -503,96 +497,79 @@ def _clone_repo(url: str, dest: str) -> _CloneResult:
 # ---------------------------------------------------------------------------
 
 
-class _PaperRow(NamedTuple):
+class _RepoRow(NamedTuple):
     id: int
-    paper_name: str
+    repo_slug: str
+    url: str
     domain: str | None
-    code_repo: str | None
     status: str
 
 
-def _lookup_paper(conn, paper_name: str) -> _PaperRow:
+def _lookup_repo(conn, *, repo_slug: str) -> _RepoRow:
     row = conn.execute(
-        "SELECT id, paper_name, domain, code_repo, status "
-        "  FROM papers WHERE paper_name = ?",
-        (paper_name,),
+        "SELECT id, repo_slug, url, domain, status "
+        "  FROM repos WHERE repo_slug = ?",
+        (repo_slug,),
     ).fetchone()
     if row is None:
-        raise ValueError(f"paper not found: paper_name={paper_name!r}")
-    return _PaperRow(*row)
+        raise ValueError(f"repo not found: repo_slug={repo_slug!r}")
+    return _RepoRow(*row)
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _persist_no_repo(conn, paper_id: int) -> None:
-    """Mark a paper without a ``code_repo`` URL as REPO_FETCHED (no-op success)."""
+def _persist_failed(conn, repo_id: int) -> None:
     with transaction(conn):
         conn.execute(
-            "DELETE FROM code_files  WHERE paper_id = ?", (paper_id,)
-        )
-        conn.execute(
-            "DELETE FROM readmes_fts WHERE paper_id = ?", (paper_id,)
-        )
-        conn.execute(
-            "UPDATE papers SET status = ?, code_repo_commit = NULL, "
-            "  code_repo_fetched_at = ? WHERE id = ?",
-            (PaperStatus.REPO_FETCHED.value, _now_iso(), paper_id),
-        )
-
-
-def _persist_failed(conn, paper_id: int) -> None:
-    with transaction(conn):
-        conn.execute(
-            "UPDATE papers SET status = ?, code_repo_fetched_at = ? "
-            "WHERE id = ?",
-            (PaperStatus.FAILED_REPO.value, _now_iso(), paper_id),
+            "UPDATE repos SET status = ?, fetched_at = ? WHERE id = ?",
+            (RepoStatus.FAILED_REPO.value, _now_iso(), repo_id),
         )
 
 
 def _persist_success(
     conn,
     *,
-    paper: _PaperRow,
+    repo: _RepoRow,
     files: list[_KeptFile],
     readme: _KeptFile | None,
     commit_sha: str | None,
 ) -> None:
-    """Replace the paper's code_files + readmes_fts rows in one transaction."""
+    """Replace the repo's code_files + readmes_fts rows in one transaction."""
     with transaction(conn):
         conn.execute(
-            "DELETE FROM code_files  WHERE paper_id = ?", (paper.id,)
+            "DELETE FROM code_files  WHERE repo_id = ?", (repo.id,)
         )
         conn.execute(
-            "DELETE FROM readmes_fts WHERE paper_id = ?", (paper.id,)
+            "DELETE FROM readmes_fts WHERE repo_id = ?", (repo.id,)
         )
         if files:
             conn.executemany(
                 "INSERT INTO code_files "
-                "  (paper_id, path, language, size_bytes, content) "
+                "  (repo_id, path, language, size_bytes, content) "
                 "VALUES (?, ?, ?, ?, ?)",
                 [
-                    (paper.id, f.path, f.language, f.size_bytes, f.content)
+                    (repo.id, f.path, f.language, f.size_bytes, f.content)
                     for f in files
                 ],
             )
         if readme is not None:
             conn.execute(
                 "INSERT INTO readmes_fts "
-                "  (paper_id, domain, paper_name, path, content) "
+                "  (repo_id, repo_slug, domain, path, content) "
                 "VALUES (?, ?, ?, ?, ?)",
                 (
-                    paper.id, paper.domain or "", paper.paper_name,
+                    repo.id, repo.repo_slug, repo.domain or "",
                     readme.path, readme.content,
                 ),
             )
         conn.execute(
-            "UPDATE papers SET status = ?, code_repo_commit = ?, "
-            "  code_repo_fetched_at = ? WHERE id = ?",
+            "UPDATE repos SET status = ?, commit_sha = ?, fetched_at = ?, "
+            "  file_count = ?, has_readme = ? WHERE id = ?",
             (
-                PaperStatus.REPO_FETCHED.value, commit_sha,
-                _now_iso(), paper.id,
+                RepoStatus.REPO_FETCHED.value, commit_sha, _now_iso(),
+                len(files), 1 if readme is not None else 0, repo.id,
             ),
         )
 
@@ -602,58 +579,53 @@ def _persist_success(
 # ---------------------------------------------------------------------------
 
 
-def fetch_repo(*, conn, paper_name: str, force: bool = False) -> None:
-    """Stage entrypoint — see module docstring.
+def fetch_repo(*, conn, repo_slug: str, force: bool = False) -> None:
+    """Stage entrypoint — clone, walk, persist for one repo.
 
     Keyword-only to match the contract enforced by
     :func:`_system.tests.test_ingest.test_stage_function_signatures_are_keyword_only`.
     """
     del force  # cascade is owned by ingest; per-stage idempotency is via DELETE+INSERT.
 
-    paper = _lookup_paper(conn, paper_name)
+    repo = _lookup_repo(conn, repo_slug=repo_slug)
 
     try:
-        current = PaperStatus(paper.status)
+        current = RepoStatus(repo.status)
     except ValueError as exc:
         raise ValueError(
-            f"papers.status={paper.status!r} for paper_name={paper_name!r} "
-            "is not a recognized PaperStatus"
+            f"repos.status={repo.status!r} for repo_slug={repo_slug!r} "
+            "is not a recognized RepoStatus"
         ) from exc
 
-    if not can_run_from(current, PaperStatus.REPO_FETCHED):
+    if not can_run_from(current, RepoStatus.REPO_FETCHED):
         _LOG.info(
             "fetch_repo skipped for %s: status=%s incompatible with target=%s",
-            paper_name, current, PaperStatus.REPO_FETCHED,
+            repo_slug, current, RepoStatus.REPO_FETCHED,
         )
         return
 
-    if not paper.code_repo:
-        _LOG.info("paper %s has no code_repo — marking REPO_FETCHED no-op", paper_name)
-        _persist_no_repo(conn, paper.id)
-        return
-
-    with tempfile.TemporaryDirectory(prefix=f"lodestone_repo_{paper_name}_") as tmp:
+    with tempfile.TemporaryDirectory(prefix=f"lodestone_repo_{repo_slug}_") as tmp:
         clone_dest = str(Path(tmp) / "clone")
-        result = _clone_repo(paper.code_repo, clone_dest)
+        result = _clone_repo(repo.url, clone_dest)
         if not result.success:
-            _persist_failed(conn, paper.id)
+            _persist_failed(conn, repo.id)
             return
 
         kept = _walk_and_collect(Path(clone_dest))
         readme = _select_top_level_readme(kept)
         if readme is None:
-            _LOG.info("no top-level README found for %s", paper_name)
+            _LOG.info("no top-level README found for %s", repo_slug)
 
     _persist_success(
         conn,
-        paper=paper,
+        repo=repo,
         files=kept,
         readme=readme,
         commit_sha=result.commit_sha,
     )
     _LOG.info(
         "fetch_repo %s: %d files indexed, readme=%s, commit=%s",
-        paper_name, len(kept), readme.path if readme else None,
+        repo_slug, len(kept), readme.path if readme else None,
         result.commit_sha[:8] if result.commit_sha else None,
     )
 
@@ -665,9 +637,9 @@ def fetch_repo(*, conn, paper_name: str, force: bool = False) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Clone the paper's code repo and persist code_files + readmes_fts."
+        description="Clone a repo and persist code_files + readmes_fts."
     )
-    parser.add_argument("--paper", required=True, help="paper_name (slug)")
+    parser.add_argument("--repo", required=True, help="repo_slug")
     parser.add_argument(
         "--db",
         default=os.environ.get("LODESTONE_DB", "lodestone.db"),
@@ -680,7 +652,7 @@ def main(argv: list[str] | None = None) -> int:
     conn = get_conn(Path(args.db))
     try:
         init_db(conn)
-        fetch_repo(conn=conn, paper_name=args.paper, force=args.force)
+        fetch_repo(conn=conn, repo_slug=args.repo, force=args.force)
     finally:
         conn.close()
     return 0

@@ -1,0 +1,42 @@
+{
+  "name": "classify_repo",
+  "description": "Classify a code repository into a domain, collection, and topics.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "domain_index": {
+        "type": "integer",
+        "description": "Index into existing_domains list. Use -1 to propose a new domain.",
+        "enum": "DOMAIN_INDEX_ENUM"
+      },
+      "new_domain": {
+        "type": "string",
+        "description": "Empty unless domain_index == -1; otherwise the proposed new domain name."
+      },
+      "new_domain_desc": {
+        "type": "string",
+        "description": "Empty unless domain_index == -1; otherwise a one-sentence description of the proposed domain (what it covers, not the specific repository). Stored alongside the domain row."
+      },
+      "collection_index": {
+        "type": "integer",
+        "description": "Index of an existing collection within the chosen domain (as shown in the tree). Use -1 to propose a new collection.",
+        "enum": "COLLECTION_INDEX_ENUM"
+      },
+      "new_collection": {
+        "type": "string",
+        "description": "Empty unless collection_index == -1; otherwise the proposed new collection name."
+      },
+      "new_collection_desc": {
+        "type": "string",
+        "description": "Empty unless collection_index == -1; otherwise a one-sentence description of the proposed collection (what family of work it groups, not the specific repository). Stored alongside the collection row."
+      },
+      "topics": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Topics naming the repository's salient semantic concepts. Each topic must be distinct from entities, from the chosen domain/collection, and from structural metadata, and should pass the linking/reusability/specificity tests."
+      }
+    },
+    "required": ["domain_index", "new_domain", "new_domain_desc", "collection_index", "new_collection", "new_collection_desc", "topics"],
+    "additionalProperties": false
+  }
+}

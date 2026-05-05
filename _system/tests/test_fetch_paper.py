@@ -17,10 +17,11 @@ from PIL import Image
 from _system.db.connection import get_conn
 from _system.db.migrations import init_db
 from _system.scripts import fetch_paper as fp
+from _system.utils.repo_url import normalize_repo_url as _normalize_repo_url
 from _system.scripts.fetch_paper import (
     USER_AGENT,
     _ArxivMetadata,
-    _normalize_repo_url,
+
     _process_figure_image,
     fetch,
 )
@@ -670,7 +671,7 @@ def test_force_refetch_preserves_slug_and_clears_children(conn, fast_sleep):
         (seeded_term_id, first.paper_name),
     )
     conn.execute(
-        "INSERT INTO paper_topics (paper_id, domain, topic) VALUES (?, ?, ?)",
+        "INSERT INTO topics (target_kind, target_id, domain, topic) VALUES ('paper', ?, ?, ?)",
         (paper_id, "rag", "tree retrieval"),
     )
 
@@ -710,7 +711,8 @@ def test_force_refetch_preserves_slug_and_clears_children(conn, fast_sleep):
         (paper_name,),
     ).fetchone()[0]
     topics = conn.execute(
-        "SELECT COUNT(*) FROM paper_topics WHERE paper_id = ?", (paper_id,)
+        "SELECT COUNT(*) FROM topics WHERE target_kind='paper' AND target_id = ?",
+        (paper_id,),
     ).fetchone()[0]
     assert ents == 0
     assert topics == 0

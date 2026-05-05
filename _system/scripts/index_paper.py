@@ -1,7 +1,7 @@
 """Populate FTS5 + vec0 derived tables from the authoritative source tables.
 
 Fifth (and final) pipeline stage: after ``extract_entities.py`` has written
-canonical entity rows, this script walks ``papers``/``entities``/``paper_topics``
+canonical entity rows, this script walks ``papers``/``entities``/``topics``
 and builds the two FTS5 tables (``sections``, ``terms_fts``) plus the vec0
 ``term_embeddings`` table that the search layer reads. The paper's abstract
 flows into ``sections`` as the ``# Abstract`` chunk produced by
@@ -14,7 +14,7 @@ Two modes:
 - ``index_one(paper_name=...)`` — per-paper replace-all for a single row.
   Advances ``papers.status`` from ``EXTRACTED`` to ``INDEXED``. The
   ``terms_fts`` rebuild inside ``index_one`` is **scoped** to the terms this
-  paper touches: its entity canonicals, its ``paper_topics`` canonicals, and
+  paper touches: its entity canonicals, its ``topics`` canonicals, and
   its ``collection`` canonical. Indexing paper A MUST NOT touch term rows
   whose only producer is paper B.
 

@@ -1,15 +1,18 @@
 """Orphan GC for topic canonicals.
 
-Topic canonicals can become orphaned in two situations:
+Topic canonicals can become orphaned in three situations:
 
-1. Re-classifying a paper. ``classify_paper`` deletes the paper's
-   ``paper_topics`` rows up front and re-runs the LLM. If the second run
-   emits different topic phrasings, the first run's topic canonicals are
-   left in ``canonical_terms`` with zero remaining ``paper_topics``
-   references.
-2. Deleting a paper. The per-paper cascade deletes ``paper_topics``
-   alongside the paper, so a topic that only appeared in the deleted
-   paper becomes orphaned.
+1. Re-classifying a paper or repo. ``classify_paper`` /
+   ``classify_repo`` deletes the target's ``topics`` rows up front and
+   re-runs the LLM. If the second run emits different topic phrasings,
+   the first run's topic canonicals are left in ``canonical_terms`` with
+   zero remaining ``topics`` references.
+2. Deleting a paper. The per-paper cascade deletes ``topics``
+   (target_kind='paper') alongside the paper, so a topic that only
+   appeared in the deleted paper becomes orphaned.
+3. Deleting a repo. The per-repo cascade deletes ``topics``
+   (target_kind='repo') alongside the repo, so a topic that only
+   appeared in the deleted repo becomes orphaned.
 
 Topics are per-paper tags — once no paper references one, it carries no
 meaning and should disappear. **Domains and collections are different.**
@@ -31,8 +34,9 @@ def gc_orphan_topic_canonicals(conn: sqlite3.Connection) -> dict[str, int]:
     """Delete orphan topic canonicals plus their satellites.
 
     Removes ``canonical_terms`` rows of ``term_type='topic'`` that have
-    zero remaining ``paper_topics`` bindings, plus their matching rows
-    in ``terms_fts``, ``term_embeddings``, and ``term_aliases``.
+    zero remaining ``topics`` bindings (across paper and repo kinds),
+    plus their matching rows in ``terms_fts``, ``term_embeddings``, and
+    ``term_aliases``.
 
     Caller owns the enclosing transaction.
 
@@ -47,9 +51,9 @@ def gc_orphan_topic_canonicals(conn: sqlite3.Connection) -> dict[str, int]:
             SELECT id FROM canonical_terms ct
              WHERE term_type = 'topic'
                AND NOT EXISTS (
-                   SELECT 1 FROM paper_topics pt
-                    WHERE pt.topic = ct.canonical_name
-                      AND pt.domain = ct.domain
+                   SELECT 1 FROM topics t
+                    WHERE t.topic = ct.canonical_name
+                      AND t.domain = ct.domain
                )
             """
         )

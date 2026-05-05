@@ -266,7 +266,7 @@ def _insert_paper_topic(
     topic: str,
 ) -> None:
     conn.execute(
-        "INSERT OR IGNORE INTO paper_topics (paper_id, domain, topic) VALUES (?, ?, ?)",
+        "INSERT OR IGNORE INTO topics (target_kind, target_id, domain, topic) VALUES ('paper', ?, ?, ?)",
         (paper_id, domain, topic),
     )
 

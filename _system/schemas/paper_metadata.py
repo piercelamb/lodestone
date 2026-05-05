@@ -13,9 +13,7 @@ class PaperStatus(StrEnum):
     CLASSIFIED = "classified"
     EXTRACTED = "extracted"
     INDEXED = "indexed"
-    REPO_FETCHED = "repo_fetched"
     FAILED_HTML = "failed_html"
-    FAILED_REPO = "failed_repo"
 
 
 class HtmlSource(StrEnum):
@@ -24,15 +22,16 @@ class HtmlSource(StrEnum):
     LATEX_LOCAL = "latex_local"
 
 
+# INDEXED is the terminal happy-path stage for the paper itself. The
+# repo (if any) is now a first-class entity with its own state machine
+# in :mod:`_system.schemas.repo_metadata`.
 STATUS_ORDER: dict[PaperStatus, int] = {
     PaperStatus.FETCHED: 0,
     PaperStatus.CONVERTED: 1,
     PaperStatus.CLASSIFIED: 2,
     PaperStatus.EXTRACTED: 3,
     PaperStatus.INDEXED: 4,
-    PaperStatus.REPO_FETCHED: 5,
     PaperStatus.FAILED_HTML: -1,
-    PaperStatus.FAILED_REPO: -1,
 }
 
 
@@ -42,8 +41,8 @@ def can_run_from(
     """True iff running `target_stage` is meaningful given `current`.
 
     You may rerun the current stage or advance one step past it. You may
-    not skip ahead or go backwards. Terminal sentinels (FAILED_HTML,
-    FAILED_REPO) short-circuit. Callers use --force to bypass this check.
+    not skip ahead or go backwards. Terminal sentinels (FAILED_HTML)
+    short-circuit. Callers use --force to bypass this check.
     """
     if current is None:
         return True
@@ -75,6 +74,10 @@ class PaperMetadata(BaseModel):
     raw_html: Optional[str] = None
     html_source: Optional[str] = None
     content_hash: Optional[str] = None
-    code_repo: Optional[str] = None
     needs_review: bool = False
     ingested_at: Optional[str] = None
+    # Discovered repo URL — transient. Surfaced by ``fetch_paper`` so the
+    # ingest orchestrator can create a ``repos`` row tied to this paper.
+    # Never persisted to the ``papers`` table; lives only on the in-memory
+    # struct returned by fetch.
+    code_repo: Optional[str] = None

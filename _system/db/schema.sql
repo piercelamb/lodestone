@@ -27,7 +27,6 @@ CREATE TABLE IF NOT EXISTS papers (
     -- FAILED_HTML stubs (no PDF was ever downloaded).
     domain TEXT REFERENCES domains(name),
     collection TEXT,
-    code_repo TEXT,
     content_hash TEXT,
     pdf_url TEXT NOT NULL,
     html_source TEXT,
@@ -55,7 +54,7 @@ CREATE INDEX IF NOT EXISTS idx_papers_review ON papers(needs_review) WHERE needs
 CREATE TRIGGER IF NOT EXISTS papers_invariant_classified_has_domain_collection_insert
 BEFORE INSERT ON papers
 FOR EACH ROW
-WHEN NEW.status NOT IN ('fetched', 'converted', 'failed_html', 'failed_repo')
+WHEN NEW.status NOT IN ('fetched', 'converted', 'failed_html')
  AND (NEW.domain IS NULL OR NEW.collection IS NULL)
 BEGIN
     SELECT RAISE(ABORT, 'papers invariant violated: classified+ rows must have both domain and collection set');
@@ -64,10 +63,63 @@ END;
 CREATE TRIGGER IF NOT EXISTS papers_invariant_classified_has_domain_collection_update
 BEFORE UPDATE ON papers
 FOR EACH ROW
-WHEN NEW.status NOT IN ('fetched', 'converted', 'failed_html', 'failed_repo')
+WHEN NEW.status NOT IN ('fetched', 'converted', 'failed_html')
  AND (NEW.domain IS NULL OR NEW.collection IS NULL)
 BEGIN
     SELECT RAISE(ABORT, 'papers invariant violated: classified+ rows must have both domain and collection set');
+END;
+
+-- First-class repo entity. Addressed by ``repo_slug`` (analog of
+-- ``papers.paper_name``). ``paper_id`` is NULL for standalone repos and
+-- set for paper-linked repos. Standalone repos either reach CLASSIFIED
+-- (README-driven) or ORPHANED (no usable README); paper-linked repos
+-- reach REPO_FETCHED and inherit domain/collection from the paper.
+CREATE TABLE IF NOT EXISTS repos (
+    id INTEGER PRIMARY KEY,
+    repo_slug TEXT UNIQUE NOT NULL,
+    url TEXT UNIQUE NOT NULL,
+    host TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    name TEXT NOT NULL,
+    paper_id INTEGER REFERENCES papers(id),
+    description TEXT,
+    default_branch TEXT,
+    commit_sha TEXT,
+    fetched_at TEXT,
+    ingested_at TEXT NOT NULL,
+    domain TEXT REFERENCES domains(name),
+    collection TEXT,
+    status TEXT NOT NULL,
+    needs_review INTEGER NOT NULL DEFAULT 0,
+    file_count INTEGER DEFAULT 0,
+    has_readme INTEGER DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_repos_paper ON repos(paper_id);
+CREATE INDEX IF NOT EXISTS idx_repos_domain ON repos(domain);
+CREATE INDEX IF NOT EXISTS idx_repos_collection ON repos(domain, collection);
+
+-- Mirror the papers invariant: classified-or-later repos must have both
+-- domain and collection. ORPHANED, FAILED_*, and pre-classify rows are
+-- exempt. RESOLVED + REPO_FETCHED are pre-classify; for paper-linked
+-- repos those stages already carry inherited domain/collection so the
+-- trigger is also satisfied if classification is implicitly skipped.
+CREATE TRIGGER IF NOT EXISTS repos_invariant_classified_has_domain_collection_insert
+BEFORE INSERT ON repos
+FOR EACH ROW
+WHEN NEW.status NOT IN ('resolved', 'repo_fetched', 'orphaned', 'failed_resolve', 'failed_repo')
+ AND (NEW.domain IS NULL OR NEW.collection IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'repos invariant violated: classified+ rows must have both domain and collection set');
+END;
+
+CREATE TRIGGER IF NOT EXISTS repos_invariant_classified_has_domain_collection_update
+BEFORE UPDATE ON repos
+FOR EACH ROW
+WHEN NEW.status NOT IN ('resolved', 'repo_fetched', 'orphaned', 'failed_resolve', 'failed_repo')
+ AND (NEW.domain IS NULL OR NEW.collection IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'repos invariant violated: classified+ rows must have both domain and collection set');
 END;
 
 CREATE TABLE IF NOT EXISTS figures (
@@ -139,31 +191,33 @@ CREATE VIRTUAL TABLE sections USING fts5(
     tokenize='unicode61 remove_diacritics 2'
 );
 
--- One row per source file in a paper's code repo. Navigated by path
--- (`--repo-tree PAPER` lists all rows; `--read-code PAPER --path X`
+-- One row per source file kept under a repo. Navigated by path
+-- (``--repo-tree REPO`` lists all rows; ``--read-code REPO --path X``
 -- fetches one). Binary blobs / vendored deps / model weights are
--- filtered out by `fetch_repo.py` before insert; surviving content is
--- guaranteed UTF-8 decodable text. `.ipynb` files are flattened to
+-- filtered out by ``fetch_repo.py`` before insert; surviving content is
+-- guaranteed UTF-8 decodable text. ``.ipynb`` files are flattened to
 -- code+markdown cell text and stored under their original path.
 CREATE TABLE IF NOT EXISTS code_files (
     id INTEGER PRIMARY KEY,
-    paper_id INTEGER NOT NULL REFERENCES papers(id),
+    repo_id INTEGER NOT NULL REFERENCES repos(id),
     path TEXT NOT NULL,
     language TEXT,
     size_bytes INTEGER NOT NULL,
     content TEXT NOT NULL,
-    UNIQUE(paper_id, path)
+    UNIQUE(repo_id, path)
 );
-CREATE INDEX IF NOT EXISTS idx_code_files_paper ON code_files(paper_id);
+CREATE INDEX IF NOT EXISTS idx_code_files_repo ON code_files(repo_id);
 
 -- Parallel FTS5 surface over each repo's top-level README. One row per
--- paper at most. README content is also present in `code_files` under
--- its real path; `readmes_fts` is the searchable copy. Tokenizer
--- matches `sections` so `--scope both` query behavior is uniform.
+-- repo at most. README content is also present in ``code_files`` under
+-- its real path; ``readmes_fts`` is the searchable copy. Tokenizer
+-- matches ``sections`` so ``--scope both`` query behavior is uniform.
+-- ``repo_slug`` is the addressable id; ``domain`` is the repo's domain
+-- (NULL for orphans).
 CREATE VIRTUAL TABLE readmes_fts USING fts5(
-    paper_id UNINDEXED,
+    repo_id UNINDEXED,
+    repo_slug UNINDEXED,
     domain,
-    paper_name,
     path,
     content,
     tokenize='unicode61 remove_diacritics 2'
@@ -238,15 +292,23 @@ CREATE VIRTUAL TABLE term_embeddings USING vec0(
 );
 
 -- ============================================================
--- GROUP 4: PAPER-TOPIC MAPPING
+-- GROUP 4: TOPIC MAPPING (papers + repos)
 -- ============================================================
 
-CREATE TABLE IF NOT EXISTS paper_topics (
-    paper_id INTEGER NOT NULL REFERENCES papers(id),
+-- Unified topic table for both paper and repo classification. The
+-- ``target_kind`` column discriminates; ``target_id`` references either
+-- ``papers.id`` or ``repos.id``. The PK ensures one (target, topic)
+-- pair regardless of kind.
+CREATE TABLE IF NOT EXISTS topics (
+    target_kind TEXT NOT NULL,
+    target_id INTEGER NOT NULL,
     domain TEXT NOT NULL,
     topic TEXT NOT NULL,
-    PRIMARY KEY(paper_id, topic)
+    PRIMARY KEY (target_kind, target_id, topic)
 );
+
+CREATE INDEX IF NOT EXISTS idx_topics_target ON topics(target_kind, target_id);
+CREATE INDEX IF NOT EXISTS idx_topics_topic ON topics(domain, topic);
 
 -- ============================================================
 -- GROUP 5: ONE-SHOT BACKFILL
