@@ -5,7 +5,8 @@
       "args": [],
       "env": {
         "LODESTONE_DB": "/Users/pierce/Personal/Code/lodestone/lodestone.db",
-        "MCP_TIMEOUT": "30000"
+        "MCP_TIMEOUT": "30000",
+        "MCP_TOOL_TIMEOUT": "1800000"
       }
     }
   }

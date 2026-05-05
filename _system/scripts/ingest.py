@@ -23,9 +23,14 @@ import argparse
 import json
 import os
 import sqlite3
+from collections.abc import Callable
 from enum import StrEnum
 from pathlib import Path
 from typing import NamedTuple
+
+# Optional callback fired between stages for progress reporting.
+# Args: (message, done, total).
+ProgressFn = Callable[[str, int, int], None]
 
 from _system.db.cascade import delete_paper_cascade, delete_repo_cascade
 from _system.db.connection import get_conn, transaction
@@ -265,8 +270,18 @@ def ingest(
     arxiv_id: str,
     force: bool = False,
     domain: str | None = None,
+    progress: ProgressFn | None = None,
 ) -> dict:
-    """Run the paper-first ingest pipeline. Returns the summary dict."""
+    """Run the paper-first ingest pipeline. Returns the summary dict.
+
+    ``progress`` fires ``(message, done, total)`` between stages so callers
+    (e.g. the MCP server) can render staged progress. CLI callers leave it
+    None and stages run silent.
+    """
+    def _tick(msg: str, done: int, total: int) -> None:
+        if progress is not None:
+            progress(msg, done, total)
+
     row = _get_paper_row(conn, arxiv_id)
 
     if row is not None and force:
@@ -299,6 +314,7 @@ def ingest(
             _LOG.info(
                 "paper %s is FAILED_HTML; use --force to retry fetch", arxiv_id
             )
+            _tick("already complete", 0, 0)
             return _summary_paper(conn, arxiv_id)
 
     stages_to_run = _remaining_paper_stages(current)
@@ -307,9 +323,17 @@ def ingest(
         arxiv_id, current, stages_to_run,
     )
 
+    total = len(stages_to_run)
+    done = 0
+
+    if total == 0:
+        _tick("already complete", 0, 0)
+        return _summary_paper(conn, arxiv_id)
+
     discovered_repo_url: str | None = None
 
     if Stage.FETCH in stages_to_run:
+        _tick(f"starting {Stage.FETCH.value}", done, total)
         pm = fetch_stage(
             conn=conn,
             arxiv_id=arxiv_id,
@@ -324,6 +348,8 @@ def ingest(
         paper_name = post_fetch.name
         if PaperStatus(post_fetch.status) is PaperStatus.FAILED_HTML:
             _LOG.warning("fetch produced FAILED_HTML for %s; halting pipeline", arxiv_id)
+            done += 1
+            _tick("complete", done, total)
             return _summary_paper(conn, arxiv_id)
         # Discovered repo URL travels on the in-memory PaperMetadata —
         # it is intentionally not persisted on the papers row anymore.
@@ -347,6 +373,7 @@ def ingest(
                     "resolve_repo failed for %s url=%s: %s; paper ingest continues",
                     arxiv_id, discovered_repo_url, exc,
                 )
+        done += 1
 
     if paper_name is None:
         raise RuntimeError(
@@ -355,18 +382,28 @@ def ingest(
         )
 
     if Stage.CONVERT in stages_to_run:
+        _tick(f"starting {Stage.CONVERT.value}", done, total)
         convert_stage(conn=conn, paper_name=paper_name, force=force)
+        done += 1
     if Stage.CLASSIFY in stages_to_run:
+        _tick(f"starting {Stage.CLASSIFY.value}", done, total)
         classify_paper_stage(
             conn=conn,
             paper_name=paper_name,
             force=force,
             domain_override=domain,
         )
+        done += 1
     if Stage.EXTRACT in stages_to_run:
+        _tick(f"starting {Stage.EXTRACT.value}", done, total)
         extract_stage(conn=conn, paper_name=paper_name, force=force)
+        done += 1
     if Stage.INDEX in stages_to_run:
+        _tick(f"starting {Stage.INDEX.value}", done, total)
         index_stage(conn=conn, paper_name=paper_name, force=force)
+        done += 1
+
+    _tick("complete", done, total)
 
     # Paper-linked repo follow-up (only if a repos row exists for this paper).
     paper_id_row = conn.execute(
@@ -440,8 +477,17 @@ def ingest_repo_only(
     repo_url: str,
     force: bool = False,
     domain: str | None = None,
+    progress: ProgressFn | None = None,
 ) -> dict:
-    """Run the standalone-repo ingest pipeline. Returns the summary dict."""
+    """Run the standalone-repo ingest pipeline. Returns the summary dict.
+
+    ``progress`` fires ``(message, done, total)`` between stages — see
+    :func:`ingest` for the contract.
+    """
+    def _tick(msg: str, done: int, total: int) -> None:
+        if progress is not None:
+            progress(msg, done, total)
+
     existing = _get_repo_row(conn, url=repo_url)
 
     if existing is not None and force:
@@ -475,6 +521,7 @@ def ingest_repo_only(
                 "repo %s already terminal (status=%s); use --force to re-ingest",
                 repo_url, current.value,
             )
+            _tick("already complete", 0, 0)
             return _summary_repo(conn, repo_url)
 
     stages_to_run = _remaining_repo_stages(current)
@@ -483,9 +530,18 @@ def ingest_repo_only(
         repo_url, current, stages_to_run,
     )
 
+    total = len(stages_to_run)
+    done = 0
+
+    if total == 0:
+        _tick("already complete", 0, 0)
+        return _summary_repo(conn, repo_url)
+
     if Stage.RESOLVE_REPO in stages_to_run:
+        _tick(f"starting {Stage.RESOLVE_REPO.value}", done, total)
         result = resolve_repo_stage(conn=conn, repo_url=repo_url)
         repo_slug = result.repo_slug
+        done += 1
 
     if repo_slug is None:
         raise RuntimeError(
@@ -493,11 +549,14 @@ def ingest_repo_only(
         )
 
     if Stage.FETCH_REPO in stages_to_run:
+        _tick(f"starting {Stage.FETCH_REPO.value}", done, total)
         fetch_repo_stage(conn=conn, repo_slug=repo_slug)
+        done += 1
 
     # CLASSIFY_REPO runs only after a successful clone. If the prior
     # stage marked FAILED_REPO the next can_run_from check rejects.
     if Stage.CLASSIFY_REPO in stages_to_run:
+        _tick(f"starting {Stage.CLASSIFY_REPO.value}", done, total)
         post_fetch = conn.execute(
             "SELECT status FROM repos WHERE repo_slug = ?", (repo_slug,)
         ).fetchone()
@@ -513,7 +572,9 @@ def ingest_repo_only(
                     force=force,
                     domain_override=domain,
                 )
+        done += 1
 
+    _tick("complete", done, total)
     return _summary_repo(conn, repo_url)
 
 
