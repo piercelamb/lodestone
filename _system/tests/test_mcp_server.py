@@ -448,14 +448,15 @@ class TestProtocolValidation:
 
 
 class TestToolsList:
-    def test_tools_list_returns_twelve_tools(self):
+    def test_tools_list_returns_thirteen_tools(self):
         out = mcp_server._handle_tools_list({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         tools = out["result"]["tools"]
-        assert len(tools) == 12
+        assert len(tools) == 13
         names = {t["name"] for t in tools}
         assert names == {
             "search", "bm25", "lookup", "browse", "overview", "collection",
             "toc", "toc_many", "read", "figure", "repo_tree", "read_code",
+            "repo",
         }
         for t in tools:
             assert isinstance(t["description"], str) and t["description"]
@@ -884,7 +885,7 @@ class TestProtocolHandshake:
         list_reply = responses[1]
         assert list_reply["id"] == 2
         tools = list_reply["result"]["tools"]
-        assert len(tools) == 12
+        assert len(tools) == 13
         for t in tools:
             assert t["name"].replace("_", "").isalnum()
 

@@ -44,7 +44,6 @@ _PRE_CLASSIFY_STATUSES = {
     PaperStatus.FETCHED.value,
     PaperStatus.CONVERTED.value,
     PaperStatus.FAILED_HTML.value,
-    PaperStatus.FAILED_REPO.value,
 }
 
 

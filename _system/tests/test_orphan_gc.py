@@ -152,7 +152,7 @@ def test_topic_with_paper_topics_row_survives(conn):
         conn, paper_name="bound_paper", arxiv_id="2401.99991", domain="rag",
     )
     conn.execute(
-        "INSERT INTO paper_topics (paper_id, domain, topic) VALUES (?, ?, ?)",
+        "INSERT INTO topics (target_kind, target_id, domain, topic) VALUES ('paper', ?, ?, ?)",
         (paper_id, "rag", "bound_topic"),
     )
 
@@ -306,7 +306,7 @@ def test_returns_counts_dict(conn):
         conn, paper_name="anchor", arxiv_id="2401.10001", domain="rag",
     )
     conn.execute(
-        "INSERT INTO paper_topics (paper_id, domain, topic) VALUES (?, ?, ?)",
+        "INSERT INTO topics (target_kind, target_id, domain, topic) VALUES ('paper', ?, ?, ?)",
         (paper_id, "rag", "bound_t"),
     )
     # two orphan topics

@@ -45,7 +45,7 @@ from typing import Any
 # that pulls torch / sentence_transformers / gliner must live inside the
 # function that needs it.
 from _system.db.connection import get_conn
-from _system.schemas.paper_metadata import PaperStatus
+from _system.schemas.repo_metadata import RepoStatus
 from _system.scripts.taxonomy_tree import (
     CollectionNode,
     DomainNode,
@@ -755,25 +755,28 @@ def _bm25_readmes(
     snippet_tokens: int = 10,
     enrich: bool = True,
 ) -> dict[str, Any]:
-    """BM25 against ``readmes_fts``. Same envelope shape as ``_bm25_sections``
-    so ``to_human`` / enrichment branches treat both uniformly."""
-    join_sql = ""
+    """BM25 against ``readmes_fts``. Each result is keyed by ``repo_slug``
+    (the repo is the searchable unit). When the repo is paper-linked the
+    envelope also carries ``paper_name`` + paper title so callers can
+    pivot back to the prose surfaces."""
+    join_sql = " JOIN repos rr ON rr.id = r.repo_id"
     wheres = ["readmes_fts MATCH ?"]
     where_params: list[Any] = [fts_expression]
     if domain:
         wheres.append("r.domain = ?")
         where_params.append(domain)
     if paper_name:
-        wheres.append("r.paper_name = ?")
+        # Restrict to a paper-linked repo for this paper.
+        join_sql += " JOIN papers pp ON pp.id = rr.paper_id"
+        wheres.append("pp.paper_name = ?")
         where_params.append(paper_name)
     if collection:
-        join_sql = " JOIN papers p ON p.id = r.paper_id"
-        wheres.append("p.collection = ?")
+        wheres.append("rr.collection = ?")
         where_params.append(collection)
     where_clause = " WHERE " + " AND ".join(wheres)
 
     sql = (
-        "SELECT r.paper_id, r.domain, r.paper_name, r.path, "
+        "SELECT r.repo_id, r.repo_slug, r.domain, r.path, "
         f"       snippet(readmes_fts, 4, '[', ']', '…', {int(snippet_tokens)}) AS snip "
         "  FROM readmes_fts r"
         + join_sql
@@ -794,30 +797,28 @@ def _bm25_readmes(
     )
 
     grouped: dict[str, dict[str, Any]] = {}
-    pid_order: list[int] = []
-    for paper_id, dom, paper_name, path, snip in rows:
-        # readmes_fts has at most one row per paper, but we still group
-        # to preserve envelope symmetry with `_bm25_sections`.
-        group = grouped.get(paper_name)
+    repo_id_order: list[int] = []
+    for repo_id, repo_slug, dom, path, snip in rows:
+        group = grouped.get(repo_slug)
         if group is None:
             group = {
-                "paper_name": paper_name,
+                "repo_slug": repo_slug,
                 "domain": dom,
-                "_paper_id": paper_id,
+                "_repo_id": repo_id,
                 "hit_count": 0,
                 "sections": [],
                 "readme_hit": None,
             }
-            grouped[paper_name] = group
-            pid_order.append(paper_id)
+            grouped[repo_slug] = group
+            repo_id_order.append(repo_id)
         group["hit_count"] += 1
         group["readme_hit"] = {"path": path, "snippet": snip}
 
     if enrich:
-        _attach_bm25_enrichment(conn, grouped, pid_order)
+        _attach_repo_bm25_enrichment(conn, grouped, repo_id_order)
     else:
         for group in grouped.values():
-            group.pop("_paper_id", None)
+            group.pop("_repo_id", None)
 
     return {
         "mode": "sections",
@@ -828,6 +829,65 @@ def _bm25_readmes(
         "total_hits": total_hits,
         "has_more": offset + len(rows) < total_hits,
     }
+
+
+def _attach_repo_bm25_enrichment(
+    conn: sqlite3.Connection,
+    grouped: dict[str, dict[str, Any]],
+    repo_id_order: list[int],
+) -> None:
+    """Attach repo / paper-link envelopes to each readme BM25 hit."""
+    if not repo_id_order:
+        for group in grouped.values():
+            group.pop("_repo_id", None)
+        return
+
+    placeholders = ",".join("?" * len(repo_id_order))
+    rows = conn.execute(
+        f"""
+        SELECT r.id, r.repo_slug, r.url, r.status, r.paper_id,
+               r.file_count, r.has_readme, r.domain, r.collection,
+               p.paper_name, p.title
+          FROM repos r
+          LEFT JOIN papers p ON p.id = r.paper_id
+         WHERE r.id IN ({placeholders})
+        """,
+        repo_id_order,
+    ).fetchall()
+    by_id: dict[int, dict[str, Any]] = {}
+    for (
+        rid, slug, url, status, paper_id, file_count, has_readme,
+        dom, coll, paper_name, paper_title,
+    ) in rows:
+        by_id[int(rid)] = {
+            "repo_slug": slug,
+            "url": url,
+            "status": status,
+            "paper_id": paper_id,
+            "file_count": int(file_count or 0),
+            "has_readme": bool(has_readme),
+            "domain": dom,
+            "collection": coll,
+            "paper_name": paper_name,
+            "paper_title": paper_title,
+        }
+
+    repo_topics = _topics_batch_repo(conn, repo_id_order)
+
+    for group in grouped.values():
+        rid = group.pop("_repo_id")
+        info = by_id.get(rid)
+        if info is None:
+            continue
+        group["url"] = info["url"]
+        group["repo_status"] = info["status"]
+        group["file_count"] = info["file_count"]
+        group["has_readme"] = info["has_readme"]
+        group["collection"] = info["collection"]
+        if info["paper_name"]:
+            group["paper_name"] = info["paper_name"]
+            group["paper_title"] = info["paper_title"]
+        group["topics"] = repo_topics.get(rid, [])
 
 
 def _bm25_both(
@@ -842,10 +902,13 @@ def _bm25_both(
     snippet_tokens: int = 10,
     enrich: bool = True,
 ) -> dict[str, Any]:
-    """Union of sections + READMES hits, merged by paper_name.
+    """Union of sections + READMES hits.
 
-    Each surface paginates independently with the same ``offset`` /
-    ``limit``; ``total_hits`` is the sum across both surfaces and
+    Sections hits are paper-keyed; readme hits are repo-keyed. The two
+    are surfaced as separate buckets (``results`` for sections,
+    ``repo_results`` for readmes) since they describe different first-class
+    entities now. Each surface paginates independently with the same
+    ``offset`` / ``limit``; ``total_hits`` is the cross-surface sum and
     ``has_more`` is true when either surface still has unread rows.
     """
     sec = _bm25_sections(
@@ -861,26 +924,13 @@ def _bm25_both(
         snippet_tokens=snippet_tokens, enrich=enrich,
     )
 
-    by_name: dict[str, dict[str, Any]] = {}
-    for group in sec.get("results", []):
-        by_name[group["paper_name"]] = group
-        group.setdefault("readme_hit", None)
-
-    for group in rdm.get("results", []):
-        existing = by_name.get(group["paper_name"])
-        if existing is None:
-            by_name[group["paper_name"]] = group
-            continue
-        existing["hit_count"] = existing.get("hit_count", 0) + group.get("hit_count", 0)
-        if group.get("readme_hit") is not None:
-            existing["readme_hit"] = group["readme_hit"]
-
     total_hits = int(sec.get("total_hits", 0)) + int(rdm.get("total_hits", 0))
     has_more = bool(sec.get("has_more")) or bool(rdm.get("has_more"))
     return {
         "mode": "sections",
         "scope": Scope.BOTH.value,
-        "results": list(by_name.values()),
+        "results": list(sec.get("results", [])),
+        "repo_results": list(rdm.get("results", [])),
         "offset": offset,
         "limit": limit,
         "total_hits": total_hits,
@@ -938,26 +988,26 @@ def _attach_bm25_enrichment(
 def _code_repo_envelope_batch(
     conn: sqlite3.Connection, paper_ids: list[int]
 ) -> dict[int, dict[str, Any] | None]:
-    """One small SELECT per BM25 hit batch — never a fan-out per result."""
+    """One small SELECT per BM25 hit batch — never a fan-out per result.
+
+    Joins ``repos`` to derive the linked repo (if any) for each paper.
+    """
     if not paper_ids:
         return {}
     placeholders = ",".join("?" * len(paper_ids))
     rows = conn.execute(
         f"""
-        SELECT p.id, p.code_repo, p.status,
-               (SELECT COUNT(*) FROM code_files cf WHERE cf.paper_id = p.id) AS file_count
-          FROM papers p
-         WHERE p.id IN ({placeholders})
+        SELECT r.paper_id, r.repo_slug, r.url, r.status, r.file_count
+          FROM repos r
+         WHERE r.paper_id IN ({placeholders})
         """,
         paper_ids,
     ).fetchall()
-    result: dict[int, dict[str, Any] | None] = {}
-    for pid, code_repo, status, file_count in rows:
-        if not code_repo:
-            result[pid] = None
-            continue
-        result[pid] = {
-            "url": code_repo,
+    result: dict[int, dict[str, Any] | None] = {pid: None for pid in paper_ids}
+    for pid, repo_slug, url, status, file_count in rows:
+        result[int(pid)] = {
+            "repo_slug": repo_slug,
+            "url": url,
             "status": status,
             "file_count": int(file_count or 0),
         }
@@ -971,14 +1021,33 @@ def _topics_batch(
         return {}
     placeholders = ",".join("?" * len(paper_ids))
     rows = conn.execute(
-        f"SELECT paper_id, topic FROM paper_topics "
-        f" WHERE paper_id IN ({placeholders}) "
-        f" ORDER BY paper_id, topic",
+        f"SELECT target_id, topic FROM topics "
+        f" WHERE target_kind = 'paper' AND target_id IN ({placeholders}) "
+        f" ORDER BY target_id, topic",
         paper_ids,
     ).fetchall()
     result: dict[int, list[str]] = {pid: [] for pid in paper_ids}
     for pid, topic in rows:
         result[pid].append(topic)
+    return result
+
+
+def _topics_batch_repo(
+    conn: sqlite3.Connection, repo_ids: list[int]
+) -> dict[int, list[str]]:
+    """Sibling of ``_topics_batch`` for ``target_kind='repo'`` rows."""
+    if not repo_ids:
+        return {}
+    placeholders = ",".join("?" * len(repo_ids))
+    rows = conn.execute(
+        f"SELECT target_id, topic FROM topics "
+        f" WHERE target_kind = 'repo' AND target_id IN ({placeholders}) "
+        f" ORDER BY target_id, topic",
+        repo_ids,
+    ).fetchall()
+    result: dict[int, list[str]] = {rid: [] for rid in repo_ids}
+    for rid, topic in rows:
+        result[rid].append(topic)
     return result
 
 
@@ -1213,9 +1282,10 @@ def mode_taxonomy_lookup(
         elif term_type == TaxonomyKind.TOPIC.value:
             prows = conn.execute(
                 "SELECT DISTINCT p.paper_name "
-                "  FROM paper_topics pt "
-                "  JOIN papers p ON p.id = pt.paper_id "
-                " WHERE pt.topic = ? AND pt.domain = ? "
+                "  FROM topics t "
+                "  JOIN papers p ON p.id = t.target_id "
+                " WHERE t.target_kind = 'paper' "
+                "   AND t.topic = ? AND t.domain = ? "
                 " ORDER BY p.paper_name",
                 (canonical_name, dom),
             ).fetchall()
@@ -1276,7 +1346,8 @@ def _attach_code_repo_to_papers(
 
     Mirrors the BM25 enrichment so an agent who lands on a taxonomy hit
     has the same "you can ground this in code" signal without an extra
-    follow-up.
+    follow-up. The envelope now identifies the linked repo by
+    ``repo_slug`` (the canonical id) alongside its URL.
     """
     if not papers:
         return
@@ -1286,20 +1357,18 @@ def _attach_code_repo_to_papers(
     placeholders = ",".join("?" * len(names))
     rows = conn.execute(
         f"""
-        SELECT p.paper_name, p.code_repo, p.status,
-               (SELECT COUNT(*) FROM code_files cf WHERE cf.paper_id = p.id) AS file_count
+        SELECT p.paper_name, r.repo_slug, r.url, r.status, r.file_count
           FROM papers p
+          JOIN repos r ON r.paper_id = p.id
          WHERE p.paper_name IN ({placeholders})
         """,
         names,
     ).fetchall()
     by_name: dict[str, dict[str, Any] | None] = {}
-    for name, code_repo, status, file_count in rows:
-        if not code_repo:
-            by_name[name] = None
-            continue
+    for name, repo_slug, url, status, file_count in rows:
         by_name[name] = {
-            "url": code_repo,
+            "repo_slug": repo_slug,
+            "url": url,
             "status": status,
             "file_count": int(file_count or 0),
         }
@@ -1465,7 +1534,8 @@ def mode_search(
         for g in readmes_payload.get("results", []):
             rh = g.get("readme_hit") or {}
             readmes_slim.append({
-                "paper_name": g["paper_name"],
+                "repo_slug": g["repo_slug"],
+                "paper_name": g.get("paper_name"),
                 "hit_count": g.get("hit_count", 0),
                 "path": rh.get("path"),
                 "snippet": rh.get("snippet"),
@@ -1639,8 +1709,13 @@ def mode_browse(
         }
 
     if view is BrowseView.TOPICS:
+        # Aggregate paper + repo bindings — both kinds count.
         sql = (
-            "SELECT topic, COUNT(DISTINCT paper_id) AS n FROM paper_topics "
+            "SELECT topic, "
+            "       COUNT(*) AS n, "
+            "       SUM(CASE WHEN target_kind='paper' THEN 1 ELSE 0 END) AS paper_n, "
+            "       SUM(CASE WHEN target_kind='repo'  THEN 1 ELSE 0 END) AS repo_n "
+            "  FROM topics "
         )
         params = []
         if domain:
@@ -1650,7 +1725,15 @@ def mode_browse(
         rows = conn.execute(sql, params).fetchall()
         return {
             "mode": view,
-            "results": [{"topic": r[0], "count": r[1]} for r in rows],
+            "results": [
+                {
+                    "topic": r[0],
+                    "count": int(r[1] or 0),
+                    "paper_count": int(r[2] or 0),
+                    "repo_count": int(r[3] or 0),
+                }
+                for r in rows
+            ],
         }
 
     if view is BrowseView.ENTITY_TYPE:
@@ -1735,6 +1818,7 @@ def _serialize_collection(node: CollectionNode) -> dict[str, Any]:
         "name": node.name,
         "description": node.description,
         "paper_count": node.paper_count,
+        "repo_count": node.repo_count,
     }
 
 
@@ -1743,6 +1827,7 @@ def _serialize_domain(node: DomainNode) -> dict[str, Any]:
         "name": node.name,
         "description": node.description,
         "paper_count": node.paper_count,
+        "repo_count": node.repo_count,
         "collection_count": len(node.collections),
         "collections": [_serialize_collection(c) for c in node.collections],
     }
@@ -1760,6 +1845,7 @@ def _domain_node_from_dict(d: dict[str, Any]) -> DomainNode:
             name=c["name"],
             description=c.get("description"),
             paper_count=int(c.get("paper_count") or 0),
+            repo_count=int(c.get("repo_count") or 0),
         )
         for c in (d.get("collections") or [])
     ]
@@ -1769,6 +1855,7 @@ def _domain_node_from_dict(d: dict[str, Any]) -> DomainNode:
         paper_count=int(d.get("paper_count") or 0),
         collections=tuple(colls),
         overflow=int(d.get("overflow") or 0),
+        repo_count=int(d.get("repo_count") or 0),
     )
 
 
@@ -1914,11 +2001,18 @@ def mode_collection(
             "SELECT COUNT(*) FROM papers WHERE domain = ? AND collection = ?",
             (d_name, c_name),
         ).fetchone()
-        total = int(total_row[0] or 0) if total_row else 0
+        total_papers = int(total_row[0] or 0) if total_row else 0
+
+        repo_total_row = conn.execute(
+            "SELECT COUNT(*) FROM repos "
+            " WHERE paper_id IS NULL AND domain = ? AND collection = ?",
+            (d_name, c_name),
+        ).fetchone()
+        total_repos = int(repo_total_row[0] or 0) if repo_total_row else 0
 
         rows = conn.execute(
             f"""
-            SELECT id, paper_name, title, authors, date, code_repo,
+            SELECT id, paper_name, title, authors, date,
                    section_count, figure_count{abstract_col}
               FROM papers
              WHERE domain = ? AND collection = ?
@@ -1931,40 +2025,85 @@ def mode_collection(
         paper_ids = [int(r[0]) for r in rows]
         topics_by_id: dict[int, list[str]] = {pid: [] for pid in paper_ids}
         if include_topics and paper_ids:
+            topics_by_id.update(_topics_batch(conn, paper_ids))
+
+        # Linked-repo lookup for has_repo / repo_slug stamps on papers[].
+        repo_by_paper_id: dict[int, tuple[str, str]] = {}
+        if paper_ids:
             placeholders = ",".join("?" for _ in paper_ids)
-            for pid, topic in conn.execute(
-                f"SELECT paper_id, topic FROM paper_topics "
-                f" WHERE paper_id IN ({placeholders}) "
-                f" ORDER BY topic",
+            for pid, slug, url in conn.execute(
+                f"SELECT paper_id, repo_slug, url FROM repos "
+                f" WHERE paper_id IN ({placeholders})",
                 paper_ids,
             ).fetchall():
-                topics_by_id.setdefault(int(pid), []).append(topic)
+                repo_by_paper_id[int(pid)] = (slug, url)
 
         papers: list[dict[str, Any]] = []
         for r in rows:
             pid = int(r[0])
+            repo_pair = repo_by_paper_id.get(pid)
             paper: dict[str, Any] = {
                 "paper_name": r[1],
                 "title": r[2],
                 "authors": r[3],
                 "date": r[4],
-                "code_repo": r[5],
-                "section_count": int(r[6] or 0),
-                "figure_count": int(r[7] or 0),
+                "section_count": int(r[5] or 0),
+                "figure_count": int(r[6] or 0),
+                "has_repo": repo_pair is not None,
+                "repo_slug": repo_pair[0] if repo_pair else None,
             }
             if include_abstracts:
-                paper["abstract"] = r[8]
+                paper["abstract"] = r[7]
             if include_topics:
                 paper["topics"] = topics_by_id.get(pid, [])
             papers.append(paper)
+
+        # Standalone repos in this (domain, collection).
+        repo_rows = conn.execute(
+            """
+            SELECT id, repo_slug, url, owner, name, description,
+                   has_readme, file_count, status
+              FROM repos
+             WHERE paper_id IS NULL
+               AND domain = ? AND collection = ?
+             ORDER BY repo_slug
+             LIMIT ?
+            """,
+            (d_name, c_name, limit),
+        ).fetchall()
+        repo_ids = [int(rr[0]) for rr in repo_rows]
+        repo_topics_by_id: dict[int, list[str]] = {rid: [] for rid in repo_ids}
+        if include_topics and repo_ids:
+            repo_topics_by_id.update(_topics_batch_repo(conn, repo_ids))
+
+        repos: list[dict[str, Any]] = []
+        for rr in repo_rows:
+            rid = int(rr[0])
+            repos.append({
+                "repo_slug": rr[1],
+                "url": rr[2],
+                "owner": rr[3],
+                "name": rr[4],
+                "description": rr[5],
+                "has_readme": bool(rr[6]),
+                "file_count": int(rr[7] or 0),
+                "status": rr[8],
+                **(
+                    {"topics": repo_topics_by_id.get(rid, [])}
+                    if include_topics else {}
+                ),
+            })
 
         entries.append({
             "domain": d_name,
             "collection": c_name,
             "description": c_desc,
-            "paper_count": total,
-            "papers_truncated": total > len(papers),
+            "paper_count": total_papers,
+            "repo_count": total_repos,
+            "papers_truncated": total_papers > len(papers),
+            "repos_truncated": total_repos > len(repos),
             "papers": papers,
+            "repos": repos,
         })
 
     return {
@@ -2120,51 +2259,161 @@ def mode_read(
 _LINES_RE = re.compile(r"^(\d+)-(\d+)$")
 
 
-def mode_repo_tree(
-    conn: sqlite3.Connection, *, paper_name: str
+def mode_repo(
+    conn: sqlite3.Connection, *, repo: str
 ) -> dict[str, Any]:
-    """List every ``code_files`` path for ``paper_name``.
+    """Single-repo metadata + topics + linked paper.
 
-    Soft statuses on missing data:
-    - ``no_repo`` — paper has no ``code_repo`` URL.
-    - ``failed_repo`` — clone failed previously; URL kept for reference.
+    Cheap "tell me about this repo" lookup. Returns the repo's full row,
+    its topic list, and (if paper-linked) the paper_name + title so the
+    caller can pivot to the prose surfaces.
     """
     row = conn.execute(
-        "SELECT id, code_repo, code_repo_commit, code_repo_fetched_at, status "
-        "  FROM papers WHERE paper_name = ?",
-        (paper_name,),
+        """
+        SELECT r.id, r.repo_slug, r.url, r.host, r.owner, r.name,
+               r.description, r.default_branch, r.commit_sha, r.fetched_at,
+               r.ingested_at, r.domain, r.collection, r.status,
+               r.needs_review, r.file_count, r.has_readme,
+               p.paper_name, p.title
+          FROM repos r
+          LEFT JOIN papers p ON p.id = r.paper_id
+         WHERE r.repo_slug = ?
+        """,
+        (repo,),
     ).fetchone()
     if row is None:
-        raise ValueError(f"paper not found: paper_name={paper_name!r}")
-    paper_id, code_repo, commit, fetched_at, status = row
+        return {
+            "mode": "repo",
+            "status": "not_found",
+            "repo_slug": repo,
+            "hint": (
+                f"no repo with repo_slug={repo!r}. Try `mode_collection` "
+                f"to browse known repos by domain/collection."
+            ),
+        }
 
-    if not code_repo:
+    repo_id = int(row[0])
+    topics_by_id = _topics_batch_repo(conn, [repo_id])
+    return {
+        "mode": "repo",
+        "status": "ok",
+        "repo_slug": row[1],
+        "url": row[2],
+        "host": row[3],
+        "owner": row[4],
+        "name": row[5],
+        "description": row[6],
+        "default_branch": row[7],
+        "commit_sha": row[8],
+        "fetched_at": row[9],
+        "ingested_at": row[10],
+        "domain": row[11],
+        "collection": row[12],
+        "repo_status": row[13],
+        "needs_review": bool(row[14]),
+        "file_count": int(row[15] or 0),
+        "has_readme": bool(row[16]),
+        "paper_name": row[17],
+        "paper_title": row[18],
+        "topics": topics_by_id.get(repo_id, []),
+    }
+
+
+def _resolve_repo_target(
+    conn: sqlite3.Connection,
+    *,
+    paper_name: str | None,
+    repo: str | None,
+) -> tuple[int, str, str | None] | dict[str, Any]:
+    """Resolve a repo target from either ``paper_name`` (paper-linked
+    repo) or ``repo`` (repo_slug) into ``(repo_id, repo_slug, paper_name)``.
+
+    Returns either the resolved tuple or a soft-status payload that
+    callers should return verbatim. Exactly one of the two args must be
+    set — callers enforce that at the dispatch boundary.
+    """
+    if repo:
+        row = conn.execute(
+            "SELECT r.id, r.repo_slug, p.paper_name "
+            "  FROM repos r LEFT JOIN papers p ON p.id = r.paper_id "
+            " WHERE r.repo_slug = ?",
+            (repo,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"repo not found: repo_slug={repo!r}")
+        return int(row[0]), row[1], row[2]
+
+    assert paper_name is not None
+    paper_row = conn.execute(
+        "SELECT id FROM papers WHERE paper_name = ?", (paper_name,),
+    ).fetchone()
+    if paper_row is None:
+        raise ValueError(f"paper not found: paper_name={paper_name!r}")
+    paper_id = paper_row[0]
+    repo_row = conn.execute(
+        "SELECT id, repo_slug FROM repos WHERE paper_id = ?", (paper_id,),
+    ).fetchone()
+    if repo_row is None:
         return {
             "mode": "repo_tree",
             "status": "no_repo",
             "paper_name": paper_name,
             "hint": (
-                f"papers.code_repo is NULL for {paper_name}. No repo "
-                f"discovery hit during fetch — nothing to list."
+                f"no repo is linked to paper {paper_name}. Either no repo "
+                f"was discovered during fetch, or fetch hasn't run yet."
             ),
         }
+    return int(repo_row[0]), repo_row[1], paper_name
 
-    if status == PaperStatus.FAILED_REPO.value:
+
+def mode_repo_tree(
+    conn: sqlite3.Connection,
+    *,
+    paper_name: str | None = None,
+    repo: str | None = None,
+) -> dict[str, Any]:
+    """List every ``code_files`` path under a repo.
+
+    Identify the target by either ``paper_name`` (the paper's linked
+    repo) or ``repo`` (a repo_slug — works for standalone repos too).
+    Exactly one must be set.
+
+    Soft statuses on missing data:
+    - ``no_repo`` — paper has no linked repo row.
+    - ``failed_repo`` — clone failed previously; URL kept for reference.
+    """
+    if (paper_name is None) == (repo is None):
+        raise ValueError("mode_repo_tree requires exactly one of paper_name / repo")
+
+    resolved = _resolve_repo_target(conn, paper_name=paper_name, repo=repo)
+    if isinstance(resolved, dict):
+        return resolved
+    repo_id, repo_slug, linked_paper = resolved
+
+    repo_meta = conn.execute(
+        "SELECT url, commit_sha, fetched_at, status FROM repos WHERE id = ?",
+        (repo_id,),
+    ).fetchone()
+    url, commit, fetched_at, status = repo_meta
+
+    if status == RepoStatus.FAILED_REPO.value:
         return {
             "mode": "repo_tree",
             "status": "failed_repo",
-            "paper_name": paper_name,
-            "code_repo": code_repo,
+            "repo_slug": repo_slug,
+            "paper_name": linked_paper,
+            "url": url,
             "hint": (
-                f"git clone {code_repo} failed during ingest. Re-run "
-                f"`ingest --url <id> --force` to retry."
+                f"git clone {url} failed during ingest. Re-run "
+                f"`ingest --repo {url} --force` (standalone) or "
+                f"`ingest --url <id> --force` (paper-linked) to retry."
             ),
         }
 
     file_rows = conn.execute(
         "SELECT path, language, size_bytes FROM code_files "
-        " WHERE paper_id = ? ORDER BY path",
-        (paper_id,),
+        " WHERE repo_id = ? ORDER BY path",
+        (repo_id,),
     ).fetchall()
 
     files = [
@@ -2176,8 +2425,9 @@ def mode_repo_tree(
     return {
         "mode": "repo_tree",
         "status": "ok",
-        "paper_name": paper_name,
-        "code_repo": code_repo,
+        "repo_slug": repo_slug,
+        "paper_name": linked_paper,
+        "url": url,
         "commit": commit,
         "fetched_at": fetched_at,
         "file_count": len(files),
@@ -2189,35 +2439,44 @@ def mode_repo_tree(
 def mode_read_code(
     conn: sqlite3.Connection,
     *,
-    paper_name: str,
+    paper_name: str | None = None,
+    repo: str | None = None,
     path: str,
     lines: str | None = None,
 ) -> dict[str, Any]:
     """Read one ``code_files`` row, optionally sliced by 1-based line range.
 
+    Identify the repo by either ``paper_name`` or ``repo`` (repo_slug).
     Soft statuses (mirror ``mode_read``):
     - ``file_not_found``
     - ``malformed_lines``
+    - ``no_repo`` (when called via paper_name and the paper has no repo)
     """
-    paper_row = conn.execute(
-        "SELECT id FROM papers WHERE paper_name = ?", (paper_name,)
-    ).fetchone()
-    if paper_row is None:
-        raise ValueError(f"paper not found: paper_name={paper_name!r}")
-    paper_id = paper_row[0]
+    if (paper_name is None) == (repo is None):
+        raise ValueError("mode_read_code requires exactly one of paper_name / repo")
+
+    resolved = _resolve_repo_target(conn, paper_name=paper_name, repo=repo)
+    if isinstance(resolved, dict):
+        # _resolve_repo_target only returns no_repo soft-status; rebrand
+        # it into mode_read_code shape.
+        resolved["mode"] = "read_code"
+        resolved["path"] = path
+        return resolved
+    repo_id, repo_slug, linked_paper = resolved
 
     file_row = conn.execute(
         "SELECT path, language, size_bytes, content "
-        "  FROM code_files WHERE paper_id = ? AND path = ?",
-        (paper_id, path),
+        "  FROM code_files WHERE repo_id = ? AND path = ?",
+        (repo_id, path),
     ).fetchone()
     if file_row is None:
         return {
             "mode": "read_code",
             "status": "file_not_found",
-            "paper_name": paper_name,
+            "repo_slug": repo_slug,
+            "paper_name": linked_paper,
             "path": path,
-            "hint": f"Run --repo-tree {paper_name} for the available paths.",
+            "hint": f"Run --repo-tree --repo {repo_slug} for the available paths.",
         }
 
     stored_path, language, size_bytes, content = file_row
@@ -2226,7 +2485,8 @@ def mode_read_code(
         return {
             "mode": "read_code",
             "status": "ok",
-            "paper_name": paper_name,
+            "repo_slug": repo_slug,
+            "paper_name": linked_paper,
             "path": stored_path,
             "language": language,
             "size_bytes": int(size_bytes),
@@ -2497,9 +2757,10 @@ def format_search_markdown(
             for g in readmes:
                 path = g.get("path") or ""
                 raw = (g.get("snippet") or "").strip()
+                ident = g.get("repo_slug") or g.get("paper_name") or "?"
                 snip = " ".join(raw.split())
                 lines.append(
-                    f"- {g.get('paper_name', '?')}: {path} — {snip}"
+                    f"- {ident}: {path} — {snip}"
                 )
         else:
             lines.append("(none)")
@@ -2632,9 +2893,10 @@ def format_collection_text(payload: dict[str, Any]) -> str:
             authors = p.get("authors")
             if authors:
                 meta_bits.append(str(authors))
-            code_repo = p.get("code_repo")
-            if code_repo:
-                meta_bits.append(str(code_repo))
+            if p.get("has_repo"):
+                slug = p.get("repo_slug")
+                if slug:
+                    meta_bits.append(f"repo:{slug}")
             sec_n = int(p.get("section_count") or 0)
             fig_n = int(p.get("figure_count") or 0)
             counts = []
@@ -2749,10 +3011,14 @@ def to_human(payload: dict[str, Any]) -> str:
             row_count = sum(
                 int(h.get("hit_count", 0))
                 for h in payload.get("results", [])
+            ) + sum(
+                int(h.get("hit_count", 0))
+                for h in payload.get("repo_results", [])
             )
             for hit in payload.get("results", []):
+                ident = hit.get("paper_name") or hit.get("repo_slug") or "?"
                 lines.append(
-                    f"- {hit['paper_name']} (hits={hit['hit_count']})"
+                    f"- {ident} (hits={hit['hit_count']})"
                 )
                 for s in hit.get("sections", []):
                     lines.append(
@@ -2768,6 +3034,20 @@ def to_human(payload: dict[str, Any]) -> str:
                     lines.append(
                         f"    code_repo: {cr.get('url')} "
                         f"(status={cr.get('status')}, files={cr.get('file_count')})"
+                    )
+            for hit in payload.get("repo_results", []):
+                slug = hit.get("repo_slug", "?")
+                lines.append(
+                    f"- repo:{slug} (hits={hit.get('hit_count', 0)})"
+                )
+                rh = hit.get("readme_hit")
+                if rh:
+                    lines.append(
+                        f"    README: {rh.get('path')}: {rh.get('snippet', '')}"
+                    )
+                if hit.get("paper_name"):
+                    lines.append(
+                        f"    linked paper: {hit['paper_name']}"
                     )
             footer = _paging_footer(payload, page_size=row_count)
             if footer:
@@ -2939,22 +3219,22 @@ def to_human(payload: dict[str, Any]) -> str:
 
     elif mode == "repo_tree":
         status = payload.get("status", "ok")
-        paper = payload.get("paper_name")
+        target = payload.get("repo_slug") or payload.get("paper_name") or "?"
         if status == "no_repo":
-            lines.append(f"no code_repo for {paper}")
+            lines.append(f"no repo for {target}")
             hint = payload.get("hint")
             if hint:
                 lines.append(hint)
         elif status == "failed_repo":
             lines.append(
-                f"clone failed for {paper}: {payload.get('code_repo')}"
+                f"clone failed for {target}: {payload.get('url')}"
             )
             hint = payload.get("hint")
             if hint:
                 lines.append(hint)
         else:
             lines.append(
-                f"== {paper} repo: {payload.get('code_repo')} "
+                f"== {target} repo: {payload.get('url')} "
                 f"({payload.get('file_count')} files, "
                 f"{payload.get('total_bytes')} bytes) =="
             )
@@ -2966,16 +3246,21 @@ def to_human(payload: dict[str, Any]) -> str:
 
     elif mode == "read_code":
         status = payload.get("status", "ok")
-        paper = payload.get("paper_name")
+        target = payload.get("repo_slug") or payload.get("paper_name") or "?"
         path = payload.get("path")
         if status == "file_not_found":
-            lines.append(f"file not found in {paper}: {path!r}")
+            lines.append(f"file not found in {target}: {path!r}")
+            hint = payload.get("hint")
+            if hint:
+                lines.append(hint)
+        elif status == "no_repo":
+            lines.append(f"no repo for {target}: {path!r}")
             hint = payload.get("hint")
             if hint:
                 lines.append(hint)
         elif status == "malformed_lines":
             lines.append(
-                f"malformed --lines for {paper} {path!r}: "
+                f"malformed --lines for {target} {path!r}: "
                 f"{payload.get('requested_lines')!r}"
             )
             err = payload.get("error")
@@ -2985,7 +3270,7 @@ def to_human(payload: dict[str, Any]) -> str:
             if hint:
                 lines.append(hint)
         else:
-            header = f"== {paper} :: {path}"
+            header = f"== {target} :: {path}"
             ln = payload.get("lines")
             if ln:
                 header += f" [lines {ln[0]}-{ln[1]}]"
@@ -3145,9 +3430,13 @@ def _build_parser() -> argparse.ArgumentParser:
               "readmes, or both."),
     )
     p.add_argument("--repo-tree", dest="repo_tree", default=None,
-                   help="list paths in PAPER's code repo")
+                   help="list paths in PAPER's code repo (paper_name)")
+    p.add_argument("--repo-tree-slug", dest="repo_tree_slug", default=None,
+                   help="list paths in REPO_SLUG (standalone or paper-linked)")
     p.add_argument("--read-code", dest="read_code", default=None,
-                   help="read a file from PAPER's code repo")
+                   help="read a file from PAPER's code repo (paper_name)")
+    p.add_argument("--read-code-slug", dest="read_code_slug", default=None,
+                   help="read a file from REPO_SLUG (standalone or paper-linked)")
     p.add_argument("--path", default=None,
                    help="repo-relative file path for --read-code")
     p.add_argument("--lines", default=None,
@@ -3206,8 +3495,12 @@ def _check_mode_conflicts(
         modes.append("--figure")
     if args.repo_tree is not None:
         modes.append("--repo-tree")
+    if args.repo_tree_slug is not None:
+        modes.append("--repo-tree-slug")
     if args.read_code is not None:
         modes.append("--read-code")
+    if args.read_code_slug is not None:
+        modes.append("--read-code-slug")
     if args.overview:
         modes.append("--overview")
     if args.collection_name is not None:
@@ -3228,12 +3521,13 @@ def _check_mode_conflicts(
             "It is ignored by every other mode."
         )
 
-    # `--read-code` requires `--path`; `--lines` is only meaningful with
-    # `--read-code`.
-    if args.read_code is not None and not args.path:
-        parser.error("--read-code requires --path REPO_RELATIVE_PATH.")
-    if args.lines is not None and args.read_code is None:
-        parser.error("--lines is only valid with --read-code.")
+    # `--read-code` / `--read-code-slug` requires `--path`; `--lines`
+    # is only meaningful with one of them.
+    using_read_code = args.read_code is not None or args.read_code_slug is not None
+    if using_read_code and not args.path:
+        parser.error("--read-code/--read-code-slug requires --path REPO_RELATIVE_PATH.")
+    if args.lines is not None and not using_read_code:
+        parser.error("--lines is only valid with --read-code/--read-code-slug.")
 
 
 def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, Any]:
@@ -3253,10 +3547,19 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
     # Mode 6: repo tree / read code
     if args.repo_tree is not None:
         return mode_repo_tree(conn, paper_name=args.repo_tree)
+    if args.repo_tree_slug is not None:
+        return mode_repo_tree(conn, repo=args.repo_tree_slug)
     if args.read_code is not None:
         return mode_read_code(
             conn,
             paper_name=args.read_code,
+            path=args.path,
+            lines=args.lines,
+        )
+    if args.read_code_slug is not None:
+        return mode_read_code(
+            conn,
+            repo=args.read_code_slug,
             path=args.path,
             lines=args.lines,
         )

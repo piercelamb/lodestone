@@ -32,6 +32,7 @@ class CollectionNode:
     name: str
     description: str | None
     paper_count: int
+    repo_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,7 @@ class DomainNode:
     paper_count: int
     collections: tuple[CollectionNode, ...]
     overflow: int = 0
+    repo_count: int = 0
 
 
 def load_taxonomy(
@@ -90,10 +92,16 @@ def load_taxonomy(
     if domain is not None:
         coll_rows = conn.execute(
             """
-            SELECT c.domain, c.name, c.description, COUNT(p.id) AS paper_count
+            SELECT c.domain, c.name, c.description,
+                   COUNT(DISTINCT p.id) AS paper_count,
+                   COUNT(DISTINCT r.id) AS repo_count
               FROM collections c
               LEFT JOIN papers p
                 ON p.domain = c.domain AND p.collection = c.name
+              LEFT JOIN repos r
+                ON r.domain = c.domain
+               AND r.collection = c.name
+               AND r.paper_id IS NULL
              WHERE c.domain = ?
              GROUP BY c.domain, c.name, c.description
             """,
@@ -102,34 +110,55 @@ def load_taxonomy(
     else:
         coll_rows = conn.execute(
             """
-            SELECT c.domain, c.name, c.description, COUNT(p.id) AS paper_count
+            SELECT c.domain, c.name, c.description,
+                   COUNT(DISTINCT p.id) AS paper_count,
+                   COUNT(DISTINCT r.id) AS repo_count
               FROM collections c
               LEFT JOIN papers p
                 ON p.domain = c.domain AND p.collection = c.name
+              LEFT JOIN repos r
+                ON r.domain = c.domain
+               AND r.collection = c.name
+               AND r.paper_id IS NULL
              GROUP BY c.domain, c.name, c.description
             """,
         ).fetchall()
 
     by_domain: dict[str, list[CollectionNode]] = {}
-    for d, name, description, count in coll_rows:
-        if not include_empty_collections and (count or 0) == 0:
+    for d, name, description, count, rcount in coll_rows:
+        # Drop entirely empty collections (no papers AND no standalone repos).
+        if not include_empty_collections and (count or 0) == 0 and (rcount or 0) == 0:
             continue
         by_domain.setdefault(d, []).append(
             CollectionNode(
                 name=name,
                 description=description,
                 paper_count=int(count or 0),
+                repo_count=int(rcount or 0),
             )
         )
 
-    # Sort each domain's collections: most-popular first, then alpha by name.
+    # Sort each domain's collections: most-popular first (papers + repos),
+    # then alpha by name.
     for d, colls in by_domain.items():
-        colls.sort(key=lambda c: (-c.paper_count, c.name))
+        colls.sort(key=lambda c: (-(c.paper_count + c.repo_count), c.name))
+
+    # Per-domain repo count (standalone repos only — paper-linked repos
+    # are already counted via their paper).
+    repo_counts_by_domain: dict[str, int] = {
+        d: c
+        for d, c in conn.execute(
+            "SELECT domain, COUNT(*) FROM repos "
+            " WHERE paper_id IS NULL AND domain IS NOT NULL "
+            " GROUP BY domain"
+        ).fetchall()
+    }
 
     nodes: list[DomainNode] = []
     for d_name, d_desc, d_count in domain_rows:
         d_count = int(d_count or 0)
-        if not include_empty_domains and d_count == 0:
+        d_repo_count = int(repo_counts_by_domain.get(d_name, 0) or 0)
+        if not include_empty_domains and d_count == 0 and d_repo_count == 0:
             continue
         colls = by_domain.get(d_name, [])
         overflow = 0
@@ -146,16 +175,30 @@ def load_taxonomy(
                 paper_count=d_count,
                 collections=tuple(colls),
                 overflow=overflow,
+                repo_count=d_repo_count,
             )
         )
 
-    # Sort domains: most-papers first, then alpha.
-    nodes.sort(key=lambda n: (-n.paper_count, n.name))
+    # Sort domains: most-papers+repos first, then alpha.
+    nodes.sort(key=lambda n: (-(n.paper_count + n.repo_count), n.name))
     return nodes
 
 
 def _format_count(n: int, *, label: str) -> str:
     return f"{n} {label}" if n == 1 else f"{n} {label}s"
+
+
+def _node_count_label(paper_count: int, repo_count: int) -> str:
+    """Render the ``(N papers, M repos)`` suffix.
+
+    Drops the repo half when ``repo_count == 0`` so existing fixtures
+    that don't exercise repos render unchanged.
+    """
+    paper_part = _format_count(paper_count, label="paper")
+    if repo_count <= 0:
+        return paper_part
+    repo_part = _format_count(repo_count, label="repo")
+    return f"{paper_part}, {repo_part}"
 
 
 def render_taxonomy_tree(
@@ -232,7 +275,7 @@ def _render_count(
     blocks: list[list[str]] = []
     for node in domains:
         block: list[str] = []
-        suffix = f"({_format_count(node.paper_count, label='paper')})"
+        suffix = f"({_node_count_label(node.paper_count, node.repo_count)})"
         head = (
             f"{node.name} — {node.description}  {suffix}"
             if node.description
@@ -249,7 +292,7 @@ def _render_count(
         n_leaves = len(node.collections) + (1 if has_overflow else 0)
         for j, coll in enumerate(node.collections):
             connector = "└──" if j == n_leaves - 1 else "├──"
-            c_count = _format_count(coll.paper_count, label="paper")
+            c_count = _node_count_label(coll.paper_count, coll.repo_count)
             leaf = (
                 f"{coll.name} — {coll.description}  ({c_count})"
                 if coll.description

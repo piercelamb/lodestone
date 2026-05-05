@@ -12,6 +12,7 @@ EXPECTED_TABLES = {
     "domains",
     "collections",
     "papers",
+    "repos",
     "figures",
     "paper_references",
     "sections",
@@ -19,7 +20,7 @@ EXPECTED_TABLES = {
     "canonical_terms",
     "term_aliases",
     "term_embeddings",
-    "paper_topics",
+    "topics",
     "code_files",
     "readmes_fts",
 }
@@ -43,9 +44,9 @@ def _user_tables(conn: sqlite3.Connection) -> set[str]:
 
 # Plain (non-virtual) tables — support row-count queries directly.
 _PLAIN_TABLES = {
-    "domains", "collections", "papers", "figures",
+    "domains", "collections", "papers", "repos", "figures",
     "paper_references",
-    "canonical_terms", "term_aliases", "paper_topics",
+    "canonical_terms", "term_aliases", "topics",
     "code_files",
 }
 
@@ -450,27 +451,27 @@ def test_papers_raw_html_accepts_large_payload(conn):
 
 
 def test_code_files_table_exists_with_unique_constraint(conn):
-    """``code_files`` is a plain table with UNIQUE(paper_id, path)."""
+    """``code_files`` is a plain table with UNIQUE(repo_id, path)."""
     cols = {c[1] for c in conn.execute("PRAGMA table_info(code_files)").fetchall()}
-    assert {"paper_id", "path", "language", "size_bytes", "content"} <= cols
+    assert {"repo_id", "path", "language", "size_bytes", "content"} <= cols
 
     conn.execute("INSERT OR IGNORE INTO domains (name) VALUES ('rag')")
     conn.execute(
-        "INSERT INTO papers (arxiv_id, paper_name, title, authors, date, "
-        "  abstract, domain, content_hash, pdf_url, ingested_at, status) "
-        "VALUES ('a/1', 'p1', 't', '[]', '2024', 'a', 'rag', 'h', 'u', 'd', 'fetched')"
+        "INSERT INTO repos (repo_slug, url, host, owner, name, status, "
+        "  ingested_at) VALUES (?, ?, 'github.com', 'o', 'r', 'resolved', 'd')",
+        ("gh-o-r", "https://github.com/o/r"),
     )
-    pid = conn.execute("SELECT id FROM papers WHERE paper_name='p1'").fetchone()[0]
+    rid = conn.execute("SELECT id FROM repos WHERE repo_slug='gh-o-r'").fetchone()[0]
     conn.execute(
-        "INSERT INTO code_files (paper_id, path, language, size_bytes, content) "
+        "INSERT INTO code_files (repo_id, path, language, size_bytes, content) "
         "VALUES (?, ?, ?, ?, ?)",
-        (pid, "main.py", "python", 5, "x=1\n"),
+        (rid, "main.py", "python", 5, "x=1\n"),
     )
     with pytest.raises(sqlite3.IntegrityError):
         conn.execute(
-            "INSERT INTO code_files (paper_id, path, language, size_bytes, content) "
+            "INSERT INTO code_files (repo_id, path, language, size_bytes, content) "
             "VALUES (?, ?, ?, ?, ?)",
-            (pid, "main.py", "python", 6, "y=2\n"),
+            (rid, "main.py", "python", 6, "y=2\n"),
         )
 
 
@@ -481,8 +482,8 @@ def test_readmes_fts_virtual_table_exists(conn):
     assert row is not None
     # FTS5 must accept inserts and tokenize MATCH queries.
     conn.execute(
-        "INSERT INTO readmes_fts (paper_id, domain, paper_name, path, content) "
-        "VALUES (1, 'rag', 'paperX', 'README.md', 'mixture-of-experts training')"
+        "INSERT INTO readmes_fts (repo_id, repo_slug, domain, path, content) "
+        "VALUES (1, 'gh-o-x', 'rag', 'README.md', 'mixture-of-experts training')"
     )
     n = conn.execute(
         "SELECT COUNT(*) FROM readmes_fts WHERE readmes_fts MATCH ?",
@@ -491,20 +492,24 @@ def test_readmes_fts_virtual_table_exists(conn):
     assert n == 1
 
 
-def test_papers_code_repo_columns_added(conn):
+def test_papers_no_legacy_code_repo_columns(conn):
+    """code_repo / code_repo_commit / code_repo_fetched_at have moved to
+    the first-class ``repos`` table; the legacy columns must not exist."""
     cols = {c[1] for c in conn.execute("PRAGMA table_info(papers)").fetchall()}
-    assert "code_repo_commit" in cols
-    assert "code_repo_fetched_at" in cols
+    assert "code_repo" not in cols
+    assert "code_repo_commit" not in cols
+    assert "code_repo_fetched_at" not in cols
 
 
-def test_add_column_if_missing_is_idempotent(conn):
-    """Repeated init_db calls don't re-add columns or error."""
-    cols1 = {c[1] for c in conn.execute("PRAGMA table_info(papers)").fetchall()}
-    init_db(conn)
-    cols2 = {c[1] for c in conn.execute("PRAGMA table_info(papers)").fetchall()}
-    assert cols1 == cols2
-    assert "code_repo_commit" in cols1
-    assert "code_repo_fetched_at" in cols1
+def test_repos_table_has_expected_columns(conn):
+    cols = {c[1] for c in conn.execute("PRAGMA table_info(repos)").fetchall()}
+    expected = {
+        "id", "repo_slug", "url", "host", "owner", "name", "paper_id",
+        "description", "default_branch", "commit_sha", "fetched_at",
+        "ingested_at", "domain", "collection", "status", "needs_review",
+        "file_count", "has_readme",
+    }
+    assert expected <= cols
 
 
 def test_term_embeddings_metadata_filters(conn):
@@ -632,8 +637,8 @@ def test_invariant_pre_classify_paper_can_have_null_domain_collection(conn):
 
 
 def test_invariant_failed_paper_can_have_null_domain_collection(conn):
-    """Terminal FAILED_HTML / FAILED_REPO rows can carry NULLs — they
-    will never be classified."""
+    """Terminal FAILED_HTML rows can carry NULLs — they will never be
+    classified. (FAILED_REPO is now a repo-side terminal status.)"""
     _insert_paper_raw(
         conn, paper_name="ok_failed_html", arxiv_id="2401.10020",
         status="failed_html", domain=None, collection=None,

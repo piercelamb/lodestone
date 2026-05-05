@@ -1006,11 +1006,11 @@ class TestGarbageGate:
         assert _is_garbage(frag)
 
     def test_over_length_rejected(self):
-        """Spans longer than 60 chars are phrase captures, not entities."""
-        long_name = "a" * 61
-        assert _is_garbage(long_name)
-        # 60 is the boundary — still accepted if otherwise clean.
-        assert not _is_garbage("a" * 60)
+        """Spans longer than _ENTITY_MAX_LEN chars are phrase captures, not entities."""
+        from _system.scripts.extract_entities import _ENTITY_MAX_LEN
+        assert _is_garbage("a" * (_ENTITY_MAX_LEN + 1))
+        # Boundary — still accepted if otherwise clean.
+        assert not _is_garbage("a" * _ENTITY_MAX_LEN)
 
     @pytest.mark.parametrize(
         "word",

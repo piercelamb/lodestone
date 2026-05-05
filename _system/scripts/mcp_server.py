@@ -48,6 +48,7 @@ from _system.scripts.search import (
     mode_overview,
     mode_read,
     mode_read_code,
+    mode_repo,
     mode_repo_tree,
     mode_search,
     mode_search_multi,
@@ -500,16 +501,25 @@ def _figure_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
 
 
 def _repo_tree_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
-    return mode_repo_tree(conn, paper_name=args["paper_name"])
+    return mode_repo_tree(
+        conn,
+        paper_name=args.get("paper_name"),
+        repo=args.get("repo"),
+    )
 
 
 def _read_code_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
     return mode_read_code(
         conn,
-        paper_name=args["paper_name"],
+        paper_name=args.get("paper_name"),
+        repo=args.get("repo"),
         path=args["path"],
         lines=args.get("lines"),
     )
+
+
+def _repo_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
+    return mode_repo(conn, repo=args["repo"])
 
 
 class AttachMode(StrEnum):
@@ -914,13 +924,20 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "repo_tree",
         "description": (
-            "List every code_files path for a paper's anchored code repo. "
-            "Soft statuses on missing data: 'no_repo', 'failed_repo'."
+            "List every code_files path for a repo. Identify by exactly "
+            "one of `paper_name` (the paper's anchored repo) or `repo` "
+            "(repo_slug, works for standalone repos). Soft statuses on "
+            "missing data: 'no_repo', 'failed_repo'."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"paper_name": {"type": "string"}},
-            "required": ["paper_name"],
+            "properties": {
+                "paper_name": {"type": "string"},
+                "repo": {
+                    "type": "string",
+                    "description": "repo_slug (e.g. gh-owner-name)",
+                },
+            },
         },
         "dispatch": _repo_tree_dispatch,
         "attach": AttachMode.NONE,
@@ -928,22 +945,47 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "read_code",
         "description": (
-            "Read one code file from a paper's anchored repo, optionally "
-            "sliced by 1-based line range A-B."
+            "Read one code file from a repo, optionally sliced by 1-based "
+            "line range A-B. Identify by exactly one of `paper_name` or "
+            "`repo` (repo_slug)."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "paper_name": {"type": "string"},
+                "repo": {
+                    "type": "string",
+                    "description": "repo_slug (e.g. gh-owner-name)",
+                },
                 "path": {"type": "string"},
                 "lines": {
                     "type": "string",
                     "description": "Inclusive 1-based range, e.g. '100-200'.",
                 },
             },
-            "required": ["paper_name", "path"],
+            "required": ["path"],
         },
         "dispatch": _read_code_dispatch,
+        "attach": AttachMode.NONE,
+    },
+    {
+        "name": "repo",
+        "description": (
+            "Return one repo's metadata, topics, and (if any) linked paper. "
+            "Single SELECT — cheap; useful as a 'tell me about this repo' "
+            "step before drilling into repo_tree / read_code."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "repo": {
+                    "type": "string",
+                    "description": "repo_slug (e.g. gh-owner-name)",
+                },
+            },
+            "required": ["repo"],
+        },
+        "dispatch": _repo_dispatch,
         "attach": AttachMode.NONE,
     },
 ]

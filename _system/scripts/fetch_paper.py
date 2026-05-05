@@ -27,8 +27,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlparse
-
 import httpx
 from PIL import Image
 from tenacity import (
@@ -48,6 +46,7 @@ from _system.latex import figures as latex_figures
 from _system.schemas.paper_metadata import HtmlSource, PaperMetadata, PaperStatus
 from _system.utils.arxiv_urls import base_url_for_source, parse_arxiv_id
 from _system.utils.logging import get_logger
+from _system.utils.repo_url import extract_repo_candidates, normalize_repo_url
 from _system.utils.slug import generate_paper_name
 
 __all__ = ["fetch", "LATEX_SENTINEL_PREFIX"]
@@ -72,13 +71,6 @@ _ARXIV_PDF_URL = "https://arxiv.org/pdf/{arxiv_id}"
 
 _PWC_PAPER_LOOKUP = "https://paperswithcode.com/api/v1/papers/?arxiv_id={arxiv_id}"
 _PWC_PAPER_REPOS = "https://paperswithcode.com/api/v1/papers/{slug}/repositories/"
-
-_REPO_HOSTS = frozenset({"github.com", "gitlab.com", "bitbucket.org"})
-_REPO_URL_RE = re.compile(
-    r"https?://(?:www\.)?(?:github\.com|gitlab\.com|bitbucket\.org)/[^\s\"'<>]+",
-    re.IGNORECASE,
-)
-_TRAILING_PUNCT = ".,);:!?]}>"
 
 _VERSION_RE = re.compile(r"v\d+$")
 
@@ -346,42 +338,6 @@ def _process_figures(
     return results
 
 
-def _normalize_repo_url(raw: str) -> str | None:
-    """Return a canonical ``https://host/owner/repo`` URL, or None if the
-    input isn't a repo root.
-
-    The plan requires path depth **exactly 2** (``/owner/repo``). A deeper
-    path (``/owner/repo/issues/42``, ``/owner/repo/blob/main/file.md``) is
-    rejected outright rather than truncated — truncation produces
-    false-positive repo links for bibliography entries that happen to cite
-    a specific file on github.
-    """
-    raw = raw.strip().rstrip(_TRAILING_PUNCT)
-    try:
-        parsed = urlparse(raw)
-    except ValueError:
-        return None
-    host = parsed.netloc.lower()
-    if host.startswith("www."):
-        host = host[4:]
-    if host not in _REPO_HOSTS:
-        return None
-    segments = [s for s in parsed.path.split("/") if s]
-    if len(segments) != 2:
-        return None
-    owner, repo = segments[0], segments[1]
-    repo = repo.removesuffix(".git")
-    return f"https://{host}/{owner}/{repo}"
-
-
-def _extract_repo_candidates(text: str) -> list[str]:
-    return [
-        norm
-        for raw in _REPO_URL_RE.findall(text)
-        if (norm := _normalize_repo_url(raw)) is not None
-    ]
-
-
 def _layer1_paperswithcode(
     client: httpx.Client, arxiv_id: str
 ) -> str | None:
@@ -429,7 +385,7 @@ def _layer1_paperswithcode(
     )
     for repo in pool:
         url = repo.get("url")
-        if url and (norm := _normalize_repo_url(url)):
+        if url and (norm := normalize_repo_url(url)):
             return norm
     return None
 
@@ -442,10 +398,10 @@ def _discover_code_repo(
 ) -> str | None:
     if pwc := _layer1_paperswithcode(client, arxiv_id):
         return pwc
-    if html_hits := _extract_repo_candidates(html_body):
+    if html_hits := extract_repo_candidates(html_body):
         return html_hits[0]
     haystack = " ".join(s for s in (meta.comment or "", meta.summary or "") if s)
-    if meta_hits := _extract_repo_candidates(haystack):
+    if meta_hits := extract_repo_candidates(haystack):
         return meta_hits[0]
     return None
 
@@ -461,7 +417,7 @@ def _get_existing_paper(conn: sqlite3.Connection, arxiv_id: str) -> PaperMetadat
         """
         SELECT arxiv_id, paper_name, title, authors, date, abstract,
                pdf_url, domain, collection, status, markdown, raw_html,
-               html_source, content_hash, code_repo, needs_review,
+               html_source, content_hash, needs_review,
                ingested_at
           FROM papers WHERE arxiv_id = ?
         """,
@@ -484,9 +440,8 @@ def _get_existing_paper(conn: sqlite3.Connection, arxiv_id: str) -> PaperMetadat
         raw_html=row[11],
         html_source=row[12],
         content_hash=row[13],
-        code_repo=row[14],
-        needs_review=bool(row[15]),
-        ingested_at=row[16],
+        needs_review=bool(row[14]),
+        ingested_at=row[15],
     )
 
 
@@ -515,11 +470,16 @@ def _persist(
     """Phase 2: single transaction writing papers + figures.
 
     Idempotency: on a forced re-fetch, any existing papers row (and every
-    dependent row across ``figures``, ``term_aliases``, ``paper_topics``,
+    dependent row across ``figures``, ``term_aliases``, ``topics``,
     and the FTS ``sections`` virtual table) is deleted inside the same
     transaction before the fresh INSERT. Callers that want paper_name /
     ingested_at preservation must set those on the incoming
     PaperMetadata — ``fetch()`` does this.
+
+    The discovered ``code_repo`` URL travels on ``pm`` for the orchestrator
+    to consume after fetch returns; it is **not** persisted on the
+    ``papers`` row. Repos are first-class entities and are created in a
+    follow-up stage.
     """
     with transaction(conn):
         if pm.domain:
@@ -541,14 +501,14 @@ def _persist(
             """
             INSERT INTO papers (
                 arxiv_id, paper_name, title, authors, date, abstract,
-                domain, collection, code_repo, content_hash, pdf_url,
+                domain, collection, content_hash, pdf_url,
                 html_source, ingested_at, status, markdown, raw_html,
                 figure_count, needs_review
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 pm.arxiv_id, pm.paper_name, pm.title, pm.authors, pm.date,
-                pm.abstract, pm.domain, pm.collection, pm.code_repo,
+                pm.abstract, pm.domain, pm.collection,
                 pm.content_hash, pm.pdf_url, pm.html_source,
                 pm.ingested_at, str(pm.status), pm.markdown, pm.raw_html,
                 len(figures), int(bool(pm.needs_review)),

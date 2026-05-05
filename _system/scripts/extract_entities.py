@@ -51,7 +51,7 @@ _LOG = get_logger("scripts.extract_entities")
 _ACRONYM_MIN_LEN = 3
 _REJECT_RATE_WARN = 0.5
 _REJECT_RATE_WARN_MIN_SAMPLES = 10
-_ENTITY_MAX_LEN = 60
+_ENTITY_MAX_LEN = 100
 
 _ACRONYM_ALLOWLIST: frozenset[str] = frozenset({"LM", "QA", "NN", "AI", "ML", "NLP"})
 _ENTITY_STOPLIST: frozenset[str] = frozenset(
@@ -611,7 +611,7 @@ def _is_garbage(name: str) -> bool:
     - pure-numeric
     - ends with dangling punctuation (``-/:,@#``): GLiNER2 span-boundary
       truncation (e.g. ``NV-``, ``foo/``).
-    - longer than ``_ENTITY_MAX_LEN``: no legitimate entity name is 60+
+    - longer than ``_ENTITY_MAX_LEN``: no legitimate entity name is 100+
       chars; long spans are phrase captures that escaped the structural
       boundary check.
     - document-structure reference (``Table 2``, ``Appendix C``, ``Eq. 7``):

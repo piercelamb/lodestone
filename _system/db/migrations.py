@@ -9,6 +9,10 @@ from the script and guarded by a ``sqlite_master`` existence check —
 ``vec0`` does not support ``IF NOT EXISTS`` and we apply the same
 pattern to FTS5 for uniformity.
 
+The repos refactor wiped legacy ``papers.code_repo`` columns and the
+``paper_topics`` table; the DB is wipe-and-reingest at that point so no
+data-preserving migration is provided. Older databases must be deleted.
+
 One pre-script migration runs first: ``_migrate_entities_to_aliases``
 folds older shapes of ``term_aliases`` into the current
 ``(term_id, alias, source_paper)`` synonym-index PK. It dispatches on
@@ -63,37 +67,6 @@ def init_db(conn: sqlite3.Connection) -> None:
     for table_name, stmt in virtual_blocks:
         if not _table_exists(conn, table_name):
             conn.execute(stmt)
-
-    # Column-level migrations run after executescript so they apply
-    # uniformly to fresh DBs (papers just got created) and pre-existing
-    # DBs that predate the columns.
-    _add_papers_code_repo_columns(conn)
-
-
-def _add_column_if_missing(
-    conn: sqlite3.Connection, table: str, column: str, decl: str
-) -> None:
-    """Idempotent ``ALTER TABLE ... ADD COLUMN`` driven by ``PRAGMA table_info``.
-
-    SQLite's ``ALTER TABLE`` has no ``IF NOT EXISTS``; this helper mirrors
-    the style of :func:`_migrate_entities_to_aliases` by gating on the
-    table's current shape.
-    """
-    cols = {c[1] for c in conn.execute(f"PRAGMA table_info({table})").fetchall()}
-    if column in cols:
-        return
-    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
-
-
-def _add_papers_code_repo_columns(conn: sqlite3.Connection) -> None:
-    """Add ``papers.code_repo_commit`` / ``code_repo_fetched_at`` if missing.
-
-    Runs after ``executescript`` so ``papers`` is guaranteed to exist on
-    fresh DBs. Idempotent — pre-existing DBs that already have the
-    columns are no-ops.
-    """
-    _add_column_if_missing(conn, "papers", "code_repo_commit", "TEXT")
-    _add_column_if_missing(conn, "papers", "code_repo_fetched_at", "TEXT")
 
 
 def _table_exists(conn: sqlite3.Connection, name: str) -> bool:

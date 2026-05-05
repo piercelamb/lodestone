@@ -1,10 +1,4 @@
-"""Paper name slug generation.
-
-The slug is a readable, filesystem-safe identifier stamped onto every paper
-at fetch time. It is not a canonical identity — `papers.arxiv_id` is the
-identity column. The slug only needs to be unique within the `papers` table
-and match the regex ^[a-z0-9_]+$.
-"""
+"""Paper-name slug generation and identifier sanitization."""
 
 from __future__ import annotations
 
@@ -19,6 +13,20 @@ _SLUG_RE = re.compile(r"^[a-z0-9_]+$")
 _VERSION_SUFFIX_RE = re.compile(r"v\d+$")
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 _NON_ALNUM_OR_SPACE_RE = re.compile(r"[^a-z0-9\s]+")
+
+DOMAIN_MAX_LEN = 64
+_WS_OR_SLASH_RE = re.compile(r"[\s/]+")
+_DOMAIN_ALLOWED_RE = re.compile(r"[^a-z0-9_-]")
+
+
+def sanitize_domain(proposed: str) -> str:
+    """Lowercase, collapse whitespace/slashes to ``_``, drop other non-[a-z0-9_-],
+    truncate to :data:`DOMAIN_MAX_LEN`, and strip leading/trailing ``_-``."""
+    lowered = proposed.lower()
+    collapsed = _WS_OR_SLASH_RE.sub("_", lowered)
+    stripped = _DOMAIN_ALLOWED_RE.sub("", collapsed)
+    trimmed = stripped[:DOMAIN_MAX_LEN]
+    return trimmed.strip("_-")
 
 
 def _fold_lower(s: str) -> str:
