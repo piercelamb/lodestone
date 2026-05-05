@@ -35,6 +35,39 @@ def get_conn(db_path: PathLike) -> sqlite3.Connection:
     # ``transaction()`` helper below keeps boundaries obvious.
     conn.isolation_level = None
 
+    _load_vec(conn)
+
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    return conn
+
+
+def get_readonly_conn(db_path: PathLike) -> sqlite3.Connection:
+    """Open a fresh read-only SQLite connection for query escape-hatch use.
+
+    ``mode=ro`` is enforced by SQLite's pager — any DML/DDL statement
+    returns ``SQLITE_READONLY`` from the engine. ``sqlite-vec`` is loaded
+    so vec0 virtual tables remain queryable. ``PRAGMA journal_mode`` is
+    skipped (read-only conns can't change journal mode); the WAL set on
+    the writable handle still governs the file.
+    """
+    uri = f"file:{Path(db_path)}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.isolation_level = None
+
+    _load_vec(conn)
+
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA synchronous = NORMAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA temp_store = MEMORY")
+    return conn
+
+
+def _load_vec(conn: sqlite3.Connection) -> None:
     conn.enable_load_extension(True)
     try:
         sqlite_vec.load(conn)
@@ -50,13 +83,6 @@ def get_conn(db_path: PathLike) -> sqlite3.Connection:
             f"changes between minor versions are expected). Run `uv sync` and "
             f"verify pyproject.toml."
         )
-
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    conn.execute("PRAGMA busy_timeout = 5000")
-    conn.execute("PRAGMA temp_store = MEMORY")
-    return conn
 
 
 @contextmanager

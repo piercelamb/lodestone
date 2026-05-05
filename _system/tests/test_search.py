@@ -2694,3 +2694,245 @@ class TestPagingFooter:
         out = search_mod.to_human(r)
         assert "invalid pagination" in out.lower(), out
         assert ">= 0" in out, out
+
+
+# ===========================================================================
+# DB introspection + read-only SQL escape hatch
+# ===========================================================================
+
+
+class TestModeTables:
+    def test_lists_user_tables_and_marks_virtual(self, conn):
+        r = search_mod.mode_tables(conn)
+        assert r["mode"] == "tables"
+        assert r["status"] == "ok"
+        assert r["include_internal"] is False
+        names = {t["name"]: t["type"] for t in r["tables"]}
+        # Core tables exist after init_db.
+        assert names.get("papers") == "table"
+        assert names.get("canonical_terms") == "table"
+        # Virtual tables tagged correctly.
+        assert names.get("sections") == "virtual"
+        assert names.get("term_embeddings") == "virtual"
+        # Internal shadow tables filtered out by default.
+        for n in names:
+            assert not (
+                n.endswith("_data") or n.endswith("_idx") or
+                n.endswith("_content") or n.endswith("_docsize") or
+                n.endswith("_config")
+            ), f"shadow table leaked: {n}"
+
+    def test_include_internal_surfaces_shadow_tables(self, conn):
+        r = search_mod.mode_tables(conn, include_internal=True)
+        names = {t["name"] for t in r["tables"]}
+        # FTS5 shadow tables for sections show up.
+        assert "sections_data" in names or "sections_idx" in names, names
+
+
+class TestModeSchema:
+    def test_returns_ddl_columns_indexes(self, conn):
+        r = search_mod.mode_schema(conn, table_names=["papers"])
+        assert r["mode"] == "schema"
+        assert r["status"] == "ok"
+        assert r["missing"] == []
+        assert len(r["tables"]) == 1
+        t = r["tables"][0]
+        assert t["name"] == "papers"
+        assert t["type"] == "table"
+        assert "CREATE TABLE" in (t["sql"] or "")
+        col_names = {c["name"] for c in t["columns"]}
+        assert {"id", "arxiv_id", "paper_name", "title"} <= col_names
+        # PK on id.
+        pk = next(c for c in t["columns"] if c["name"] == "id")
+        assert pk["pk"] == 1
+
+    def test_unknown_tables_land_in_missing(self, conn):
+        r = search_mod.mode_schema(
+            conn, table_names=["papers", "no_such_table"]
+        )
+        names = [t["name"] for t in r["tables"]]
+        assert names == ["papers"]
+        assert r["missing"] == ["no_such_table"]
+
+    def test_virtual_table_tagged(self, conn):
+        r = search_mod.mode_schema(conn, table_names=["sections"])
+        t = r["tables"][0]
+        assert t["type"] == "virtual"
+        assert "CREATE VIRTUAL TABLE" in (t["sql"] or "")
+
+    def test_empty_input_raises(self, conn):
+        with pytest.raises(ValueError):
+            search_mod.mode_schema(conn, table_names=[])
+
+
+class TestModeQuery:
+    def test_select_returns_rows(self, seeded_db, db_path):
+        # Commit any seeded writes so the read-only conn opened inside
+        # mode_query sees them.
+        if seeded_db.in_transaction:
+            seeded_db.commit()
+        r = search_mod.mode_query(
+            seeded_db,
+            sql="SELECT paper_name, title FROM papers ORDER BY paper_name",
+            db_path=db_path,
+        )
+        assert r["mode"] == "query"
+        assert r["status"] == "ok"
+        assert r["columns"] == ["paper_name", "title"]
+        assert r["row_count"] >= 1
+        assert r["truncated"] is False
+        names = [row["paper_name"] for row in r["rows"]]
+        assert "bookrag_2024" in names
+
+    def test_write_attempt_is_read_only_violation(self, seeded_db, db_path):
+        r = search_mod.mode_query(
+            seeded_db,
+            sql="DROP TABLE papers",
+            db_path=db_path,
+        )
+        assert r["status"] == "read_only_violation"
+        # Source table still there.
+        assert seeded_db.execute(
+            "SELECT count(*) FROM papers"
+        ).fetchone()[0] >= 1
+
+    def test_insert_attempt_is_read_only_violation(self, seeded_db, db_path):
+        r = search_mod.mode_query(
+            seeded_db,
+            sql="INSERT INTO papers (arxiv_id, paper_name, title, "
+                "authors, date, abstract, pdf_url, ingested_at, status) "
+                "VALUES ('x','x','x','[]','2024-01-01','x','x','x','x')",
+            db_path=db_path,
+        )
+        assert r["status"] == "read_only_violation"
+
+    def test_multiple_statements_soft_fails(self, seeded_db, db_path):
+        r = search_mod.mode_query(
+            seeded_db, sql="SELECT 1; SELECT 2", db_path=db_path,
+        )
+        assert r["status"] == "multiple_statements"
+        # Trailing terminator alone is also caught.
+        r2 = search_mod.mode_query(
+            seeded_db,
+            sql="SELECT 1; DROP TABLE papers;",
+            db_path=db_path,
+        )
+        assert r2["status"] == "multiple_statements"
+
+    def test_syntax_error_is_query_failed(self, seeded_db, db_path):
+        r = search_mod.mode_query(
+            seeded_db, sql="SELEKT 1", db_path=db_path,
+        )
+        assert r["status"] == "query_failed"
+        assert "SELEKT" in r["error"] or "syntax" in r["error"].lower()
+
+    def test_unknown_table_is_query_failed(self, seeded_db, db_path):
+        r = search_mod.mode_query(
+            seeded_db, sql="SELECT * FROM no_such_table",
+            db_path=db_path,
+        )
+        assert r["status"] == "query_failed"
+
+    def test_blob_column_is_summarized(self, seeded_db, db_path):
+        r = search_mod.mode_query(
+            seeded_db,
+            sql="SELECT figure_number, image FROM figures "
+                "ORDER BY figure_number LIMIT 1",
+            db_path=db_path,
+        )
+        assert r["status"] == "ok"
+        assert r["row_count"] == 1
+        row = r["rows"][0]
+        blob = row["image"]
+        assert isinstance(blob, dict)
+        assert blob.get("_blob") is True
+        assert blob.get("size_bytes", 0) > 0
+
+    def test_row_ceiling_truncates(self, seeded_db, db_path):
+        # Use a tiny ceiling and verify truncated=true.
+        r = search_mod.mode_query(
+            seeded_db,
+            sql="SELECT name FROM sqlite_master ORDER BY name",
+            db_path=db_path,
+            max_rows=2,
+        )
+        assert r["status"] == "ok"
+        assert r["truncated"] is True
+        assert r["row_count"] == 2
+
+    def test_virtual_table_query_works(self, seeded_db, db_path):
+        # FTS5 queries against the sections virtual table should run on
+        # the read-only conn (sqlite-vec / FTS5 are loaded via _load_vec).
+        r = search_mod.mode_query(
+            seeded_db,
+            sql="SELECT paper_name FROM sections "
+                "WHERE sections MATCH 'BookRAG' LIMIT 5",
+            db_path=db_path,
+        )
+        assert r["status"] == "ok"
+        assert r["row_count"] >= 1
+
+    def test_query_timeout_short_budget(self, seeded_db, db_path):
+        # Force the wall-clock budget into the past so the progress handler
+        # interrupts on the very first check.
+        r = search_mod.mode_query(
+            seeded_db,
+            sql=(
+                "WITH RECURSIVE c(i) AS ("
+                " SELECT 1 UNION ALL SELECT i+1 FROM c WHERE i < 1000000"
+                ") SELECT count(*) FROM c"
+            ),
+            db_path=db_path,
+            timeout_seconds=0.0,
+        )
+        assert r["status"] == "query_timeout", r
+
+
+class TestIntrospectionToHuman:
+    def test_tables_to_human(self, conn):
+        r = search_mod.mode_tables(conn)
+        out = search_mod.to_human(r)
+        assert "tables" in out
+        assert "papers" in out
+
+    def test_schema_to_human(self, conn):
+        r = search_mod.mode_schema(conn, table_names=["papers"])
+        out = search_mod.to_human(r)
+        assert "papers" in out
+        assert "columns" in out
+
+    def test_query_ok_to_human(self, seeded_db, db_path):
+        r = search_mod.mode_query(
+            seeded_db,
+            sql="SELECT paper_name FROM papers LIMIT 1",
+            db_path=db_path,
+        )
+        out = search_mod.to_human(r)
+        assert "query" in out
+
+    def test_query_soft_fail_to_human(self, seeded_db, db_path):
+        r = search_mod.mode_query(
+            seeded_db, sql="DROP TABLE papers", db_path=db_path,
+        )
+        out = search_mod.to_human(r)
+        assert "read_only_violation" in out
+
+
+class TestIntrospectionConflicts:
+    def _run(self, argv: list[str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-m", "_system.scripts.search", *argv],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    def test_tables_plus_sql_is_rejected(self):
+        result = self._run(["--tables", "--sql", "SELECT 1"])
+        assert result.returncode != 0
+        assert "mutually exclusive" in result.stderr
+
+    def test_include_internal_without_tables_is_rejected(self):
+        result = self._run(["--include-internal", "--sql", "SELECT 1"])
+        assert result.returncode != 0
+        assert "include-internal" in result.stderr

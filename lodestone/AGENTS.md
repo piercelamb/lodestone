@@ -136,3 +136,24 @@ uv run _system/scripts/create_domain.py --name <slug> --description "..."
   whose API key is not exported — pre-flight raises rather than
   silently falling back. Either export the key or delete the file to
   re-trigger env-based selection.
+
+## SQL escape hatch (rare)
+
+When none of the curated modes above fits the question, three extra
+modes expose the DB directly. Reach for the curated tools FIRST — they
+exist because they're the right answer 95% of the time.
+
+- `--tables` — list every user table / view / virtual table.
+  `--include-internal` adds FTS5 / vec0 shadow tables.
+- `--schema TABLE` — print DDL + columns + indexes. Repeat the flag
+  for many tables at once; missing names land in `missing` rather than
+  raising.
+- `--sql 'SELECT ...'` — run one read-only statement. Read-only is
+  engine-enforced (`mode=ro` URI); writes return a `read_only_violation`
+  soft-fail. Single statement only, hard ceiling of 1000 rows, 5 s
+  wall-clock timeout. Paginate with `LIMIT N OFFSET M` + a stable
+  `ORDER BY` in your own SQL.
+
+Same three modes are exposed over MCP as `tables`, `schema`, and
+`query`. Treat `query` as the last resort: it bypasses the curated
+output shapes and gives you raw rows.

@@ -448,15 +448,15 @@ class TestProtocolValidation:
 
 
 class TestToolsList:
-    def test_tools_list_returns_thirteen_tools(self):
+    def test_tools_list_returns_sixteen_tools(self):
         out = mcp_server._handle_tools_list({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         tools = out["result"]["tools"]
-        assert len(tools) == 13
+        assert len(tools) == 16
         names = {t["name"] for t in tools}
         assert names == {
             "search", "bm25", "lookup", "browse", "overview", "collection",
             "toc", "toc_many", "read", "figure", "repo_tree", "read_code",
-            "repo",
+            "repo", "tables", "schema", "query",
         }
         for t in tools:
             assert isinstance(t["description"], str) and t["description"]
@@ -885,7 +885,7 @@ class TestProtocolHandshake:
         list_reply = responses[1]
         assert list_reply["id"] == 2
         tools = list_reply["result"]["tools"]
-        assert len(tools) == 13
+        assert len(tools) == 16
         for t in tools:
             assert t["name"].replace("_", "").isalnum()
 
@@ -1239,3 +1239,120 @@ class TestLookupPagination:
         assert not _is_error(resp)
         sc = resp["result"]["structuredContent"]
         assert sc["status"] == "invalid_pagination"
+
+
+# ===========================================================================
+# tables / schema / query — DB introspection + read-only SQL escape hatch
+# ===========================================================================
+
+
+class TestTablesTool:
+    def test_tables_lists_user_tables(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(state, "tables", {})
+        assert not _is_error(resp)
+        sc = resp["result"]["structuredContent"]
+        assert sc["mode"] == "tables"
+        assert sc["status"] == "ok"
+        assert sc["include_internal"] is False
+        names = {t["name"] for t in sc["tables"]}
+        assert "papers" in names
+        assert "sections" in names  # virtual
+        # Shadow tables filtered out by default.
+        assert not any(n.endswith("_data") for n in names)
+
+    def test_tables_include_internal_passes_through(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(state, "tables", {"include_internal": True})
+        sc = resp["result"]["structuredContent"]
+        assert sc["include_internal"] is True
+        names = {t["name"] for t in sc["tables"]}
+        assert any(n.endswith("_data") or n.endswith("_idx") for n in names)
+
+
+class TestSchemaTool:
+    def test_schema_string_arg_auto_wraps(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(state, "schema", {"tables": "papers"})
+        assert not _is_error(resp)
+        sc = resp["result"]["structuredContent"]
+        assert sc["mode"] == "schema"
+        assert len(sc["tables"]) == 1
+        assert sc["tables"][0]["name"] == "papers"
+        assert sc["missing"] == []
+
+    def test_schema_array_arg(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(
+            state, "schema",
+            {"tables": ["papers", "no_such_table"]},
+        )
+        sc = resp["result"]["structuredContent"]
+        names = [t["name"] for t in sc["tables"]]
+        assert names == ["papers"]
+        assert sc["missing"] == ["no_such_table"]
+
+    def test_schema_missing_arg(self, fig_db):
+        state = _make_state(fig_db)
+        resp = mcp_server._handle_tools_call(
+            state,
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "schema", "arguments": {}}},
+        )
+        assert "error" in resp
+        assert resp["error"]["code"] == -32602
+
+
+class TestQueryTool:
+    def test_query_select_happy_path(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(
+            state, "query",
+            {"sql": "SELECT paper_name FROM papers ORDER BY paper_name"},
+        )
+        assert not _is_error(resp)
+        assert not _has_image(resp)
+        sc = resp["result"]["structuredContent"]
+        assert sc["mode"] == "query"
+        assert sc["status"] == "ok"
+        assert sc["columns"] == ["paper_name"]
+        assert sc["truncated"] is False
+        names = [r["paper_name"] for r in sc["rows"]]
+        assert "tot_2023" in names
+
+    def test_query_drop_is_read_only_violation(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(state, "query", {"sql": "DROP TABLE papers"})
+        # Soft-failures stay isError=false.
+        assert not _is_error(resp)
+        sc = resp["result"]["structuredContent"]
+        assert sc["status"] == "read_only_violation"
+        # Original DB still has the table.
+        assert fig_db.execute(
+            "SELECT count(*) FROM papers"
+        ).fetchone()[0] >= 1
+
+    def test_query_multiple_statements_soft_fail(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(state, "query", {"sql": "SELECT 1; SELECT 2"})
+        assert not _is_error(resp)
+        sc = resp["result"]["structuredContent"]
+        assert sc["status"] == "multiple_statements"
+
+    def test_query_syntax_error_soft_fail(self, fig_db):
+        state = _make_state(fig_db)
+        resp = _call(state, "query", {"sql": "SELEKT 1"})
+        assert not _is_error(resp)
+        sc = resp["result"]["structuredContent"]
+        assert sc["status"] == "query_failed"
+
+    def test_query_missing_sql_arg(self, fig_db):
+        state = _make_state(fig_db)
+        resp = mcp_server._handle_tools_call(
+            state,
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "query", "arguments": {}}},
+        )
+        assert "error" in resp
+        assert resp["error"]["code"] == -32602
+

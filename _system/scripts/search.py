@@ -36,6 +36,7 @@ import re
 import sqlite3
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -44,7 +45,7 @@ from typing import Any
 # NB: import only cheap stdlib + the cheap internal modules here. Anything
 # that pulls torch / sentence_transformers / gliner must live inside the
 # function that needs it.
-from _system.db.connection import get_conn
+from _system.db.connection import PathLike, get_conn, get_readonly_conn
 from _system.schemas.repo_metadata import RepoStatus
 from _system.scripts.taxonomy_tree import (
     CollectionNode,
@@ -2636,6 +2637,330 @@ def mode_figure(
 
 
 # ---------------------------------------------------------------------------
+# DB introspection + read-only SQL escape hatch
+# ---------------------------------------------------------------------------
+# Three modes for the rare 5% case where none of the curated mode_* fits the
+# agent's question: enumerate the schema, inspect one or many tables, and run
+# an arbitrary read-only SELECT. Read-only is enforced by opening a fresh
+# ``mode=ro`` URI connection per query call (see ``get_readonly_conn``); a
+# 5 s wall-clock budget is enforced via ``set_progress_handler``; row output
+# is hard-capped to ``_QUERY_MAX_ROWS``.
+
+# Internal FTS5 / vec0 shadow-table suffix patterns. Filtered out of
+# mode_tables() unless include_internal=True.
+_INTERNAL_TABLE_SUFFIXES: tuple[str, ...] = (
+    "_data", "_idx", "_content", "_docsize", "_config",
+)
+
+# Hard ceiling on rows returned by mode_query. Agents paginate via
+# LIMIT/OFFSET in their own SQL.
+_QUERY_MAX_ROWS = 1000
+
+# Wall-clock budget for a single mode_query call, in seconds.
+_QUERY_TIMEOUT_SECONDS = 5.0
+
+# How often the SQLite engine asks the progress handler whether to keep
+# going. Smaller = finer interrupt granularity; this is only the upper
+# bound on how many VDBE steps run between checks.
+_QUERY_PROGRESS_STEPS = 1_000_000
+
+
+def _is_internal_shadow_name(name: str) -> bool:
+    return any(name.endswith(suf) for suf in _INTERNAL_TABLE_SUFFIXES)
+
+
+def _classify_table_kind(typ: str, sql: str | None) -> str:
+    if typ == "table" and sql and sql.lstrip().upper().startswith(
+        "CREATE VIRTUAL TABLE"
+    ):
+        return "virtual"
+    return typ
+
+
+def mode_tables(
+    conn: sqlite3.Connection,
+    *,
+    include_internal: bool = False,
+) -> dict[str, Any]:
+    """List every user table / view / virtual table in the DB.
+
+    Virtual tables (FTS5, vec0) are tagged ``virtual`` so callers can tell
+    them apart from regular tables. FTS5 / vec0 shadow tables (``%_data``,
+    ``%_idx``, ``%_content``, ``%_docsize``, ``%_config``) are filtered
+    out by default; pass ``include_internal=True`` to surface them.
+    """
+    rows = conn.execute(
+        """
+        SELECT name, type, sql
+          FROM sqlite_master
+         WHERE type IN ('table', 'view')
+         ORDER BY type, name
+        """
+    ).fetchall()
+
+    tables: list[dict[str, Any]] = []
+    for name, typ, sql in rows:
+        if not include_internal and _is_internal_shadow_name(name):
+            continue
+        tables.append({"name": name, "type": _classify_table_kind(typ, sql)})
+
+    return {
+        "mode": "tables",
+        "status": "ok",
+        "include_internal": bool(include_internal),
+        "tables": tables,
+    }
+
+
+def mode_schema(
+    conn: sqlite3.Connection,
+    *,
+    table_names: list[str],
+) -> dict[str, Any]:
+    """Return DDL + column metadata + index metadata for each named table.
+
+    Names that don't resolve land in ``missing`` (mirrors ``mode_toc_many``
+    / ``mode_collection`` rather than raising on a single typo). Empty
+    input raises :class:`ValueError` — that's a caller bug.
+    """
+    if not table_names:
+        raise ValueError("table_names must contain at least one name")
+
+    ordered = list(dict.fromkeys(table_names))
+
+    tables: list[dict[str, Any]] = []
+    missing: list[str] = []
+    for name in ordered:
+        master = conn.execute(
+            "SELECT type, sql FROM sqlite_master "
+            " WHERE name = ? AND type IN ('table', 'view')",
+            (name,),
+        ).fetchone()
+        if master is None:
+            missing.append(name)
+            continue
+        typ, sql = master
+        # Bind table name into pragma_table_info / pragma_index_list rather
+        # than interpolating it into a PRAGMA statement.
+        columns = [
+            {
+                "cid": int(r[0]),
+                "name": r[1],
+                "type": r[2],
+                "notnull": int(r[3]),
+                "dflt_value": r[4],
+                "pk": int(r[5]),
+            }
+            for r in conn.execute(
+                "SELECT cid, name, type, [notnull], dflt_value, pk "
+                "  FROM pragma_table_info(?)",
+                (name,),
+            ).fetchall()
+        ]
+        indexes = [
+            {
+                "name": r[1],
+                "unique": int(r[2]),
+                "origin": r[3],
+                "partial": int(r[4]),
+            }
+            for r in conn.execute(
+                "SELECT seq, name, [unique], origin, partial "
+                "  FROM pragma_index_list(?)",
+                (name,),
+            ).fetchall()
+        ]
+        tables.append({
+            "name": name,
+            "type": _classify_table_kind(typ, sql),
+            "sql": sql,
+            "columns": columns,
+            "indexes": indexes,
+        })
+
+    return {
+        "mode": "schema",
+        "status": "ok",
+        "tables": tables,
+        "missing": missing,
+    }
+
+
+def _serialize_row(description: tuple, row: tuple) -> dict[str, Any]:
+    """Turn a positional sqlite row + ``cur.description`` into a column-keyed
+    dict. ``bytes`` columns are summarized as ``{"_blob": True, "size_bytes":
+    N}`` so multi-MB figure BLOBs don't bloat the JSON envelope.
+    """
+    out: dict[str, Any] = {}
+    for col, value in zip(description, row):
+        col_name = col[0]
+        if isinstance(value, memoryview):
+            out[col_name] = {"_blob": True, "size_bytes": value.nbytes}
+        elif isinstance(value, (bytes, bytearray)):
+            out[col_name] = {"_blob": True, "size_bytes": len(value)}
+        else:
+            out[col_name] = value
+    return out
+
+
+def _count_statements(sql: str) -> int:
+    """Count distinct SQL statements separated by ``;`` terminators. A
+    non-empty trailing fragment after the last terminator counts as one
+    additional statement (so ``"SELECT 1; SELECT 2"`` — where the second
+    has no trailing ``;`` — counts as 2).
+
+    ``sqlite3.complete_statement`` only meaningfully changes verdict at a
+    ``;`` boundary (it tracks string/comment state inside the statement),
+    so we slice on ``;`` rather than rebuilding a prefix per character.
+    """
+    count = 0
+    start = 0
+    for i, ch in enumerate(sql):
+        if ch != ";":
+            continue
+        piece = sql[start:i + 1]
+        if sqlite3.complete_statement(piece) and piece.strip(" \t\r\n;"):
+            count += 1
+            start = i + 1
+    if sql[start:].strip():
+        count += 1
+    return count
+
+
+def mode_query(
+    conn: sqlite3.Connection,
+    *,
+    sql: str,
+    db_path: PathLike | None = None,
+    timeout_seconds: float = _QUERY_TIMEOUT_SECONDS,
+    max_rows: int = _QUERY_MAX_ROWS,
+) -> dict[str, Any]:
+    """Run an arbitrary read-only SQL statement against the DB.
+
+    Read-only is enforced by opening a fresh ``mode=ro`` URI connection
+    (DML/DDL surfaces as ``SQLITE_READONLY`` from the engine). A
+    progress-handler-driven wall-clock timeout caps runtime. Output rows
+    are hard-capped at ``max_rows``; agents paginate by writing
+    ``LIMIT N OFFSET M`` (with a stable ``ORDER BY``) in their own SQL.
+
+    ``conn`` is the existing writable handle — used only to pull the
+    DB path if ``db_path`` isn't supplied. The actual execution runs on
+    a separate read-only connection that is opened and closed inside
+    this call.
+
+    Soft-fail statuses (no exception raised):
+
+    - ``multiple_statements`` — input contained more than one terminated
+      SQL statement.
+    - ``read_only_violation`` — engine rejected as not-read-only
+      (DML / DDL / write-pragma).
+    - ``query_timeout`` — exceeded ``timeout_seconds``.
+    - ``query_failed`` — any other engine error (syntax, unknown table,
+      type mismatch, etc.).
+    """
+    n_stmts = _count_statements(sql)
+    if n_stmts > 1:
+        return _query_soft_fail(
+            sql=sql,
+            status="multiple_statements",
+            error=(
+                f"input contains {n_stmts} statements; mode_query accepts "
+                f"exactly one. Drop trailing ';' separators or split into "
+                f"separate calls."
+            ),
+        )
+
+    if db_path is None:
+        # sqlite3.Connection has no public "filename" attribute, but
+        # ``database_list`` returns it for the main schema.
+        row = conn.execute("PRAGMA database_list").fetchone()
+        if row is None or not row[2]:
+            return _query_soft_fail(
+                sql=sql,
+                status="query_failed",
+                error="cannot resolve db path from connection",
+            )
+        db_path = row[2]
+
+    ro = get_readonly_conn(db_path)
+
+    deadline = time.monotonic() + float(timeout_seconds)
+
+    def _on_progress() -> int:
+        return 1 if time.monotonic() >= deadline else 0
+
+    ro.set_progress_handler(_on_progress, _QUERY_PROGRESS_STEPS)
+
+    try:
+        try:
+            cur = ro.execute(sql)
+            rows = cur.fetchmany(max_rows + 1)
+        except sqlite3.OperationalError as exc:
+            return _classify_query_error(sql, exc)
+        except sqlite3.DatabaseError as exc:
+            return _query_soft_fail(
+                sql=sql, status="query_failed", error=str(exc),
+            )
+
+        truncated = len(rows) > max_rows
+        if truncated:
+            rows = rows[:max_rows]
+
+        description = cur.description or ()
+        columns = [c[0] for c in description]
+        serialized = [_serialize_row(description, r) for r in rows]
+    finally:
+        ro.set_progress_handler(None, 0)
+        ro.close()
+
+    return {
+        "mode": "query",
+        "status": "ok",
+        "sql": sql,
+        "columns": columns,
+        "row_count": len(serialized),
+        "truncated": truncated,
+        "rows": serialized,
+    }
+
+
+def _query_soft_fail(
+    *, sql: str, status: str, error: str,
+) -> dict[str, Any]:
+    return {
+        "mode": "query",
+        "status": status,
+        "sql": sql,
+        "error": error,
+    }
+
+
+def _classify_query_error(
+    sql: str, exc: sqlite3.OperationalError,
+) -> dict[str, Any]:
+    """Map an OperationalError raised by the engine onto the right
+    soft-fail bucket. The engine surfaces read-only refusals as
+    ``"attempt to write a readonly database"`` and timeouts (interrupted
+    by the progress handler) as ``"interrupted"``.
+    """
+    msg = str(exc)
+    low = msg.lower()
+    if "readonly" in low or "read-only" in low or "attempt to write" in low:
+        return _query_soft_fail(
+            sql=sql, status="read_only_violation", error=msg,
+        )
+    if "interrupted" in low:
+        return _query_soft_fail(
+            sql=sql, status="query_timeout",
+            error=(
+                f"query exceeded {_QUERY_TIMEOUT_SECONDS:.0f}s wall-clock "
+                f"budget and was interrupted."
+            ),
+        )
+    return _query_soft_fail(sql=sql, status="query_failed", error=msg)
+
+
+# ---------------------------------------------------------------------------
 # Output formatting
 # ---------------------------------------------------------------------------
 
@@ -3278,6 +3603,96 @@ def to_human(payload: dict[str, Any]) -> str:
             lines.append(header)
             lines.append(payload.get("content", ""))
 
+    elif mode == "tables":
+        tables = payload.get("tables") or []
+        lines.append(f"== tables ({len(tables)}) ==")
+        # Group by type (table / virtual / view) for legibility.
+        by_type: dict[str, list[str]] = {}
+        for t in tables:
+            by_type.setdefault(t.get("type", "?"), []).append(t.get("name", "?"))
+        for typ in sorted(by_type):
+            names = sorted(by_type[typ])
+            lines.append(f"  [{typ}] ({len(names)})")
+            for n in names:
+                lines.append(f"    {n}")
+
+    elif mode == "schema":
+        for t in payload.get("tables") or []:
+            lines.append(
+                f"== {t.get('name')} ({t.get('type')}) =="
+            )
+            sql = t.get("sql")
+            if sql:
+                lines.append(sql)
+            cols = t.get("columns") or []
+            if cols:
+                lines.append("  columns:")
+                for c in cols:
+                    bits = [
+                        f"#{c.get('cid')}",
+                        c.get("name", "?"),
+                        c.get("type") or "",
+                    ]
+                    if c.get("notnull"):
+                        bits.append("NOT NULL")
+                    if c.get("pk"):
+                        bits.append(f"PK={c['pk']}")
+                    if c.get("dflt_value") is not None:
+                        bits.append(f"DEFAULT {c['dflt_value']}")
+                    lines.append("    " + " ".join(b for b in bits if b))
+            idx = t.get("indexes") or []
+            if idx:
+                lines.append("  indexes:")
+                for ix in idx:
+                    bits = [ix.get("name", "?")]
+                    if ix.get("unique"):
+                        bits.append("UNIQUE")
+                    bits.append(f"origin={ix.get('origin')}")
+                    if ix.get("partial"):
+                        bits.append("partial")
+                    lines.append("    " + " ".join(bits))
+            lines.append("")
+        missing = payload.get("missing") or []
+        if missing:
+            lines.append(f"== missing ({len(missing)}) ==")
+            for n in missing:
+                lines.append(f"  - {n}")
+
+    elif mode == "query":
+        status = payload.get("status")
+        sql = payload.get("sql", "")
+        if status != "ok":
+            lines.append(f"query {status}: {sql}")
+            err = payload.get("error")
+            if err:
+                lines.append(err)
+        else:
+            cols = payload.get("columns") or []
+            rows = payload.get("rows") or []
+            row_count = int(payload.get("row_count") or 0)
+            truncated = bool(payload.get("truncated"))
+            lines.append(
+                f"== query ({row_count} row{'' if row_count == 1 else 's'}"
+                + (", truncated" if truncated else "")
+                + ") =="
+            )
+            if cols:
+                lines.append("  " + " | ".join(cols))
+            for r in rows:
+                vals: list[str] = []
+                for c in cols:
+                    v = r.get(c)
+                    if isinstance(v, dict) and v.get("_blob"):
+                        vals.append(f"<blob {v.get('size_bytes')} B>")
+                    else:
+                        vals.append("" if v is None else str(v))
+                lines.append("  " + " | ".join(vals))
+            if truncated:
+                lines.append(
+                    f"-- truncated at {row_count} rows; paginate with "
+                    f"LIMIT/OFFSET in your SQL --"
+                )
+
     else:
         lines.append(f"(unknown mode: {mode!r})")
         lines.append(json.dumps(payload, indent=2))
@@ -3442,6 +3857,39 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lines", default=None,
                    help="line range A-B (1-based, inclusive) for --read-code")
 
+    p.add_argument(
+        "--tables", action="store_true",
+        help=(
+            "list every user table / view / virtual table in the DB. "
+            "Pair with --include-internal to also show FTS5 / vec0 "
+            "shadow tables."
+        ),
+    )
+    p.add_argument(
+        "--include-internal", dest="include_internal", action="store_true",
+        help=(
+            "with --tables: also show FTS5 / vec0 shadow tables "
+            "(suffixed _data/_idx/_content/_docsize/_config)."
+        ),
+    )
+    p.add_argument(
+        "--schema", default=None, action="append",
+        help=(
+            "print DDL + columns + indexes for TABLE. Repeat the flag to "
+            "fetch many tables in one call. Names that don't resolve land "
+            "in 'missing' rather than raising."
+        ),
+    )
+    p.add_argument(
+        "--sql", default=None,
+        help=(
+            "run a single read-only SQL statement against the DB. "
+            "Read-only is engine-enforced (mode=ro URI), single-statement "
+            "only, capped at 1000 rows, 5s wall-clock timeout. Paginate "
+            "with LIMIT N OFFSET M + ORDER BY in your own SQL."
+        ),
+    )
+
     p.add_argument("--human", action="store_true",
                    help="emit plaintext instead of JSON")
     p.add_argument("--db", default="lodestone.db", help="sqlite db path")
@@ -3505,6 +3953,12 @@ def _check_mode_conflicts(
         modes.append("--overview")
     if args.collection_name is not None:
         modes.append("--collection-name")
+    if args.tables:
+        modes.append("--tables")
+    if args.schema is not None:
+        modes.append("--schema")
+    if args.sql is not None:
+        modes.append("--sql")
 
     if len(modes) > 1:
         parser.error(
@@ -3529,8 +3983,20 @@ def _check_mode_conflicts(
     if args.lines is not None and not using_read_code:
         parser.error("--lines is only valid with --read-code/--read-code-slug.")
 
+    # --include-internal is a --tables modifier; reject it elsewhere so a
+    # stray flag doesn't get silently dropped.
+    if args.include_internal and not args.tables:
+        parser.error("--include-internal is only valid with --tables.")
+
 
 def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, Any]:
+    if args.tables:
+        return mode_tables(conn, include_internal=args.include_internal)
+    if args.schema is not None:
+        return mode_schema(conn, table_names=list(args.schema))
+    if args.sql is not None:
+        return mode_query(conn, sql=args.sql, db_path=args.db)
+
     # Top-down: overview / collection
     if args.overview:
         return mode_overview(conn, filters={"domain": args.domain})
@@ -3684,6 +4150,10 @@ _SOFT_FAILURE_STATUSES = frozenset({
     "failed_repo",
     "file_not_found",
     "malformed_lines",
+    "multiple_statements",
+    "read_only_violation",
+    "query_timeout",
+    "query_failed",
 })
 
 
