@@ -448,15 +448,16 @@ class TestProtocolValidation:
 
 
 class TestToolsList:
-    def test_tools_list_returns_sixteen_tools(self):
+    def test_tools_list_returns_eighteen_tools(self):
         out = mcp_server._handle_tools_list({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         tools = out["result"]["tools"]
-        assert len(tools) == 16
+        assert len(tools) == 18
         names = {t["name"] for t in tools}
         assert names == {
             "search", "bm25", "lookup", "browse", "overview", "collection",
             "toc", "toc_many", "read", "figure", "repo_tree", "read_code",
             "repo", "tables", "schema", "query",
+            "ingest_paper", "ingest_repo",
         }
         for t in tools:
             assert isinstance(t["description"], str) and t["description"]
@@ -885,7 +886,7 @@ class TestProtocolHandshake:
         list_reply = responses[1]
         assert list_reply["id"] == 2
         tools = list_reply["result"]["tools"]
-        assert len(tools) == 16
+        assert len(tools) == 18
         for t in tools:
             assert t["name"].replace("_", "").isalnum()
 
@@ -1355,4 +1356,155 @@ class TestQueryTool:
         )
         assert "error" in resp
         assert resp["error"]["code"] == -32602
+
+
+# ===========================================================================
+# ingest_paper / ingest_repo — progress notification wiring
+# ===========================================================================
+
+
+class TestIngestProgress:
+    """The ingest tools accept a ``progressToken`` via the standard MCP
+    ``_meta.progressToken`` channel and emit ``notifications/progress``
+    messages between stages. These tests stub the underlying ingest
+    orchestrators so they exercise the dispatch wiring + notification
+    plumbing without touching HF caches or arxiv."""
+
+    def _stub_ingest(self, monkeypatch, *, kind: str, ticks: int):
+        """Replace ``ingest`` (kind='paper') or ``ingest_repo_only`` (kind='repo')
+        with a stub that fires the progress callback ``ticks`` times then
+        returns a fake summary. Returns the captured ``calls`` list so the
+        caller can assert kwargs flowed through."""
+        from _system.scripts import ingest as ingest_mod
+
+        calls: list[dict] = []
+
+        def _fake(**kwargs):
+            calls.append(kwargs)
+            cb = kwargs.get("progress")
+            for i in range(ticks):
+                if cb is not None:
+                    cb(f"step-{i}", i, ticks)
+            if cb is not None:
+                cb("complete", ticks, ticks)
+            return {"kind": kind, "status": "INDEXED" if kind == "paper" else "CLASSIFIED"}
+
+        target = "ingest" if kind == "paper" else "ingest_repo_only"
+        monkeypatch.setattr(ingest_mod, target, _fake)
+
+        # Stub out check_models so we don't touch the HF cache. Patch on
+        # the module the dispatcher imports from.
+        from _system.scripts import validate_models
+        monkeypatch.setattr(validate_models, "check_models", lambda: None)
+        return calls
+
+    def test_ingest_paper_emits_progress(self, fig_db, monkeypatch):
+        sent: list[dict] = []
+        monkeypatch.setattr(mcp_server, "_send", lambda msg: sent.append(msg))
+        calls = self._stub_ingest(monkeypatch, kind="paper", ticks=3)
+
+        state = _make_state(fig_db)
+        resp = mcp_server._handle_tools_call(
+            state,
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "ingest_paper",
+                    "arguments": {"url": "2301.12345"},
+                    "_meta": {"progressToken": "tok-1"},
+                },
+            },
+        )
+
+        assert not _is_error(resp), resp
+        sc = resp["result"]["structuredContent"]
+        assert sc == {"kind": "paper", "status": "INDEXED"}
+
+        # Stub fired 3 staged ticks + a final 'complete' tick. The
+        # dispatcher itself emits one upfront 'checking models' tick. So
+        # 5 progress notifications total.
+        progress_msgs = [
+            m for m in sent if m.get("method") == "notifications/progress"
+        ]
+        assert len(progress_msgs) == 5
+        for m in progress_msgs:
+            assert m["params"]["progressToken"] == "tok-1"
+            assert isinstance(m["params"]["progress"], int)
+            assert isinstance(m["params"]["total"], int)
+            assert isinstance(m["params"]["message"], str)
+
+        # arxiv parsing happened: the underlying ingest got the bare id.
+        assert len(calls) == 1
+        assert calls[0]["arxiv_id"] == "2301.12345"
+        assert calls[0]["force"] is False
+
+    def test_ingest_paper_no_token_no_notifications(self, fig_db, monkeypatch):
+        sent: list[dict] = []
+        monkeypatch.setattr(mcp_server, "_send", lambda msg: sent.append(msg))
+        self._stub_ingest(monkeypatch, kind="paper", ticks=2)
+
+        state = _make_state(fig_db)
+        resp = mcp_server._handle_tools_call(
+            state,
+            {
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "ingest_paper",
+                    "arguments": {"url": "2301.12345"},
+                    # No _meta -> no progressToken -> notifications suppressed.
+                },
+            },
+        )
+        assert not _is_error(resp)
+        progress_msgs = [
+            m for m in sent if m.get("method") == "notifications/progress"
+        ]
+        assert progress_msgs == []
+
+    def test_ingest_repo_dispatch_threads_kwargs(self, fig_db, monkeypatch):
+        sent: list[dict] = []
+        monkeypatch.setattr(mcp_server, "_send", lambda msg: sent.append(msg))
+        calls = self._stub_ingest(monkeypatch, kind="repo", ticks=2)
+
+        state = _make_state(fig_db)
+        resp = mcp_server._handle_tools_call(
+            state,
+            {
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "ingest_repo",
+                    "arguments": {
+                        "url": "https://github.com/foo/bar",
+                        "force": True,
+                        "domain": "agents",
+                    },
+                    "_meta": {"progressToken": "tok-9"},
+                },
+            },
+        )
+        assert not _is_error(resp), resp
+        sc = resp["result"]["structuredContent"]
+        assert sc == {"kind": "repo", "status": "CLASSIFIED"}
+
+        assert len(calls) == 1
+        assert calls[0]["repo_url"] == "https://github.com/foo/bar"
+        assert calls[0]["force"] is True
+        assert calls[0]["domain"] == "agents"
+        # The dispatcher's progress callback must be wired in.
+        assert callable(calls[0]["progress"])
+
+        progress_msgs = [
+            m for m in sent if m.get("method") == "notifications/progress"
+        ]
+        # 1 'checking models' + 2 step ticks + 1 'complete' = 4.
+        assert len(progress_msgs) == 4
+        assert all(
+            m["params"]["progressToken"] == "tok-9" for m in progress_msgs
+        )
 

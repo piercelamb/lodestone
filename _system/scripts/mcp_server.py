@@ -130,6 +130,27 @@ def _send(msg: dict) -> None:
     sys.stdout.flush()
 
 
+def _send_progress(token: Any, message: str, progress: int, total: int) -> None:
+    """Emit one ``notifications/progress`` message keyed off the client's token.
+
+    No-op when ``token`` is None — clients that don't request progress on
+    a tools/call simply receive nothing here, and the eventual result
+    envelope still arrives normally.
+    """
+    if token is None:
+        return
+    _send({
+        "jsonrpc": "2.0",
+        "method": "notifications/progress",
+        "params": {
+            "progressToken": token,
+            "progress": progress,
+            "total": total,
+            "message": message,
+        },
+    })
+
+
 def _log(level: str, s: str) -> None:
     sys.stderr.write(f"[lodestone-mcp][{level}] {s}\n")
     sys.stderr.flush()
@@ -539,6 +560,50 @@ def _schema_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
 
 def _query_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
     return mode_query(conn, sql=args["sql"])
+
+
+def _ingest_paper_dispatch(
+    conn: sqlite3.Connection, args: dict, progress=None,
+) -> dict:
+    # Imports kept local: ingest pulls in HF model validation and the full
+    # pipeline graph, which is dead weight for the read-side tools.
+    from _system.db.migrations import init_db
+    from _system.scripts.ingest import ingest
+    from _system.scripts.validate_models import check_models
+    from _system.utils.arxiv_urls import parse_arxiv_id
+
+    if progress is not None:
+        progress("checking models", 0, 1)
+    check_models()
+    init_db(conn)
+    arxiv_id = parse_arxiv_id(args["url"])
+    return ingest(
+        conn=conn,
+        arxiv_id=arxiv_id,
+        force=bool(args.get("force", False)),
+        domain=args.get("domain"),
+        progress=progress,
+    )
+
+
+def _ingest_repo_dispatch(
+    conn: sqlite3.Connection, args: dict, progress=None,
+) -> dict:
+    from _system.db.migrations import init_db
+    from _system.scripts.ingest import ingest_repo_only
+    from _system.scripts.validate_models import check_models
+
+    if progress is not None:
+        progress("checking models", 0, 1)
+    check_models()
+    init_db(conn)
+    return ingest_repo_only(
+        conn=conn,
+        repo_url=args["url"],
+        force=bool(args.get("force", False)),
+        domain=args.get("domain"),
+        progress=progress,
+    )
 
 
 class AttachMode(StrEnum):
@@ -1120,6 +1185,68 @@ TOOLS: list[dict[str, Any]] = [
         "dispatch": _query_dispatch,
         "attach": AttachMode.NONE,
     },
+    {
+        "name": "ingest_paper",
+        "description": (
+            "Ingest an arXiv paper into the lodestone DB. Runs the full "
+            "pipeline: fetch → convert → classify → extract → index. "
+            "Resumable — re-running on a paper that partially ingested "
+            "picks up at the last completed stage; pass force=true to "
+            "wipe and re-ingest from scratch (preserves global taxonomy). "
+            "Emits MCP progress notifications between stages so the client "
+            "can render a progress bar; total ticks = number of stages "
+            "remaining for this run. If the paper ships a code repo URL, "
+            "the linked repo is registered and cloned as a follow-up "
+            "after the 'complete' tick (no progress events for that step)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": (
+                        "arXiv URL or bare ID (version suffix preserved "
+                        "verbatim — '2301.12345v1' and '2301.12345v2' "
+                        "are different rows)."
+                    ),
+                },
+                "force": {"type": "boolean", "default": False},
+                "domain": {
+                    "type": "string",
+                    "description": "Optional: override the classifier's domain choice.",
+                },
+            },
+            "required": ["url"],
+        },
+        "dispatch": _ingest_paper_dispatch,
+        "attach": AttachMode.NONE,
+        "accepts_progress": True,
+    },
+    {
+        "name": "ingest_repo",
+        "description": (
+            "Ingest a standalone code repo into the lodestone DB. Runs "
+            "resolve → fetch → classify. Use this for repos with no "
+            "associated paper; for paper-linked repos, ingest the paper "
+            "via 'ingest_paper' (the repo follow-up runs automatically). "
+            "Emits MCP progress notifications between stages."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "github/gitlab/bitbucket URL",
+                },
+                "force": {"type": "boolean", "default": False},
+                "domain": {"type": "string"},
+            },
+            "required": ["url"],
+        },
+        "dispatch": _ingest_repo_dispatch,
+        "attach": AttachMode.NONE,
+        "accepts_progress": True,
+    },
 ]
 
 
@@ -1254,8 +1381,16 @@ def _handle_tools_call(state: _ServerState, msg: dict) -> dict:
             f"{state.startup_error or 'sqlite connection unavailable'}",
         )
 
+    meta = params.get("_meta") or {}
+    progress_token = meta.get("progressToken")
+
     try:
-        payload = tool["dispatch"](state.conn, args)
+        if tool.get("accepts_progress"):
+            def _progress_cb(message: str, p: int, total: int) -> None:
+                _send_progress(progress_token, message, p, total)
+            payload = tool["dispatch"](state.conn, args, _progress_cb)
+        else:
+            payload = tool["dispatch"](state.conn, args)
     except KeyError as exc:
         # Missing required arg surfaces as KeyError from the dispatcher's
         # ``args[...]`` lookups — translate to InvalidParams at the
