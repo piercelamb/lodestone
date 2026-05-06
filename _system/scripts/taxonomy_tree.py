@@ -93,11 +93,11 @@ def load_taxonomy(
         coll_rows = conn.execute(
             """
             SELECT c.domain, c.name, c.description,
-                   COUNT(DISTINCT p.id) AS paper_count,
+                   COUNT(DISTINCT pc.paper_id) AS paper_count,
                    COUNT(DISTINCT r.id) AS repo_count
               FROM collections c
-              LEFT JOIN papers p
-                ON p.domain = c.domain AND p.collection = c.name
+              LEFT JOIN paper_collections pc
+                ON pc.domain = c.domain AND pc.collection = c.name
               LEFT JOIN repos r
                 ON r.domain = c.domain
                AND r.collection = c.name
@@ -111,11 +111,11 @@ def load_taxonomy(
         coll_rows = conn.execute(
             """
             SELECT c.domain, c.name, c.description,
-                   COUNT(DISTINCT p.id) AS paper_count,
+                   COUNT(DISTINCT pc.paper_id) AS paper_count,
                    COUNT(DISTINCT r.id) AS repo_count
               FROM collections c
-              LEFT JOIN papers p
-                ON p.domain = c.domain AND p.collection = c.name
+              LEFT JOIN paper_collections pc
+                ON pc.domain = c.domain AND pc.collection = c.name
               LEFT JOIN repos r
                 ON r.domain = c.domain
                AND r.collection = c.name

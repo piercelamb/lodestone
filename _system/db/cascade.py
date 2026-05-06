@@ -54,6 +54,9 @@ def delete_paper_cascade(conn: sqlite3.Connection, *, paper_id: int) -> None:
         (paper_id,),
     )
     conn.execute(
+        "DELETE FROM paper_collections WHERE paper_id = ?", (paper_id,)
+    )
+    conn.execute(
         "DELETE FROM topics WHERE target_kind = ? AND target_id = ?",
         (TopicTarget.PAPER.value, paper_id),
     )

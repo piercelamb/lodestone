@@ -53,7 +53,7 @@ def _seed_paper(
     arxiv_id: str | None = None,
 ) -> None:
     aid = arxiv_id or f"arxiv-{paper_name}"
-    conn.execute(
+    cur = conn.execute(
         """
         INSERT INTO papers (
             arxiv_id, paper_name, title, authors, date, abstract,
@@ -68,6 +68,12 @@ def _seed_paper(
             domain, collection, 0,
         ),
     )
+    if domain is not None and collection is not None:
+        conn.execute(
+            "INSERT OR IGNORE INTO paper_collections "
+            " (paper_id, domain, collection, is_primary) VALUES (?, ?, ?, 1)",
+            (cur.lastrowid, domain, collection),
+        )
 
 
 # ---------------------------------------------------------------------------

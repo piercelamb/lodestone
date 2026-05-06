@@ -2,8 +2,12 @@
   "domain_index": 0,
   "new_domain": "",
   "new_domain_desc": "",
-  "collection_index": -1,
-  "new_collection": "hierarchical indexing",
-  "new_collection_desc": "Retrieval methods that build tree- or hierarchy-shaped indices to summarize long documents.",
+  "collections": [
+    {
+      "index": -1,
+      "new_name": "hierarchical indexing",
+      "new_desc": "Retrieval methods that build tree- or hierarchy-shaped indices to summarize long documents."
+    }
+  ],
   "topics": ["tree retrieval", "long-context qa"]
 }

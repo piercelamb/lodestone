@@ -11,6 +11,7 @@ from _system.db.migrations import init_db
 EXPECTED_TABLES = {
     "domains",
     "collections",
+    "paper_collections",
     "papers",
     "repos",
     "figures",
@@ -44,7 +45,7 @@ def _user_tables(conn: sqlite3.Connection) -> set[str]:
 
 # Plain (non-virtual) tables — support row-count queries directly.
 _PLAIN_TABLES = {
-    "domains", "collections", "papers", "repos", "figures",
+    "domains", "collections", "paper_collections", "papers", "repos", "figures",
     "paper_references",
     "canonical_terms", "term_aliases", "topics",
     "code_files",
@@ -366,6 +367,85 @@ def test_init_db_backfills_collections_from_legacy_papers(conn):
     ).fetchone()
     assert row is not None
     assert row[2] is None  # legacy rows land with NULL description
+
+
+def test_init_db_backfills_paper_collections_from_legacy_papers(conn):
+    """Papers predating the `paper_collections` join table must be
+    promoted by `init_db`'s one-shot backfill into a primary row.
+
+    Idempotent: re-running `init_db` is a no-op against the PK
+    ``(paper_id, collection)``.
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO domains (name) VALUES (?)", ("rag",)
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (domain, name) VALUES (?, ?)",
+        ("rag", "hierarchical indexing"),
+    )
+    conn.execute(
+        "INSERT INTO papers (arxiv_id, paper_name, title, authors, date, abstract, "
+        "domain, collection, content_hash, pdf_url, ingested_at, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("2401.11111", "legacy_paper", "t", "[]", "2026-04-20", "a",
+         "rag", "hierarchical indexing", "h", "http://x",
+         "2026-04-20T00:00:00", "classified"),
+    )
+    # Drop any backfilled row the conn fixture / prior init_db may have
+    # created so we observe init_db re-creating it.
+    conn.execute("DELETE FROM paper_collections")
+
+    init_db(conn)
+
+    rows = conn.execute(
+        "SELECT domain, collection, is_primary FROM paper_collections "
+        " WHERE paper_id = (SELECT id FROM papers WHERE paper_name = ?)",
+        ("legacy_paper",),
+    ).fetchall()
+    assert rows == [("rag", "hierarchical indexing", 1)]
+
+    # Idempotent — second init_db run does not duplicate.
+    init_db(conn)
+    rows2 = conn.execute(
+        "SELECT COUNT(*) FROM paper_collections "
+        " WHERE paper_id = (SELECT id FROM papers WHERE paper_name = ?)",
+        ("legacy_paper",),
+    ).fetchone()
+    assert rows2[0] == 1
+
+
+def test_paper_collections_intra_domain_trigger_blocks_mismatch(conn):
+    """Inserting a paper_collections row whose `domain` doesn't match the
+    parent paper's `papers.domain` must raise on the trigger."""
+    init_db(conn)
+    conn.execute("INSERT OR IGNORE INTO domains (name) VALUES (?)", ("rag",))
+    conn.execute("INSERT OR IGNORE INTO domains (name) VALUES (?)", ("nlp",))
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (domain, name) VALUES (?, ?)",
+        ("nlp", "transformers"),
+    )
+    conn.execute(
+        "INSERT INTO papers (arxiv_id, paper_name, title, authors, date, abstract, "
+        " domain, collection, content_hash, pdf_url, ingested_at, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("2402.99001", "p_intra", "t", "[]", "2026-01-01", "a",
+         "rag", "hybrid search", "h", "http://x", "2026-01-01T00:00:00", "fetched"),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (domain, name) VALUES (?, ?)",
+        ("rag", "hybrid search"),
+    )
+    paper_id = conn.execute(
+        "SELECT id FROM papers WHERE paper_name = 'p_intra'"
+    ).fetchone()[0]
+
+    with pytest.raises(sqlite3.IntegrityError) as exc_info:
+        conn.execute(
+            "INSERT INTO paper_collections (paper_id, domain, collection, is_primary) "
+            "VALUES (?, ?, ?, 1)",
+            (paper_id, "nlp", "transformers"),
+        )
+    assert "intra_domain" in str(exc_info.value) or "domain must match" in str(exc_info.value)
 
 
 def test_init_db_drops_legacy_abstracts_fts5(tmp_path):

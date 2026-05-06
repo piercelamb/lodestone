@@ -12,21 +12,26 @@ responseSchema) so the LLM cannot return malformed JSON.
 Prompt assets live at ``_system/llm/prompts/classify_paper/``:
 ``system.md``, ``user.md`` (with ``{EXISTING_TAXONOMY}`` /
 ``{PAPER_CONTENT}`` placeholders), and ``response.json`` (schema with
-a ``DOMAIN_INDEX_ENUM`` runtime-replaced sentinel for the index-replace
-pattern).
+``DOMAIN_INDEX_ENUM`` / ``COLLECTION_INDEX_ENUM`` runtime-replaced
+sentinels for the index-replace pattern).
 
 Domain selection uses *index-replace*: the LLM picks an integer index
 into the runtime-supplied ``existing_domains`` list (or ``-1`` to
 propose a new one). This is cheaper than regenerating a free-form
 string, eliminates typos, and stays strict-mode compatible with all
-three providers' structured-output modes. Collection and topics remain
-free strings — they depend on the chosen domain / are unbounded, so the
-5-tier term resolver still canonicalizes them.
+three providers' structured-output modes. Collections use the same
+index-replace pattern but per-entry inside an ordered list — index 0 is
+the paper's PRIMARY collection, indices 1+ are SECONDARY memberships
+within the same domain (max 4 total). Topics remain free strings —
+they're unbounded so the 5-tier term resolver still canonicalizes them.
 
-On success we resolve ``collection`` and every ``topic`` through the
+On success we resolve every collection and every ``topic`` through the
 shared 5-tier term resolver (Section 4) and write the canonical names.
-On a proposed new domain we sanitize the name and auto-insert it with
-``needs_review=1`` on the *paper* row.
+The denormalized ``papers.collection`` scalar always points at the
+primary collection; the full set lives in ``paper_collections``. On a
+proposed new domain we sanitize the name and auto-insert it with
+``needs_review=1``; ``needs_review`` is also set when any picked
+collection is new.
 """
 from __future__ import annotations
 
@@ -43,7 +48,11 @@ from _system.resolution.embeddings import Embedder
 from _system.resolution.resolver import pending_fts_rebuilds, resolve
 from _system.schemas.paper_metadata import PaperStatus, can_run_from
 from _system.schemas.repo_metadata import TopicTarget
-from _system.schemas.taxonomy import ClassificationLLMOutput, ClassificationOutput
+from _system.schemas.taxonomy import (
+    ClassificationLLMOutput,
+    ClassificationOutput,
+    ResolvedCollection,
+)
 from _system.scripts.taxonomy_tree import (
     DomainNode,
     TaxonomyTreeStyle,
@@ -90,7 +99,7 @@ class ClassifyPaperNotFound(ClassifyError):
 class ClassifyResult(NamedTuple):
     paper_name: str
     domain: str
-    collection: str
+    collections: tuple[str, ...]
     topics: tuple[str, ...]
     needs_review: bool
     status: str
@@ -234,32 +243,86 @@ def classify(
         # topic canonicals.
         touched_term_ids: set[int] = set()
 
-        collection_hit = resolve(
-            conn,
-            output.collection,
-            domain=decision.name,
-            term_type="collection",
-            source_paper=paper_name,
-            embedder=embedder,
-        )
-        touched_term_ids.add(collection_hit.term_id)
+        resolved: list[ResolvedCollection] = []
+        seen_raw_names: set[str] = set()
+        seen_canonicals: set[str] = set()
+        for i, pick in enumerate(output.collections):
+            raw_key = pick.name.casefold()
+            if raw_key in seen_raw_names:
+                continue
+            seen_raw_names.add(raw_key)
 
-        # Register the (domain, collection) pair in the first-class table.
-        # INSERT OR IGNORE is a no-op when the resolver canonicalized to an
-        # already-registered collection; in that case we keep the existing
-        # description rather than overwriting with whatever the LLM wrote
-        # for a name it thought was novel. A genuinely new collection
-        # lands with the LLM's description attached.
+            coll_hit = resolve(
+                conn,
+                pick.name,
+                domain=decision.name,
+                term_type="collection",
+                source_paper=paper_name,
+                embedder=embedder,
+            )
+            touched_term_ids.add(coll_hit.term_id)
+
+            if coll_hit.canonical_name in seen_canonicals:
+                _LOG.warning(
+                    "classify paper_name=%s: collection pick #%d (%r) "
+                    "canonicalized to %r — already present; dropping",
+                    paper_name, i, pick.name, coll_hit.canonical_name,
+                )
+                continue
+            seen_canonicals.add(coll_hit.canonical_name)
+
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO collections (domain, name, description)
+                VALUES (?, ?, ?)
+                """,
+                (decision.name, coll_hit.canonical_name, pick.description),
+            )
+            resolved.append(
+                ResolvedCollection(
+                    name=coll_hit.canonical_name,
+                    description=pick.description,
+                )
+            )
+
+        primary_name = resolved[0].name
+        any_new_collection = any(r.description is not None for r in resolved)
+
+        # papers UPDATE runs before paper_collections writes so the
+        # papers-invariant trigger sees a non-NULL collection in the
+        # same transaction, and so the paper_collections intra-domain
+        # trigger reads the new papers.domain.
         conn.execute(
             """
-            INSERT OR IGNORE INTO collections (domain, name, description)
-            VALUES (?, ?, ?)
+            UPDATE papers
+               SET domain = ?,
+                   collection = ?,
+                   needs_review = ?,
+                   status = ?
+             WHERE id = ?
             """,
             (
                 decision.name,
-                collection_hit.canonical_name,
-                output.collection_description,
+                primary_name,
+                int(decision.paper_needs_review or any_new_collection),
+                PaperStatus.CLASSIFIED.value,
+                paper_id,
             ),
+        )
+
+        conn.execute(
+            "DELETE FROM paper_collections WHERE paper_id = ?", (paper_id,)
+        )
+        conn.executemany(
+            """
+            INSERT INTO paper_collections
+                (paper_id, domain, collection, is_primary)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                (paper_id, decision.name, r.name, int(i == 0))
+                for i, r in enumerate(resolved)
+            ],
         )
 
         seen_term_ids: set[int] = set()
@@ -289,24 +352,6 @@ def classify(
             )
             inserted_topic_names.append(topic_hit.canonical_name)
 
-        conn.execute(
-            """
-            UPDATE papers
-               SET domain = ?,
-                   collection = ?,
-                   needs_review = ?,
-                   status = ?
-             WHERE id = ?
-            """,
-            (
-                decision.name,
-                collection_hit.canonical_name,
-                int(decision.paper_needs_review),
-                PaperStatus.CLASSIFIED.value,
-                paper_id,
-            ),
-        )
-
         pending_fts_rebuilds(conn).update(touched_term_ids)
 
         # Re-classify deletes the paper's topics rows up front and
@@ -318,19 +363,20 @@ def classify(
         # survive even if the paper moves off — only humans delete them.
         gc_orphan_topic_canonicals(conn)
 
+    needs_review = bool(decision.paper_needs_review or any_new_collection)
     _LOG.info(
-        "classified paper_id=%s paper_name=%s domain=%s collection=%s "
-        "topics=%d needs_review=%s",
-        paper_id, paper_name, decision.name, collection_hit.canonical_name,
-        len(inserted_topic_names), decision.paper_needs_review,
+        "classified paper_id=%s paper_name=%s domain=%s primary=%s "
+        "secondaries=%d topics=%d needs_review=%s",
+        paper_id, paper_name, decision.name, primary_name,
+        len(resolved) - 1, len(inserted_topic_names), needs_review,
     )
 
     return ClassifyResult(
         paper_name=paper_name,
         domain=decision.name,
-        collection=collection_hit.canonical_name,
+        collections=tuple(r.name for r in resolved),
         topics=tuple(inserted_topic_names),
-        needs_review=decision.paper_needs_review,
+        needs_review=needs_review,
         status=PaperStatus.CLASSIFIED.value,
     )
 
@@ -369,8 +415,10 @@ def _resolve_raw(
     """Translate the index-based LLM output to a name-based pipeline shape.
 
     Domain: ``-1`` → propose new; ``0..N-1`` → existing.
-    Collection: ``-1`` → propose new; ``0..M-1`` → lookup in the truncated
-    collection list for the chosen domain.
+    Collections: list of picks. Each pick uses ``-1`` to propose a new
+    collection name + description, or an index ``0..M-1`` into the
+    chosen domain's collection list. Index 0 of the *list* is always the
+    PRIMARY collection.
 
     Cross-field rules the schema enum cannot express are enforced here:
 
@@ -378,11 +426,13 @@ def _resolve_raw(
     - domain_index == -1 but new_domain_desc empty → raise
     - domain_index >= 0 but new_domain_desc non-empty → raise
       (LLM is writing a description for a domain it didn't propose)
-    - collection_index >= 0 while domain_index == -1 (new domain has no
-      existing collections) → raise
-    - collection_index >= 0 but out of range for the chosen domain's
-      collections → raise
-    - collection_index == -1 but new_collection empty → raise
+    - len(collections) == 0 → raise (schema enforces minItems: 1, but
+      we double-check for resilience against schema regressions)
+    - per pick: index out of ``[-1, M-1]`` for the chosen domain → raise
+    - per pick: index == -1 with empty new_name or new_desc → raise
+    - per pick: index >= 0 with non-empty new_name or new_desc → raise
+    - any pick.index >= 0 while domain_index == -1 → raise (new domain
+      has no existing collections)
     """
     if raw.domain_index == -1:
         domain_name = raw.new_domain
@@ -414,59 +464,81 @@ def _resolve_raw(
             f"to make this impossible"
         )
 
-    if raw.collection_index == -1:
-        proposed = raw.new_collection.strip()
-        if not proposed:
-            raise ClassifyLLMError(
-                "LLM returned collection_index=-1 but "
-                "new_collection is empty"
-            )
-        collection_name = proposed
-        collection_description: str | None = (
-            raw.new_collection_desc.strip()
-        )
-        if not collection_description:
-            raise ClassifyLLMError(
-                "LLM returned collection_index=-1 but "
-                "new_collection_desc is empty; new "
-                "collections must include a one-sentence description"
-            )
-    elif raw.collection_index >= 0:
-        if domain_is_new or domain_node is None:
-            raise ClassifyLLMError(
-                f"LLM proposed new domain={domain_name!r} but set "
-                f"collection_index={raw.collection_index}; new domains have "
-                f"no existing collections — collection_index must be -1"
-            )
-        domain_colls = domain_node.collections
-        if raw.collection_index >= len(domain_colls):
-            raise ClassifyLLMError(
-                f"LLM returned collection_index={raw.collection_index} "
-                f"for domain={domain_name!r}, which has "
-                f"{len(domain_colls)} collection(s) — index out of range"
-            )
-        collection_name = domain_colls[raw.collection_index].name
-        if raw.new_collection_desc.strip():
-            raise ClassifyLLMError(
-                f"LLM picked existing collection_index={raw.collection_index} "
-                f"but also set new_collection_desc="
-                f"{raw.new_collection_desc!r}; description "
-                f"must be empty unless collection_index == -1"
-            )
-        collection_description = None
-    else:
+    if not raw.collections:
         raise ClassifyLLMError(
-            f"LLM returned collection_index={raw.collection_index} outside "
-            f"[-1, max); schema enum was supposed to make this impossible"
+            "LLM returned an empty collections list; schema minItems was "
+            "supposed to make this impossible"
         )
+
+    resolved_picks = [
+        _resolve_pick(pick, i, domain_name, domain_is_new, domain_node)
+        for i, pick in enumerate(raw.collections)
+    ]
 
     return ClassificationOutput(
         domain=domain_name,
         domain_is_new=domain_is_new,
         domain_description=domain_description,
-        collection=collection_name,
-        collection_description=collection_description,
+        collections=resolved_picks,
         topics=raw.topics,
+    )
+
+
+def _resolve_pick(
+    pick,
+    i: int,
+    domain_name: str,
+    domain_is_new: bool,
+    domain_node: DomainNode | None,
+) -> ResolvedCollection:
+    """Validate one CollectionPick and return its ResolvedCollection.
+
+    Schema enum already constrains ``pick.index`` to ``[-1, M-1]``, so
+    the only out-of-range case left to enforce here is ``index >= len``
+    for the *chosen* domain (which the cross-domain enum cannot express).
+    """
+    if pick.index == -1:
+        proposed = pick.new_name.strip()
+        if not proposed:
+            raise ClassifyLLMError(
+                f"LLM collection pick #{i} has index=-1 but new_name is empty"
+            )
+        description = pick.new_desc.strip()
+        if not description:
+            raise ClassifyLLMError(
+                f"LLM collection pick #{i} has index=-1 but new_desc is "
+                f"empty; new collections must include a one-sentence description"
+            )
+        return ResolvedCollection(name=proposed, description=description)
+
+    if domain_is_new or domain_node is None:
+        raise ClassifyLLMError(
+            f"LLM proposed new domain={domain_name!r} but pick #{i} has "
+            f"index={pick.index}; new domains have no existing collections "
+            f"— every pick's index must be -1"
+        )
+    domain_colls = domain_node.collections
+    if pick.index >= len(domain_colls):
+        raise ClassifyLLMError(
+            f"LLM collection pick #{i} has index={pick.index} for "
+            f"domain={domain_name!r}, which has {len(domain_colls)} "
+            f"collection(s) — index out of range"
+        )
+    if pick.new_name.strip():
+        raise ClassifyLLMError(
+            f"LLM collection pick #{i} picked existing index={pick.index} "
+            f"but also set new_name={pick.new_name!r}; new_name must be "
+            f"empty when index >= 0"
+        )
+    if pick.new_desc.strip():
+        raise ClassifyLLMError(
+            f"LLM collection pick #{i} picked existing index={pick.index} "
+            f"but also set new_desc={pick.new_desc!r}; new_desc must be "
+            f"empty when index >= 0"
+        )
+    return ResolvedCollection(
+        name=domain_colls[pick.index].name,
+        description=None,
     )
 
 

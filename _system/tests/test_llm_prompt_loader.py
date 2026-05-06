@@ -161,7 +161,12 @@ def test_real_classify_paper_assets_load_with_documented_context():
     assert loaded.schema["name"] == "classify_paper"
     props = loaded.schema["schema"]["properties"]
     assert props["domain_index"]["enum"] == [-1, 0]
-    assert props["collection_index"]["enum"] == [-1, 0]
+    # COLLECTION_INDEX_ENUM is replaced inside the per-pick `index` field
+    # of the `collections` array.
+    assert (
+        props["collections"]["items"]["properties"]["index"]["enum"]
+        == [-1, 0]
+    )
 
 
 def test_real_classify_paper_user_asset_has_documented_placeholders():
@@ -179,9 +184,7 @@ def test_real_classify_paper_response_json_has_documented_shape():
         "domain_index",
         "new_domain",
         "new_domain_desc",
-        "collection_index",
-        "new_collection",
-        "new_collection_desc",
+        "collections",
         "topics",
     }
     assert parsed["schema"]["additionalProperties"] is False
@@ -189,10 +192,20 @@ def test_real_classify_paper_response_json_has_documented_shape():
         "domain_index",
         "new_domain",
         "new_domain_desc",
-        "collection_index",
-        "new_collection",
-        "new_collection_desc",
+        "collections",
         "topics",
     ]
     assert props["domain_index"]["enum"] == "DOMAIN_INDEX_ENUM"
-    assert props["collection_index"]["enum"] == "COLLECTION_INDEX_ENUM"
+
+    # `collections` is an array of {index, new_name, new_desc} objects;
+    # COLLECTION_INDEX_ENUM lives on the per-item `index` field.
+    coll = props["collections"]
+    assert coll["type"] == "array"
+    assert coll["minItems"] == 1
+    assert coll["maxItems"] == 4
+    item = coll["items"]
+    assert item["type"] == "object"
+    assert item["additionalProperties"] is False
+    assert set(item["properties"].keys()) == {"index", "new_name", "new_desc"}
+    assert item["properties"]["index"]["enum"] == "COLLECTION_INDEX_ENUM"
+    assert item["required"] == ["index", "new_name", "new_desc"]
