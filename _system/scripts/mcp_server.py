@@ -484,6 +484,8 @@ def _browse_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
         filters["entity_type"] = args["entity_type"]
     if args.get("aliases_term"):
         filters["aliases_term"] = args["aliases_term"]
+    if args.get("collection"):
+        filters["collection"] = args["collection"]
     return mode_browse(conn, which=which, filters=filters)
 
 
@@ -822,7 +824,10 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "List taxonomy/paper rollups: collections, topics, entities of "
             "a given type, aliases of a canonical name, or papers flagged "
-            "for review."
+            "for review. For which='topics', pass 'collection' to scope the "
+            "topic rollup to one collection (papers via paper_collections, "
+            "repos via repos.collection); pass 'domain' to disambiguate "
+            "collection names that exist in multiple domains."
         ),
         "inputSchema": {
             "type": "object",
@@ -842,6 +847,13 @@ TOOLS: list[dict[str, Any]] = [
                 "aliases_term": {
                     "type": "string",
                     "description": "required when which='aliases'",
+                },
+                "collection": {
+                    "type": "string",
+                    "description": (
+                        "optional when which='topics': scope the topic "
+                        "rollup to one collection"
+                    ),
                 },
             },
             "required": ["which"],

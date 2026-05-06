@@ -1716,19 +1716,60 @@ def mode_browse(
         }
 
     if view is BrowseView.TOPICS:
+        collection = filters.get("collection")
         # Aggregate paper + repo bindings — both kinds count.
-        sql = (
-            "SELECT topic, "
-            "       COUNT(*) AS n, "
-            "       SUM(CASE WHEN target_kind='paper' THEN 1 ELSE 0 END) AS paper_n, "
-            "       SUM(CASE WHEN target_kind='repo'  THEN 1 ELSE 0 END) AS repo_n "
-            "  FROM topics "
-        )
-        params = []
-        if domain:
-            sql += " WHERE domain = ? "
-            params.append(domain)
-        sql += " GROUP BY topic ORDER BY n DESC, topic"
+        if collection:
+            # Scope to one collection: papers join via paper_collections
+            # (multi-collection), repos via the scalar repos.collection.
+            # `domain` disambiguates collection names that exist in
+            # multiple domains.
+            paper_clauses = ["pc.collection = ?"]
+            paper_params: list[Any] = [collection]
+            repo_clauses = ["r.collection = ?"]
+            repo_params: list[Any] = [collection]
+            if domain:
+                paper_clauses.append("pc.domain = ?")
+                paper_params.append(domain)
+                repo_clauses.append("r.domain = ?")
+                repo_params.append(domain)
+            sql = (
+                "WITH bindings AS ( "
+                "  SELECT t.topic, t.target_kind "
+                "    FROM topics t "
+                "    JOIN paper_collections pc "
+                "      ON t.target_kind = 'paper' "
+                "     AND t.target_id = pc.paper_id "
+                f"    WHERE {' AND '.join(paper_clauses)} "
+                "  UNION ALL "
+                "  SELECT t.topic, t.target_kind "
+                "    FROM topics t "
+                "    JOIN repos r "
+                "      ON t.target_kind = 'repo' "
+                "     AND t.target_id = r.id "
+                f"    WHERE {' AND '.join(repo_clauses)} "
+                ") "
+                "SELECT topic, "
+                "       COUNT(*) AS n, "
+                "       SUM(CASE WHEN target_kind='paper' THEN 1 ELSE 0 END) AS paper_n, "
+                "       SUM(CASE WHEN target_kind='repo'  THEN 1 ELSE 0 END) AS repo_n "
+                "  FROM bindings "
+                " GROUP BY topic "
+                " ORDER BY n DESC, topic"
+            )
+            params = paper_params + repo_params
+        else:
+            sql = (
+                "SELECT topic, "
+                "       COUNT(*) AS n, "
+                "       SUM(CASE WHEN target_kind='paper' THEN 1 ELSE 0 END) AS paper_n, "
+                "       SUM(CASE WHEN target_kind='repo'  THEN 1 ELSE 0 END) AS repo_n "
+                "  FROM topics "
+            )
+            params = []
+            if domain:
+                sql += " WHERE domain = ? "
+                params.append(domain)
+            sql += " GROUP BY topic ORDER BY n DESC, topic"
         rows = conn.execute(sql, params).fetchall()
         return {
             "mode": view,
@@ -3735,6 +3776,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--domain", default=None, help="filter by papers.domain")
     p.add_argument("--collection", default=None,
                    help="collection name — filter when QUERY is set, "
+                        "topic-scope when --topics is set, "
                         "otherwise Mode 2 lookup term")
     p.add_argument(
         "--limit", type=int, default=None,
@@ -3933,7 +3975,11 @@ def _check_mode_conflicts(
         modes.append("--entity")
     if args.topic is not None:
         modes.append("--topic")
-    if args.collection is not None and args.query is None:
+    if (
+        args.collection is not None
+        and args.query is None
+        and not args.topics
+    ):
         modes.append("--collection (lookup)")
     # Mode 3 browse flags
     if args.collections:
@@ -4066,7 +4112,10 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
     if args.collections:
         return mode_browse(conn, which=BrowseView.COLLECTIONS, filters=domain_filter)
     if args.topics:
-        return mode_browse(conn, which=BrowseView.TOPICS, filters=domain_filter)
+        topics_filters: dict[str, Any] = {**domain_filter}
+        if args.collection is not None:
+            topics_filters["collection"] = args.collection
+        return mode_browse(conn, which=BrowseView.TOPICS, filters=topics_filters)
     if args.entity_type:
         return mode_browse(
             conn,

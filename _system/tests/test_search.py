@@ -1972,6 +1972,160 @@ class TestModeBrowse:
         names = [row["topic"] for row in r["results"]]
         assert "entity resolution" in names
 
+    def test_topics_by_collection_includes_papers_and_repos(self, seeded_db):
+        # A second paper in the SAME collection contributes its topic.
+        p_same_id = _insert_paper(
+            seeded_db,
+            arxiv_id="2403.00003",
+            paper_name="hier_followup_2024",
+            title="Hierarchical Indexing Follow-up",
+            abstract="More on hierarchical indexing.",
+            markdown=None,
+            domain="rag",
+            collection="hierarchical indexing",
+            needs_review=0,
+            ingested_at="2024-03-01T00:00:00+00:00",
+        )
+        _insert_paper_topic(
+            seeded_db,
+            paper_id=p_same_id,
+            domain="rag",
+            topic="tree summarization",
+        )
+        # A paper in a DIFFERENT collection in the same domain MUST be
+        # excluded — its topic should not appear in the rollup.
+        p_other_id = _insert_paper(
+            seeded_db,
+            arxiv_id="2404.00004",
+            paper_name="dense_retrieval_2024",
+            title="Dense Retrieval",
+            abstract="Dense retrieval approaches.",
+            markdown=None,
+            domain="rag",
+            collection="dense retrieval",
+            needs_review=0,
+            ingested_at="2024-04-01T00:00:00+00:00",
+        )
+        _insert_paper_topic(
+            seeded_db,
+            paper_id=p_other_id,
+            domain="rag",
+            topic="dense embeddings",
+        )
+        # A repo in the target collection contributes via the scalar
+        # repos.collection column.
+        seeded_db.execute(
+            "INSERT INTO repos (repo_slug, url, host, owner, name, "
+            "  ingested_at, status, domain, collection) "
+            "VALUES ('owner-hier', 'https://github.com/owner/hier', "
+            "  'github.com', 'owner', 'hier', "
+            "  '2024-05-01T00:00:00+00:00', 'classified', "
+            "  'rag', 'hierarchical indexing')"
+        )
+        repo_id = seeded_db.execute(
+            "SELECT id FROM repos WHERE repo_slug = 'owner-hier'"
+        ).fetchone()[0]
+        seeded_db.execute(
+            "INSERT INTO topics (target_kind, target_id, domain, topic) "
+            "VALUES ('repo', ?, 'rag', 'tree retrieval')",
+            (repo_id,),
+        )
+        # A repo in a DIFFERENT collection MUST be excluded.
+        seeded_db.execute(
+            "INSERT INTO repos (repo_slug, url, host, owner, name, "
+            "  ingested_at, status, domain, collection) "
+            "VALUES ('owner-dense', 'https://github.com/owner/dense', "
+            "  'github.com', 'owner', 'dense', "
+            "  '2024-05-02T00:00:00+00:00', 'classified', "
+            "  'rag', 'dense retrieval')"
+        )
+        other_repo_id = seeded_db.execute(
+            "SELECT id FROM repos WHERE repo_slug = 'owner-dense'"
+        ).fetchone()[0]
+        seeded_db.execute(
+            "INSERT INTO topics (target_kind, target_id, domain, topic) "
+            "VALUES ('repo', ?, 'rag', 'dense embeddings')",
+            (other_repo_id,),
+        )
+
+        r = search_mod.mode_browse(
+            seeded_db,
+            which="topics",
+            filters={"collection": "hierarchical indexing"},
+        )
+        assert r["mode"] == "topics"
+        rows_by_topic = {row["topic"]: row for row in r["results"]}
+        # Included: paper topic from p1, paper topic from the in-collection
+        # follow-up, and the repo topic.
+        assert "entity resolution" in rows_by_topic
+        assert "tree summarization" in rows_by_topic
+        assert "tree retrieval" in rows_by_topic
+        # Excluded: topics whose only sources sit in other collections.
+        assert "dense embeddings" not in rows_by_topic
+        # Per-kind counts split the union correctly.
+        assert rows_by_topic["entity resolution"]["paper_count"] == 1
+        assert rows_by_topic["entity resolution"]["repo_count"] == 0
+        assert rows_by_topic["tree retrieval"]["paper_count"] == 0
+        assert rows_by_topic["tree retrieval"]["repo_count"] == 1
+
+    def test_topics_by_collection_disambiguates_with_domain(self, seeded_db):
+        # Re-use the existing collection name "misc" (only registered under
+        # the 'other' domain by the fixture) and also create it under 'rag'.
+        seeded_db.execute(
+            "INSERT OR IGNORE INTO collections (domain, name, description) "
+            "VALUES ('rag', 'misc', NULL)"
+        )
+        rag_misc_id = _insert_paper(
+            seeded_db,
+            arxiv_id="2405.00005",
+            paper_name="rag_misc_2024",
+            title="RAG Miscellany",
+            abstract="A grab bag.",
+            markdown=None,
+            domain="rag",
+            collection="misc",
+            needs_review=0,
+            ingested_at="2024-05-03T00:00:00+00:00",
+        )
+        _insert_paper_topic(
+            seeded_db,
+            paper_id=rag_misc_id,
+            domain="rag",
+            topic="rag-misc-topic",
+        )
+        # The 'other' domain's misc paper (stale_2024) carries no topics
+        # in the fixture, so add one so the cross-domain mix would be
+        # detectable.
+        other_misc_id = seeded_db.execute(
+            "SELECT id FROM papers WHERE paper_name = 'stale_2024'"
+        ).fetchone()[0]
+        _insert_paper_topic(
+            seeded_db,
+            paper_id=other_misc_id,
+            domain="other",
+            topic="other-misc-topic",
+        )
+
+        # Without domain: both 'misc' collections collapse into the rollup.
+        both = search_mod.mode_browse(
+            seeded_db,
+            which="topics",
+            filters={"collection": "misc"},
+        )
+        topics_both = {row["topic"] for row in both["results"]}
+        assert "rag-misc-topic" in topics_both
+        assert "other-misc-topic" in topics_both
+
+        # With domain='rag': only the rag-side misc collection contributes.
+        only_rag = search_mod.mode_browse(
+            seeded_db,
+            which="topics",
+            filters={"collection": "misc", "domain": "rag"},
+        )
+        topics_rag = {row["topic"] for row in only_rag["results"]}
+        assert "rag-misc-topic" in topics_rag
+        assert "other-misc-topic" not in topics_rag
+
     def test_entity_type_list(self, seeded_db):
         r = search_mod.mode_browse(
             seeded_db, which="entity_type", filters={"entity_type": "method"}
