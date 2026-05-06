@@ -132,16 +132,22 @@ def _seed_paper(
             0,
         ),
     )
+    paper_id = cur.lastrowid
     # Mirror the invariant production maintains: a paper with a collection
-    # means that (domain, collection) is registered. Keeps seeded fixtures
-    # in sync with what classify() builds up on its own.
+    # means that (domain, collection) is registered AND has a primary
+    # paper_collections row.
     if domain is not None and collection is not None:
         conn.execute(
             "INSERT OR IGNORE INTO collections (domain, name, description) "
             "VALUES (?, ?, NULL)",
             (domain, collection),
         )
-    return cur.lastrowid
+        conn.execute(
+            "INSERT OR IGNORE INTO paper_collections "
+            " (paper_id, domain, collection, is_primary) VALUES (?, ?, ?, 1)",
+            (paper_id, domain, collection),
+        )
+    return paper_id
 
 
 def _load_fixture(name: str) -> dict:
@@ -165,6 +171,36 @@ def _runner_from_dict(payload: dict):
         return response_model.model_validate(payload)
 
     return _runner
+
+
+def _payload(
+    *,
+    domain_index: int = 0,
+    new_domain: str = "",
+    new_domain_desc: str = "",
+    collections: list[dict] | None = None,
+    topics: list[str] | None = None,
+) -> dict:
+    """Build a classification payload in the new list-of-collections shape.
+
+    Collections default to a single new ``"hierarchical indexing"`` pick;
+    callers override with the multi-collection shape they want to exercise.
+    """
+    if collections is None:
+        collections = [
+            {
+                "index": -1,
+                "new_name": "hierarchical indexing",
+                "new_desc": "Hierarchical retrieval over long documents.",
+            }
+        ]
+    return {
+        "domain_index": domain_index,
+        "new_domain": new_domain,
+        "new_domain_desc": new_domain_desc,
+        "collections": collections,
+        "topics": topics if topics is not None else ["t"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -229,15 +265,14 @@ def test_classify_passes_resolved_prompt_and_schema_to_call_llm(seeded):
         captured["user"] = user
         captured["schema"] = schema
         captured["response_model"] = response_model
-        return response_model(
-            domain_index=0,
-            new_domain="",
-            new_domain_desc="",
-            collection_index=-1,
-            new_collection="hierarchical indexing",
-            new_collection_desc="Retrieval methods that build hierarchical indices over long documents.",
+        return response_model.model_validate(_payload(
+            collections=[{
+                "index": -1,
+                "new_name": "hierarchical indexing",
+                "new_desc": "Retrieval methods that build hierarchical indices over long documents.",
+            }],
             topics=["tree retrieval"],
-        )
+        ))
 
     classify(paper_name="paper_name_2024", conn=seeded, call_llm=_runner)
 
@@ -252,7 +287,10 @@ def test_classify_passes_resolved_prompt_and_schema_to_call_llm(seeded):
     enum_val = schema["schema"]["properties"]["domain_index"]["enum"]
     assert enum_val == [-1, 0]
     # COLLECTION_INDEX_ENUM — rag has no collections yet, so only -1 is valid.
-    coll_enum = schema["schema"]["properties"]["collection_index"]["enum"]
+    coll_enum = (
+        schema["schema"]["properties"]["collections"]
+        ["items"]["properties"]["index"]["enum"]
+    )
     assert coll_enum == [-1]
     assert captured["response_model"] is ClassificationLLMOutput
 
@@ -271,91 +309,58 @@ def test_classify_writes_paper_state_from_llm_output(seeded):
     assert row[0] == "rag"
     assert row[1] == "hierarchical indexing"
     assert row[2] == PaperStatus.CLASSIFIED.value
-    assert row[3] == 0
+    # New collection → needs_review=1.
+    assert row[3] == 1
 
 
 def test_domain_index_out_of_range_raises_llm_error(seeded):
-    def _runner(system, user, schema, response_model):
-        return response_model(
-            domain_index=99,  # outside [-1, 0]
-            new_domain="",
-            new_domain_desc="",
-            collection_index=-1,
-            new_collection="c",
-            new_collection_desc="",
-            topics=["t"],
-        )
-
+    runner = _runner_from_dict(_payload(
+        domain_index=99,  # outside [-1, 0]
+        collections=[{"index": -1, "new_name": "c", "new_desc": "A cluster."}],
+    ))
     with pytest.raises(ClassifyLLMError):
-        classify(paper_name="paper_name_2024", conn=seeded, call_llm=_runner)
+        classify(paper_name="paper_name_2024", conn=seeded, call_llm=runner)
 
 
-def test_collection_index_minus_one_with_empty_proposal_raises(seeded):
-    def _runner(system, user, schema, response_model):
-        return response_model(
-            domain_index=0,
-            new_domain="",
-            new_domain_desc="",
-            collection_index=-1,
-            new_collection="",  # invalid: both signal "new" but name is empty
-            new_collection_desc="A dummy cluster.",
-            topics=["t"],
-        )
-
+def test_collection_pick_minus_one_with_empty_proposal_raises(seeded):
+    runner = _runner_from_dict(_payload(
+        collections=[{"index": -1, "new_name": "", "new_desc": "A cluster."}],
+    ))
     with pytest.raises(ClassifyLLMError) as exc_info:
-        classify(paper_name="paper_name_2024", conn=seeded, call_llm=_runner)
-    assert "new_collection" in str(exc_info.value)
+        classify(paper_name="paper_name_2024", conn=seeded, call_llm=runner)
+    assert "new_name" in str(exc_info.value)
 
 
 def test_new_domain_with_empty_description_raises(seeded):
-    def _runner(system, user, schema, response_model):
-        return response_model(
-            domain_index=-1,
-            new_domain="new_dom",
-            new_domain_desc="   ",  # whitespace-only → empty
-            collection_index=-1,
-            new_collection="c",
-            new_collection_desc="A dummy cluster.",
-            topics=["t"],
-        )
-
+    runner = _runner_from_dict(_payload(
+        domain_index=-1,
+        new_domain="new_dom",
+        new_domain_desc="   ",  # whitespace-only → empty
+        collections=[{"index": -1, "new_name": "c", "new_desc": "A cluster."}],
+    ))
     with pytest.raises(ClassifyLLMError) as exc_info:
-        classify(paper_name="paper_name_2024", conn=seeded, call_llm=_runner)
+        classify(paper_name="paper_name_2024", conn=seeded, call_llm=runner)
     assert "new_domain_desc" in str(exc_info.value)
 
 
 def test_existing_domain_with_description_raises(seeded):
-    def _runner(system, user, schema, response_model):
-        return response_model(
-            domain_index=0,
-            new_domain="",
-            new_domain_desc="should not be set",
-            collection_index=-1,
-            new_collection="c",
-            new_collection_desc="A dummy cluster.",
-            topics=["t"],
-        )
-
+    runner = _runner_from_dict(_payload(
+        domain_index=0,
+        new_domain_desc="should not be set",
+        collections=[{"index": -1, "new_name": "c", "new_desc": "A cluster."}],
+    ))
     with pytest.raises(ClassifyLLMError) as exc_info:
-        classify(paper_name="paper_name_2024", conn=seeded, call_llm=_runner)
+        classify(paper_name="paper_name_2024", conn=seeded, call_llm=runner)
     assert "new_domain_desc" in str(exc_info.value)
 
 
 def test_new_collection_with_empty_description_raises(seeded):
-    def _runner(system, user, schema, response_model):
-        return response_model(
-            domain_index=0,
-            new_domain="",
-            new_domain_desc="",
-            collection_index=-1,
-            new_collection="some new cluster",
-            new_collection_desc="   ",  # whitespace-only → empty
-            topics=["t"],
-        )
-
+    runner = _runner_from_dict(_payload(
+        collections=[{"index": -1, "new_name": "some new cluster", "new_desc": "   "}],
+    ))
     with pytest.raises(ClassifyLLMError) as exc_info:
-        classify(paper_name="paper_name_2024", conn=seeded, call_llm=_runner)
-    assert "new_collection_desc" in str(exc_info.value)
+        classify(paper_name="paper_name_2024", conn=seeded, call_llm=runner)
+    assert "new_desc" in str(exc_info.value)
 
 
 def test_existing_collection_with_description_raises(tmp_db_with_domain):
@@ -368,43 +373,31 @@ def test_existing_collection_with_description_raises(tmp_db_with_domain):
         collection="hybrid search",
     )
     _seed_paper(tmp_db_with_domain)  # paper under test
-
-    def _runner(system, user, schema, response_model):
-        return response_model(
-            domain_index=0,
-            new_domain="",
-            new_domain_desc="",
-            collection_index=0,  # existing "hybrid search"
-            new_collection="",
-            new_collection_desc="should not be set",
-            topics=["t"],
-        )
-
+    runner = _runner_from_dict(_payload(
+        collections=[{"index": 0, "new_name": "", "new_desc": "should not be set"}],
+    ))
     with pytest.raises(ClassifyLLMError) as exc_info:
         classify(
             paper_name="paper_name_2024",
             conn=tmp_db_with_domain,
-            call_llm=_runner,
+            call_llm=runner,
         )
-    assert "new_collection_desc" in str(exc_info.value)
+    assert "new_desc" in str(exc_info.value)
 
 
 def test_new_domain_with_existing_collection_index_raises(seeded):
-    def _runner(system, user, schema, response_model):
-        return response_model(
-            domain_index=-1,
-            new_domain="new_dom",
-            new_domain_desc="A new research area about something.",
-            collection_index=0,  # invalid: new domain has no collections
-            new_collection="",
-            new_collection_desc="",
-            topics=["t"],
-        )
-
+    runner = _runner_from_dict(_payload(
+        domain_index=-1,
+        new_domain="new_dom",
+        new_domain_desc="A new research area about something.",
+        collections=[{"index": 0, "new_name": "", "new_desc": ""}],
+    ))
     with pytest.raises(ClassifyLLMError) as exc_info:
-        classify(paper_name="paper_name_2024", conn=seeded, call_llm=_runner)
-    assert "new" in str(exc_info.value).lower()
-    assert "collection_index" in str(exc_info.value)
+        classify(paper_name="paper_name_2024", conn=seeded, call_llm=runner)
+    msg = str(exc_info.value)
+    assert "new" in msg.lower()
+    # Each pick under a new domain must use index=-1.
+    assert "index" in msg
 
 
 def test_existing_collection_index_resolves_to_name(tmp_db_with_domain):
@@ -418,22 +411,14 @@ def test_existing_collection_index_resolves_to_name(tmp_db_with_domain):
         collection="hybrid search",
     )
     _seed_paper(tmp_db_with_domain)  # paper under test
-
-    def _runner(system, user, schema, response_model):
-        return response_model(
-            domain_index=0,
-            new_domain="",
-            new_domain_desc="",
-            collection_index=0,  # → "hybrid search" (only collection under rag)
-            new_collection="",
-            new_collection_desc="",
-            topics=["tree retrieval"],
-        )
-
+    runner = _runner_from_dict(_payload(
+        collections=[{"index": 0, "new_name": "", "new_desc": ""}],
+        topics=["tree retrieval"],
+    ))
     classify(
         paper_name="paper_name_2024",
         conn=tmp_db_with_domain,
-        call_llm=_runner,
+        call_llm=runner,
     )
     row = tmp_db_with_domain.execute(
         "SELECT collection FROM papers WHERE paper_name = ?",
@@ -445,23 +430,14 @@ def test_existing_collection_index_resolves_to_name(tmp_db_with_domain):
 def test_collection_index_out_of_range_for_chosen_domain_raises(tmp_db_with_domain):
     # rag has zero collections → any non-negative index is out of range.
     _seed_paper(tmp_db_with_domain)
-
-    def _runner(system, user, schema, response_model):
-        return response_model(
-            domain_index=0,
-            new_domain="",
-            new_domain_desc="",
-            collection_index=1,
-            new_collection="",
-            new_collection_desc="",
-            topics=["t"],
-        )
-
+    runner = _runner_from_dict(_payload(
+        collections=[{"index": 1, "new_name": "", "new_desc": ""}],
+    ))
     with pytest.raises(ClassifyLLMError) as exc_info:
         classify(
             paper_name="paper_name_2024",
             conn=tmp_db_with_domain,
-            call_llm=_runner,
+            call_llm=runner,
         )
     assert "out of range" in str(exc_info.value)
 
@@ -587,15 +563,10 @@ def test_rerun_gcs_orphan_topic_canonicals_from_prior_run(tmp_db_with_domain):
     classify(
         paper_name="paper_name_2024",
         conn=tmp_db_with_domain,
-        call_llm=_runner_from_dict({
-            "domain_index": 0,
-            "new_domain": "",
-            "new_domain_desc": "",
-            "collection_index": -1,
-            "new_collection": "first cluster",
-            "new_collection_desc": "Initial classification cluster.",
-            "topics": ["apple zoology", "zebra fishery"],
-        }),
+        call_llm=_runner_from_dict(_payload(
+            collections=[{"index": -1, "new_name": "first cluster", "new_desc": "Initial classification cluster."}],
+            topics=["apple zoology", "zebra fishery"],
+        )),
         embedder=embedder,
     )
 
@@ -634,15 +605,10 @@ def test_rerun_gcs_orphan_topic_canonicals_from_prior_run(tmp_db_with_domain):
     classify(
         paper_name="paper_name_2024",
         conn=tmp_db_with_domain,
-        call_llm=_runner_from_dict({
-            "domain_index": 0,
-            "new_domain": "",
-            "new_domain_desc": "",
-            "collection_index": 0,  # existing "first cluster"
-            "new_collection": "",
-            "new_collection_desc": "",
-            "topics": ["foobar widget", "qux baz silo"],
-        }),
+        call_llm=_runner_from_dict(_payload(
+            collections=[{"index": 0, "new_name": "", "new_desc": ""}],  # existing "first cluster"
+            topics=["foobar widget", "qux baz silo"],
+        )),
         embedder=embedder,
     )
 
@@ -789,15 +755,13 @@ def test_llm_returns_dirty_domain_name_gets_sanitized(tmp_db_with_domain):
 
 def test_proposed_domain_sanitizing_to_empty_raises(tmp_db_with_domain):
     _seed_paper(tmp_db_with_domain)
-    runner = _runner_from_dict({
-        "domain_index": -1,
-        "new_domain": "!!! ???",
-        "new_domain_desc": "A dummy area.",
-        "collection_index": -1,
-        "new_collection": "c",
-        "new_collection_desc": "A dummy cluster.",
-        "topics": ["t1"],
-    })
+    runner = _runner_from_dict(_payload(
+        domain_index=-1,
+        new_domain="!!! ???",
+        new_domain_desc="A dummy area.",
+        collections=[{"index": -1, "new_name": "c", "new_desc": "A cluster."}],
+        topics=["t1"],
+    ))
 
     with pytest.raises(ClassifyDomainNameError):
         classify(
@@ -820,7 +784,8 @@ def test_domain_override_bypasses_llm_choice_and_does_not_flag_review(tmp_db_wit
         ("paper_name_2024",),
     ).fetchone()
     assert row[0] == "rag"
-    assert row[1] == 0
+    # New collection still flips needs_review even when domain is overridden.
+    assert row[1] == 1
 
 
 def test_domain_override_inserts_new_domain_needs_review_false(tmp_db_with_domain):
@@ -836,7 +801,8 @@ def test_domain_override_inserts_new_domain_needs_review_false(tmp_db_with_domai
         ("paper_name_2024",),
     ).fetchone()
     assert row[0] == "theorem_proving"
-    assert row[1] == 0
+    # New collection still flips needs_review even when domain is overridden.
+    assert row[1] == 1
 
     # Override forces a name the LLM didn't propose — we must not attach
     # the LLM's description (which was about the LLM's proposed domain).
@@ -914,15 +880,10 @@ def test_duplicate_topics_dedupe_by_term_id(tmp_db_with_domain):
         VALUES ('rag', 'topic', '', 'tree retrieval', 'seed')
         """
     )
-    runner = _runner_from_dict({
-        "domain_index": 0,
-        "new_domain": "",
-        "new_domain_desc": "",
-        "collection_index": -1,
-        "new_collection": "hierarchical indexing",
-        "new_collection_desc": "Hierarchical retrieval over long documents.",
-        "topics": ["tree retrieval", "tree retrieval"],
-    })
+    runner = _runner_from_dict(_payload(
+        collections=[{"index": -1, "new_name": "hierarchical indexing", "new_desc": "Hierarchical retrieval over long documents."}],
+        topics=["tree retrieval", "tree retrieval"],
+    ))
 
     classify(
         paper_name="paper_name_2024",
@@ -933,6 +894,114 @@ def test_duplicate_topics_dedupe_by_term_id(tmp_db_with_domain):
         "SELECT COUNT(*) FROM topics WHERE target_kind='paper' AND target_id = ?", (paper_id,)
     ).fetchone()[0]
     assert rows == 1
+
+
+# ===========================================================================
+# Multi-collection picks
+# ===========================================================================
+
+
+def test_multi_collection_pick_writes_primary_and_secondary(tmp_db_with_domain):
+    """LLM returns two collection picks. The primary lands in
+    `papers.collection`; both rows land in `paper_collections` with the
+    expected `is_primary` flags. `needs_review = 1` because the secondary
+    is new."""
+    paper_id = _seed_paper(tmp_db_with_domain)
+    runner = _runner_from_dict(_payload(
+        collections=[
+            {"index": -1, "new_name": "hierarchical indexing", "new_desc": "Tree-shaped indices."},
+            {"index": -1, "new_name": "long-context retrieval", "new_desc": "Retrieval over very long inputs."},
+        ],
+        topics=["t"],
+    ))
+
+    classify(paper_name="paper_name_2024", conn=tmp_db_with_domain, call_llm=runner)
+
+    row = tmp_db_with_domain.execute(
+        "SELECT domain, collection, needs_review FROM papers WHERE id = ?",
+        (paper_id,),
+    ).fetchone()
+    assert row[0] == "rag"
+    assert row[1] == "hierarchical indexing"  # primary
+    assert row[2] == 1  # secondary is new
+
+    pc_rows = tmp_db_with_domain.execute(
+        "SELECT collection, is_primary FROM paper_collections "
+        " WHERE paper_id = ? ORDER BY is_primary DESC, collection",
+        (paper_id,),
+    ).fetchall()
+    assert pc_rows == [
+        ("hierarchical indexing", 1),
+        ("long-context retrieval", 0),
+    ]
+
+
+def test_multi_collection_canonical_collision_dedupes_keeping_primary(tmp_db_with_domain):
+    """If two picks resolve to the same canonical (primary first), only
+    one row lands and the primary flag survives."""
+    paper_id = _seed_paper(tmp_db_with_domain)
+    # Pre-register the canonical so resolver tier-1 hits it for both picks.
+    tmp_db_with_domain.execute(
+        """
+        INSERT INTO canonical_terms (domain, term_type, entity_type, canonical_name, first_seen_in)
+        VALUES ('rag', 'collection', '', 'hierarchical indexing', 'seed')
+        """
+    )
+    runner = _runner_from_dict(_payload(
+        collections=[
+            {"index": -1, "new_name": "hierarchical indexing", "new_desc": "Tree-shaped indices."},
+            {"index": -1, "new_name": "hierarchical indexing", "new_desc": "Some other description."},
+        ],
+        topics=["t"],
+    ))
+
+    classify(paper_name="paper_name_2024", conn=tmp_db_with_domain, call_llm=runner)
+
+    pc_rows = tmp_db_with_domain.execute(
+        "SELECT collection, is_primary FROM paper_collections WHERE paper_id = ?",
+        (paper_id,),
+    ).fetchall()
+    assert pc_rows == [("hierarchical indexing", 1)]
+
+
+def test_rerun_replaces_paper_collections_rows(tmp_db_with_domain):
+    """Re-classify wipes the prior paper_collections rows so secondaries
+    that the second run dropped don't linger."""
+    paper_id = _seed_paper(tmp_db_with_domain)
+    # Run 1: primary + secondary.
+    classify(
+        paper_name="paper_name_2024",
+        conn=tmp_db_with_domain,
+        call_llm=_runner_from_dict(_payload(
+            collections=[
+                {"index": -1, "new_name": "primary one", "new_desc": "Cluster A."},
+                {"index": -1, "new_name": "secondary one", "new_desc": "Cluster B."},
+            ],
+            topics=["t"],
+        )),
+    )
+    rows1 = tmp_db_with_domain.execute(
+        "SELECT collection FROM paper_collections WHERE paper_id = ? ORDER BY collection",
+        (paper_id,),
+    ).fetchall()
+    assert {r[0] for r in rows1} == {"primary one", "secondary one"}
+
+    # Run 2: only the primary survives, with a different name.
+    classify(
+        paper_name="paper_name_2024",
+        conn=tmp_db_with_domain,
+        call_llm=_runner_from_dict(_payload(
+            collections=[
+                {"index": -1, "new_name": "different primary", "new_desc": "Cluster C."},
+            ],
+            topics=["t"],
+        )),
+    )
+    rows2 = tmp_db_with_domain.execute(
+        "SELECT collection, is_primary FROM paper_collections WHERE paper_id = ?",
+        (paper_id,),
+    ).fetchall()
+    assert rows2 == [("different primary", 1)]
 
 
 # ===========================================================================
@@ -953,13 +1022,23 @@ def test_status_is_classified_after_success(seeded):
     assert row[0] == PaperStatus.CLASSIFIED.value
 
 
-def test_needs_review_is_zero_on_existing_domain(seeded):
-    classify(
-        paper_name="paper_name_2024",
-        conn=seeded,
-        call_llm=_fake_runner(),
+def test_needs_review_is_zero_on_existing_collection(tmp_db_with_domain):
+    """When both domain and collection are existing, needs_review stays 0."""
+    _seed_paper(
+        tmp_db_with_domain,
+        paper_name="earlier_2024",
+        arxiv_id="2400.00000",
+        status=PaperStatus.CLASSIFIED.value,
+        domain="rag",
+        collection="hybrid search",
     )
-    row = seeded.execute(
+    _seed_paper(tmp_db_with_domain)
+    runner = _runner_from_dict(_payload(
+        collections=[{"index": 0, "new_name": "", "new_desc": ""}],
+        topics=["tree retrieval"],
+    ))
+    classify(paper_name="paper_name_2024", conn=tmp_db_with_domain, call_llm=runner)
+    row = tmp_db_with_domain.execute(
         "SELECT needs_review FROM papers WHERE paper_name = ?",
         ("paper_name_2024",),
     ).fetchone()
@@ -972,6 +1051,21 @@ def test_needs_review_is_one_on_new_domain_auto_create(tmp_db_with_domain):
         paper_name="paper_name_2024",
         conn=tmp_db_with_domain,
         call_llm=_fake_runner("classification_new_domain.json"),
+    )
+    row = tmp_db_with_domain.execute(
+        "SELECT needs_review FROM papers WHERE paper_name = ?",
+        ("paper_name_2024",),
+    ).fetchone()
+    assert row[0] == 1
+
+
+def test_needs_review_is_one_on_new_collection_only(tmp_db_with_domain):
+    """Existing domain + new (proposed) collection still flips needs_review."""
+    _seed_paper(tmp_db_with_domain)
+    classify(
+        paper_name="paper_name_2024",
+        conn=tmp_db_with_domain,
+        call_llm=_fake_runner(),
     )
     row = tmp_db_with_domain.execute(
         "SELECT needs_review FROM papers WHERE paper_name = ?",

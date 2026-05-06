@@ -115,7 +115,15 @@ def _seed_paper(
         (arxiv_id, paper_name, f"https://arxiv.org/pdf/{arxiv_id}",
          domain, collection),
     )
-    return cur.lastrowid
+    paper_id = cur.lastrowid
+    if collection is not None:
+        # Mirror production: paper_collections carries the primary row.
+        conn.execute(
+            "INSERT OR IGNORE INTO paper_collections "
+            " (paper_id, domain, collection, is_primary) VALUES (?, ?, ?, 1)",
+            (paper_id, domain, collection),
+        )
+    return paper_id
 
 
 # ===========================================================================
@@ -344,3 +352,47 @@ def test_returns_counts_dict(conn):
     assert conn.execute(
         "SELECT COUNT(*) FROM collections WHERE name = 'orphan_c1'"
     ).fetchone()[0] == 1
+
+
+# ===========================================================================
+# delete_paper_cascade clears paper_collections
+# ===========================================================================
+
+
+def test_delete_paper_cascade_drops_paper_collections_rows(conn):
+    """Deleting a paper must wipe all of its paper_collections rows
+    (primary + secondary) but leave the curated `collections` registry
+    rows alone — those are categories, not per-paper concepts."""
+    from _system.db.cascade import delete_paper_cascade
+
+    _seed_domain(conn)
+    paper_id = _seed_paper(
+        conn,
+        paper_name="cascade_paper",
+        arxiv_id="2401.55555",
+        domain="rag",
+        collection="primary_coll",
+    )
+    # Add a SECONDARY membership.
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "VALUES (?, ?, NULL)",
+        ("rag", "secondary_coll"),
+    )
+    conn.execute(
+        "INSERT INTO paper_collections "
+        " (paper_id, domain, collection, is_primary) VALUES (?, ?, ?, 0)",
+        (paper_id, "rag", "secondary_coll"),
+    )
+
+    delete_paper_cascade(conn, paper_id=paper_id)
+
+    # All paper_collections rows for the paper are gone.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM paper_collections WHERE paper_id = ?",
+        (paper_id,),
+    ).fetchone()[0] == 0
+    # The two collection registry rows survive — categories, not per-paper.
+    assert conn.execute(
+        "SELECT COUNT(*) FROM collections WHERE domain = 'rag' AND name IN ('primary_coll', 'secondary_coll')"
+    ).fetchone()[0] == 2

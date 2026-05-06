@@ -108,7 +108,42 @@ def _insert_paper(
             0,
         ),
     )
-    return cur.lastrowid
+    paper_id = cur.lastrowid
+    # Mirror production: a classified paper carries a primary
+    # paper_collections row pointing at its denormalized collection.
+    if collection is not None:
+        conn.execute(
+            "INSERT OR IGNORE INTO collections (domain, name, description) "
+            "VALUES (?, ?, NULL)",
+            (domain, collection),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO paper_collections "
+            " (paper_id, domain, collection, is_primary) VALUES (?, ?, ?, 1)",
+            (paper_id, domain, collection),
+        )
+    return paper_id
+
+
+def _add_secondary_collection(
+    conn: sqlite3.Connection,
+    *,
+    paper_id: int,
+    domain: str,
+    collection: str,
+) -> None:
+    """Attach a SECONDARY paper_collections row (is_primary=0) — keeps
+    `papers.collection` (the primary) untouched."""
+    conn.execute(
+        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "VALUES (?, ?, NULL)",
+        (domain, collection),
+    )
+    conn.execute(
+        "INSERT INTO paper_collections "
+        " (paper_id, domain, collection, is_primary) VALUES (?, ?, ?, 0)",
+        (paper_id, domain, collection),
+    )
 
 
 def _insert_sections_for_md(
@@ -2363,9 +2398,11 @@ def _seed_collection_row(
     name: str,
     description: str | None = None,
 ) -> None:
+    # UPSERT so an explicit description here overrides any prior NULL row
+    # left by _insert_paper's auto-seed of (domain, name).
     conn.execute(
-        "INSERT OR IGNORE INTO collections (domain, name, description) "
-        "VALUES (?, ?, ?)",
+        "INSERT INTO collections (domain, name, description) VALUES (?, ?, ?) "
+        "ON CONFLICT(domain, name) DO UPDATE SET description = excluded.description",
         (domain, name, description),
     )
 
@@ -2577,6 +2614,114 @@ def test_mode_collection_empty_input_raises(seeded_db):
         search_mod.mode_collection(
             seeded_db, collection_names=[], filters={}
         )
+
+
+def test_mode_collection_returns_secondary_membership(seeded_db):
+    """A paper whose primary is 'A' but who carries 'B' as a secondary
+    in `paper_collections` must surface under both `mode_collection(["A"])`
+    and `mode_collection(["B"])`."""
+    p_id = _insert_paper(
+        seeded_db,
+        arxiv_id="2405.01010",
+        paper_name="multi_2024",
+        title="Bridging A and B",
+        abstract="abs",
+        markdown=None,
+        domain="rag",
+        collection="hierarchical indexing",  # primary = A
+        needs_review=0,
+        ingested_at="2024-05-01T00:00:00+00:00",
+    )
+    _add_secondary_collection(
+        seeded_db, paper_id=p_id, domain="rag", collection="hybrid"
+    )
+    _seed_collection_row(seeded_db, "rag", "hierarchical indexing")
+    _seed_collection_row(seeded_db, "rag", "hybrid")
+
+    primary_payload = search_mod.mode_collection(
+        seeded_db,
+        collection_names=["hierarchical indexing"],
+        filters={"domain": "rag"},
+    )
+    primary_entry = primary_payload["collections"][0]
+    assert "multi_2024" in {p["paper_name"] for p in primary_entry["papers"]}
+
+    secondary_payload = search_mod.mode_collection(
+        seeded_db,
+        collection_names=["hybrid"],
+        filters={"domain": "rag"},
+    )
+    secondary_entry = secondary_payload["collections"][0]
+    assert secondary_entry["paper_count"] == 1
+    assert "multi_2024" in {p["paper_name"] for p in secondary_entry["papers"]}
+
+
+def test_bm25_collection_filter_matches_secondary(seeded_db):
+    """`bm25(query, collection='B')` must match a paper whose secondary
+    membership is 'B' even when its primary `papers.collection` is 'A'."""
+    p_id = _insert_paper(
+        seeded_db,
+        arxiv_id="2405.02020",
+        paper_name="multi_bm25_2024",
+        title="Hybrid Hierarchies",
+        abstract="hybrid hierarchies for retrieval over books.",
+        markdown=(
+            "# Hybrid Hierarchies\n\n"
+            "We introduce HybridHierarchies, a unique-marker phrase.\n"
+        ),
+        domain="rag",
+        collection="hierarchical indexing",  # primary = A
+        needs_review=0,
+        ingested_at="2024-05-02T00:00:00+00:00",
+    )
+    _add_secondary_collection(
+        seeded_db, paper_id=p_id, domain="rag", collection="hybrid"
+    )
+    _insert_sections_for_md(
+        seeded_db,
+        paper_id=p_id,
+        domain="rag",
+        paper_name="multi_bm25_2024",
+        markdown=(
+            "# Hybrid Hierarchies\n\n"
+            "We introduce HybridHierarchies, a unique-marker phrase.\n"
+        ),
+    )
+
+    payload = search_mod.mode_bm25(
+        seeded_db,
+        query="HybridHierarchies",
+        filters={"collection": "hybrid"},
+        limit=10,
+    )
+    paper_names = {r["paper_name"] for r in payload["results"]}
+    assert "multi_bm25_2024" in paper_names
+
+
+def test_browse_collections_counts_primary_and_secondary(seeded_db):
+    """browse(view='collections') aggregates from `paper_collections`,
+    so a paper that's a secondary in 'B' counts toward 'B' too."""
+    p_id = _insert_paper(
+        seeded_db,
+        arxiv_id="2405.03030",
+        paper_name="multi_browse_2024",
+        title="t",
+        abstract="a",
+        markdown=None,
+        domain="rag",
+        collection="hierarchical indexing",
+        needs_review=0,
+        ingested_at="2024-05-03T00:00:00+00:00",
+    )
+    _add_secondary_collection(
+        seeded_db, paper_id=p_id, domain="rag", collection="hybrid"
+    )
+    payload = search_mod.mode_browse(
+        seeded_db, which="collections", filters={"domain": "rag"}
+    )
+    counts = {r["collection"]: r["count"] for r in payload["results"]}
+    # The paper counts in both buckets thanks to the secondary row.
+    assert counts.get("hybrid") == 1
 
 
 # ===========================================================================

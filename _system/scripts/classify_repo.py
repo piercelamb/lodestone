@@ -25,7 +25,10 @@ from _system.llm import call_structured, load_prompt
 from _system.resolution.embeddings import Embedder
 from _system.resolution.resolver import pending_fts_rebuilds, resolve
 from _system.schemas.repo_metadata import RepoStatus, TopicTarget, can_run_from
-from _system.schemas.taxonomy import ClassificationLLMOutput, ClassificationOutput
+from _system.schemas.taxonomy import (
+    RepoClassificationLLMOutput as ClassificationLLMOutput,
+    RepoClassificationOutput as ClassificationOutput,
+)
 from _system.scripts.taxonomy_tree import (
     DomainNode,
     TaxonomyTreeStyle,

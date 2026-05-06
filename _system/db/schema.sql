@@ -14,6 +14,42 @@ CREATE TABLE IF NOT EXISTS collections (
     PRIMARY KEY(domain, name)
 );
 
+-- Many-to-(few) join: a paper carries one PRIMARY collection plus 0..N
+-- secondary collections, all within the paper's single domain. The
+-- denormalized `papers.collection` scalar mirrors the primary row.
+CREATE TABLE IF NOT EXISTS paper_collections (
+    paper_id   INTEGER NOT NULL REFERENCES papers(id),
+    domain     TEXT    NOT NULL,
+    collection TEXT    NOT NULL,
+    is_primary INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (paper_id, collection),
+    FOREIGN KEY (domain, collection) REFERENCES collections(domain, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_paper_collections_collection
+  ON paper_collections(domain, collection);
+
+-- Exactly one primary per paper.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_collections_primary
+  ON paper_collections(paper_id) WHERE is_primary = 1;
+
+-- Intra-domain invariant: paper_collections.domain must match papers.domain.
+CREATE TRIGGER IF NOT EXISTS paper_collections_intra_domain_insert
+BEFORE INSERT ON paper_collections
+FOR EACH ROW
+WHEN NEW.domain != (SELECT domain FROM papers WHERE id = NEW.paper_id)
+BEGIN
+    SELECT RAISE(ABORT, 'paper_collections invariant: domain must match papers.domain');
+END;
+
+CREATE TRIGGER IF NOT EXISTS paper_collections_intra_domain_update
+BEFORE UPDATE ON paper_collections
+FOR EACH ROW
+WHEN NEW.domain != (SELECT domain FROM papers WHERE id = NEW.paper_id)
+BEGIN
+    SELECT RAISE(ABORT, 'paper_collections invariant: domain must match papers.domain');
+END;
+
 CREATE TABLE IF NOT EXISTS papers (
     id INTEGER PRIMARY KEY,
     arxiv_id TEXT UNIQUE NOT NULL,
@@ -320,5 +356,12 @@ CREATE INDEX IF NOT EXISTS idx_topics_topic ON topics(domain, topic);
 -- legacy rows — classify_paper fills them in when the LLM proposes new.
 INSERT OR IGNORE INTO collections (domain, name, description)
 SELECT DISTINCT domain, collection, NULL
+  FROM papers
+ WHERE domain IS NOT NULL AND collection IS NOT NULL;
+
+-- Backfill paper_collections from the legacy scalar `papers.collection`
+-- so DBs that predate the join table get a primary row per classified paper.
+INSERT OR IGNORE INTO paper_collections (paper_id, domain, collection, is_primary)
+SELECT id, domain, collection, 1
   FROM papers
  WHERE domain IS NOT NULL AND collection IS NOT NULL;

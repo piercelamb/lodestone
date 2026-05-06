@@ -675,10 +675,14 @@ def _bm25_sections(
         wheres.append("s.paper_name = ?")
         where_params.append(paper_name)
     if collection:
-        # Join papers for the collection filter — sections does not carry
-        # collection in FTS5 (by design; the paper owns the collection).
-        join_sql = " JOIN papers p ON p.id = s.paper_id"
-        wheres.append("p.collection = ?")
+        # Sections does not carry collection in FTS5 (by design; the
+        # paper owns the collection). Match against `paper_collections`
+        # so secondary memberships filter through too — a paper that's
+        # `collection` as a secondary still surfaces via this filter.
+        wheres.append(
+            "EXISTS (SELECT 1 FROM paper_collections pc "
+            "         WHERE pc.paper_id = s.paper_id AND pc.collection = ?)"
+        )
         where_params.append(collection)
     where_clause = " WHERE " + " AND ".join(wheres)
 
@@ -1694,13 +1698,15 @@ def mode_browse(
         raise ValueError(f"unknown browse view: {which!r}") from exc
     domain = filters.get("domain")
     if view is BrowseView.COLLECTIONS:
+        # paper_collections counts a paper once per primary/secondary
+        # membership it carries.
         sql = (
-            "SELECT collection, COUNT(*) AS n FROM papers "
-            " WHERE collection IS NOT NULL "
+            "SELECT collection, COUNT(paper_id) AS n "
+            "  FROM paper_collections "
         )
         params: list[Any] = []
         if domain:
-            sql += " AND domain = ? "
+            sql += " WHERE domain = ? "
             params.append(domain)
         sql += " GROUP BY collection ORDER BY n DESC, collection"
         rows = conn.execute(sql, params).fetchall()
@@ -1916,9 +1922,11 @@ def _resolve_collection_targets(
                 (domain_filter, name),
             ).fetchone()
             if row is None:
-                # Fall back to papers — legacy rows may not be registered.
+                # Fall back to paper_collections — legacy rows may not
+                # be registered in the curated `collections` table.
                 fallback = conn.execute(
-                    "SELECT 1 FROM papers WHERE domain = ? AND collection = ? LIMIT 1",
+                    "SELECT 1 FROM paper_collections "
+                    " WHERE domain = ? AND collection = ? LIMIT 1",
                     (domain_filter, name),
                 ).fetchone()
                 if fallback is None:
@@ -1943,10 +1951,11 @@ def _resolve_collection_targets(
             (name,),
         ).fetchall()
         if not rows:
-            # Fallback to legacy paper-side rows.
+            # Fallback to paper_collections — covers legacy rows that
+            # aren't registered in the curated `collections` table.
             paper_rows = conn.execute(
-                "SELECT DISTINCT domain FROM papers "
-                " WHERE collection = ? AND domain IS NOT NULL "
+                "SELECT DISTINCT domain FROM paper_collections "
+                " WHERE collection = ? "
                 " ORDER BY domain",
                 (name,),
             ).fetchall()
@@ -1999,7 +2008,9 @@ def mode_collection(
     entries: list[dict[str, Any]] = []
     for d_name, c_name, c_desc in targets:
         total_row = conn.execute(
-            "SELECT COUNT(*) FROM papers WHERE domain = ? AND collection = ?",
+            "SELECT COUNT(pc.paper_id) "
+            "  FROM paper_collections pc "
+            " WHERE pc.domain = ? AND pc.collection = ?",
             (d_name, c_name),
         ).fetchone()
         total_papers = int(total_row[0] or 0) if total_row else 0
@@ -2013,11 +2024,12 @@ def mode_collection(
 
         rows = conn.execute(
             f"""
-            SELECT id, paper_name, title, authors, date,
-                   section_count, figure_count{abstract_col}
-              FROM papers
-             WHERE domain = ? AND collection = ?
-             ORDER BY date DESC, paper_name
+            SELECT p.id, p.paper_name, p.title, p.authors, p.date,
+                   p.section_count, p.figure_count{abstract_col}
+              FROM papers p
+              JOIN paper_collections pc ON pc.paper_id = p.id
+             WHERE pc.domain = ? AND pc.collection = ?
+             ORDER BY p.date DESC, p.paper_name
              LIMIT ?
             """,
             (d_name, c_name, limit),

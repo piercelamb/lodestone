@@ -2,8 +2,12 @@
   "domain_index": -1,
   "new_domain": "Multi-Agent Systems",
   "new_domain_desc": "Research on coordinating multiple autonomous agents to plan, reason, and act on shared tasks.",
-  "collection_index": -1,
-  "new_collection": "orchestration patterns",
-  "new_collection_desc": "Design patterns for dividing work between a planner agent and one or more executor agents.",
+  "collections": [
+    {
+      "index": -1,
+      "new_name": "orchestration patterns",
+      "new_desc": "Design patterns for dividing work between a planner agent and one or more executor agents."
+    }
+  ],
   "topics": ["planner-executor split", "tool routing"]
 }

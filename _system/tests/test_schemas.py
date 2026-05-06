@@ -192,16 +192,18 @@ class TestClassificationOutput:
             "domain": "nlp",
             "domain_is_new": False,
             "domain_description": None,
-            "collection": "transformers",
-            "collection_description": None,
+            "collections": [
+                {"name": "transformers", "description": None},
+            ],
             "topics": ["attention", "pretraining"],
         }
         co = ClassificationOutput.model_validate(payload)
         assert co.domain == "nlp"
         assert co.domain_is_new is False
         assert co.domain_description is None
-        assert co.collection == "transformers"
-        assert co.collection_description is None
+        assert len(co.collections) == 1
+        assert co.collections[0].name == "transformers"
+        assert co.collections[0].description is None
         assert co.topics == ["attention", "pretraining"]
 
     def test_accepts_domain_is_new_true_with_description_and_empty_topics(self):
@@ -209,15 +211,30 @@ class TestClassificationOutput:
             "domain": "new-field",
             "domain_is_new": True,
             "domain_description": "A new research area.",
-            "collection": "c",
-            "collection_description": "A new cluster of work.",
+            "collections": [
+                {"name": "c", "description": "A new cluster of work."},
+            ],
             "topics": [],
         }
         co = ClassificationOutput.model_validate(payload)
         assert co.domain_is_new is True
         assert co.domain_description == "A new research area."
-        assert co.collection_description == "A new cluster of work."
+        assert co.collections[0].description == "A new cluster of work."
         assert co.topics == []
+
+    def test_accepts_primary_plus_secondary(self):
+        payload = {
+            "domain": "rag",
+            "domain_is_new": False,
+            "domain_description": None,
+            "collections": [
+                {"name": "hybrid_search", "description": None},
+                {"name": "long_context_rag", "description": None},
+            ],
+            "topics": [],
+        }
+        co = ClassificationOutput.model_validate(payload)
+        assert [c.name for c in co.collections] == ["hybrid_search", "long_context_rag"]
 
     def test_rejects_missing_domain(self):
         with pytest.raises(ValidationError):
@@ -225,8 +242,9 @@ class TestClassificationOutput:
                 {
                     "domain_is_new": False,
                     "domain_description": None,
-                    "collection": "c",
-                    "collection_description": None,
+                    "collections": [
+                        {"name": "c", "description": None},
+                    ],
                     "topics": [],
                 }
             )
@@ -238,8 +256,9 @@ class TestClassificationOutput:
                     "domain": "nlp",
                     "domain_is_new": False,
                     "domain_description": None,
-                    "collection": "c",
-                    "collection_description": None,
+                    "collections": [
+                        {"name": "c", "description": None},
+                    ],
                     "topics": [],
                     "confidence": 0.9,
                 }
