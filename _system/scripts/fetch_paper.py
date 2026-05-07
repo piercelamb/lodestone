@@ -10,8 +10,12 @@ persists a stub ``papers`` row with ``status=failed_html`` and returns
 without raising — ``search.py --needs-review`` surfaces the failure.
 
 All outbound HTTP carries the ``Lodestone/1.0`` User-Agent header. Retries
-are 3-attempt exponential backoff, triggered only on 5xx / transport
-errors (per project policy: never swallow unexpected exceptions).
+are 3-attempt exponential backoff, triggered on 5xx / 429 / transport
+errors (per project policy: never swallow unexpected exceptions). 429 is
+included specifically because arxiv's Atom export throttles aggressively;
+a short backoff clears it. Note we hit ``export.arxiv.org`` directly
+rather than via the ``arxiv`` Python library — the library's hardcoded
+``arxiv.py/<v>`` UA shares a global throttle bucket and 429s constantly.
 """
 from __future__ import annotations
 
@@ -111,7 +115,10 @@ def _make_default_client() -> httpx.Client:
 
 def _is_transient(exc: BaseException) -> bool:
     if isinstance(exc, httpx.HTTPStatusError):
-        return 500 <= exc.response.status_code < 600
+        # Retry on 429 too — arxiv's API throttles aggressively, but a
+        # short backoff usually clears it.
+        sc = exc.response.status_code
+        return sc == 429 or 500 <= sc < 600
     return isinstance(exc, httpx.TransportError)
 
 
@@ -122,34 +129,70 @@ _retry_http = retry(
     reraise=True,
 )
 
+_ARXIV_API_URL = "https://export.arxiv.org/api/query?id_list={arxiv_id}"
+
+_ATOM_NS = "http://www.w3.org/2005/Atom"
+_ARXIV_NS = "http://arxiv.org/schemas/atom"
+
+
+@_retry_http
+def _arxiv_api_get(arxiv_id: str) -> str:
+    """GET arxiv's Atom export with our Lodestone UA.
+
+    The official ``arxiv`` Python lib sends ``user-agent: arxiv.py/<v>``,
+    which shares a global throttle bucket with every other user of that
+    library and 429s constantly. Our project UA carries a contact email
+    (per fetch_paper module docstring) and lands in arxiv's normal-citizen
+    rate class. Retries (5xx + 429) are handled by ``_retry_http``.
+    """
+    url = _ARXIV_API_URL.format(arxiv_id=arxiv_id)
+    with httpx.Client(headers={"User-Agent": USER_AGENT}, timeout=30.0) as c:
+        resp = c.get(url)
+        resp.raise_for_status()
+        return resp.text
+
 
 def _default_arxiv_lookup(arxiv_id: str) -> _ArxivMetadata:
-    """Query the arxiv API for a single id. Version suffix is accepted."""
-    import arxiv  # lazy — tests monkeypatch this entry point
+    """Query arxiv's Atom export for a single id. Version suffix accepted."""
+    import xml.etree.ElementTree as ET
 
-    results = list(arxiv.Search(id_list=[arxiv_id]).results())
-    if not results:
+    xml_text = _arxiv_api_get(arxiv_id)
+    root = ET.fromstring(xml_text)
+    entry = root.find(f"{{{_ATOM_NS}}}entry")
+    if entry is None:
         raise RuntimeError(f"arxiv API returned no result for {arxiv_id!r}")
-    return _result_to_metadata(results[0])
 
+    title_el = entry.find(f"{{{_ATOM_NS}}}title")
+    summary_el = entry.find(f"{{{_ATOM_NS}}}summary")
+    published_el = entry.find(f"{{{_ATOM_NS}}}published")
+    comment_el = entry.find(f"{{{_ARXIV_NS}}}comment")
+    title = (title_el.text or "").strip() if title_el is not None else ""
+    summary = (summary_el.text or "").strip() if summary_el is not None else ""
+    published_raw = (published_el.text or "").strip() if published_el is not None else ""
+    published = published_raw[:10]  # YYYY-MM-DD prefix of ISO 8601
+    comment = (comment_el.text or "").strip() if comment_el is not None else None
 
-def _result_to_metadata(result) -> _ArxivMetadata:
-    authors = [getattr(a, "name", None) or str(a) for a in result.authors]
-    published = result.published
-    if hasattr(published, "strftime"):
-        published_str = published.strftime("%Y-%m-%d")
-    else:
-        published_str = str(published)[:10]
-    pdf_url = getattr(result, "pdf_url", None)
+    authors: list[str] = []
+    for author_el in entry.findall(f"{{{_ATOM_NS}}}author"):
+        name_el = author_el.find(f"{{{_ATOM_NS}}}name")
+        if name_el is not None and name_el.text:
+            authors.append(name_el.text.strip())
+
+    pdf_url: str | None = None
+    for link in entry.findall(f"{{{_ATOM_NS}}}link"):
+        if link.get("type") == "application/pdf":
+            pdf_url = link.get("href")
+            break
     if not pdf_url:
-        pdf_url = _ARXIV_PDF_URL.format(arxiv_id=_strip_version(str(result.entry_id).rsplit("/", 1)[-1]))
+        pdf_url = _ARXIV_PDF_URL.format(arxiv_id=_strip_version(arxiv_id))
+
     return _ArxivMetadata(
-        title=result.title.strip(),
+        title=title,
         authors=authors,
-        abstract=(getattr(result, "summary", "") or "").strip(),
-        published=published_str,
-        comment=getattr(result, "comment", None),
-        summary=getattr(result, "summary", None),
+        abstract=summary,
+        published=published,
+        comment=comment,
+        summary=summary or None,
         pdf_url=pdf_url,
     )
 

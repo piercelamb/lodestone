@@ -16,7 +16,7 @@ from urllib.parse import urljoin
 
 import lxml.html
 
-from _system.utils.arxiv_urls import extract_arxiv_id_from_text
+from _system.utils.arxiv_urls import extract_arxiv_id_from_text, fix_figure_url
 from _system.utils.logging import get_logger
 
 _logger = get_logger("html.latexml_parser")
@@ -324,7 +324,7 @@ def _convert_figure(elem, state: _State) -> str:
                 )
                 markdown = placeholder
     else:
-        src_url = urljoin(state.base_url, src)
+        src_url = fix_figure_url(urljoin(state.base_url, src))
         markdown = image_ref
 
     state.figures.append(
