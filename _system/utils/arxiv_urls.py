@@ -58,6 +58,28 @@ _URL_PREFIXES: tuple[str, ...] = (
 )
 
 
+# arxiv.org serves HTML at /html/{id} (no version) but its figure srcs
+# come in two flavors across papers: bare "x1.png" (relative to the page)
+# and "{id}vN/x1.png" (a versioned subpath). With the trailing-slash base
+# above, urljoin handles the first case correctly but produces a doubled
+# path "/html/{id}/{id}vN/x1.png" for the second — a 404. This regex
+# collapses that duplication post-urljoin so both src patterns resolve.
+# Anchored on /html/ to avoid touching unrelated URLs that happen to have
+# the same id-twice substring.
+_ARXIV_HTML_DUP_ID_RE = re.compile(
+    r"(/html/)(\d{4}\.\d{4,5}|[a-z\-]+/\d{7})/(\2(?:v\d+)?/)"
+)
+
+
+def fix_figure_url(url: str) -> str:
+    """Collapse arxiv.org's duplicated /html/{id}/{id}vN/ figure paths.
+
+    No-op for ar5iv (absolute /html/{id}/assets/... srcs don't trip the
+    dup pattern) and for paths that already resolve correctly.
+    """
+    return _ARXIV_HTML_DUP_ID_RE.sub(r"\1\3", url)
+
+
 def base_url_for_source(source: HtmlSource, arxiv_id: str) -> str:
     if source is HtmlSource.ARXIV:
         return _ARXIV_HTML_BASE.format(arxiv_id=arxiv_id)

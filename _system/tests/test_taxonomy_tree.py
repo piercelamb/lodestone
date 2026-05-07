@@ -244,10 +244,10 @@ def test_render_tree_index_style_classify_format():
     )
 
     expected = (
-        "0. rag — retrieval augmented generation\n"
-        "   ├── 0: hybrid_search — dense+sparse retrieval fusion\n"
+        "0. rag\n"
+        "   ├── 0: hybrid_search\n"
         "   └── 1: rag_systems\n"
-        "1. agents — multi-agent systems   (no existing collections)\n"
+        "1. agents   (no existing collections)\n"
         "2. theorem_proving\n"
         "   ├── 0: saturation_methods\n"
         "   ├── 1: superposition\n"

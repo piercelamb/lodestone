@@ -209,10 +209,12 @@ def render_taxonomy_tree(
 ) -> str:
     """Render a list of ``DomainNode`` as tree text.
 
-    ``style=INDEX`` — classify_paper format::
+    ``style=INDEX`` — classify_paper format (names only; descriptions
+    are intentionally omitted — the classifier picks by index, and
+    descriptions blow up prompt size without changing the choice)::
 
-        0. rag — desc
-           ├── 0: hybrid_search — desc
+        0. rag
+           ├── 0: hybrid_search
            └── 1: rag_systems
 
     ``style=COUNT`` — overview format::
@@ -243,11 +245,7 @@ def _render_index(
 ) -> str:
     lines: list[str] = []
     for i, node in enumerate(domains):
-        head = (
-            f"{i}. {node.name} — {node.description}"
-            if node.description
-            else f"{i}. {node.name}"
-        )
+        head = f"{i}. {node.name}"
         if not node.collections:
             lines.append(f"{head}   (no existing collections)")
             continue
@@ -257,12 +255,7 @@ def _render_index(
         n_leaves = len(node.collections) + (1 if has_overflow else 0)
         for j, coll in enumerate(node.collections):
             connector = "└──" if j == n_leaves - 1 else "├──"
-            leaf = (
-                f"{j}: {coll.name} — {coll.description}"
-                if coll.description
-                else f"{j}: {coll.name}"
-            )
-            lines.append(f"   {connector} {leaf}")
+            lines.append(f"   {connector} {j}: {coll.name}")
         if has_overflow:
             tail = overflow_message.format(n=node.overflow)
             lines.append(f"   └── {tail}")
