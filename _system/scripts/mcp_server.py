@@ -36,6 +36,7 @@ from typing import Any
 
 from _system.db.connection import get_conn
 from _system.scripts.search import (
+    CitationDirection,
     Scope,
     _SOFT_FAILURE_STATUSES,
     format_collection_text,
@@ -43,6 +44,7 @@ from _system.scripts.search import (
     format_search_markdown,
     mode_bm25,
     mode_browse,
+    mode_citations,
     mode_collection,
     mode_figure,
     mode_overview,
@@ -237,15 +239,15 @@ def _resolve_paper_id_for_payload(
 ) -> int | None:
     """Best-effort: find the paper_id this payload is talking about.
 
-    Top-level ``paper_name`` (read/toc/figure/repo_tree/read_code) wins.
-    For BM25 results, fall back to the first hit's paper_name. Returns
+    Top-level ``slug`` (read/toc) or ``paper_name`` (figure/repo_tree/
+    read_code) wins. For BM25 results, fall back to the first hit. Returns
     ``None`` when no paper context is determinable.
     """
-    name = payload.get("paper_name")
+    name = payload.get("slug") or payload.get("paper_name")
     if not name:
         results = payload.get("results") or []
         if results and isinstance(results[0], dict):
-            name = results[0].get("paper_name")
+            name = results[0].get("slug") or results[0].get("paper_name")
     if not name:
         return None
     row = conn.execute(
@@ -507,17 +509,17 @@ def _collection_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
 
 
 def _toc_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
-    return mode_toc(conn, paper_name=args["paper_name"])
+    return mode_toc(conn, slug=args["slug"])
 
 
 def _toc_many_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
-    return mode_toc_many(conn, paper_names=list(args["paper_names"]))
+    return mode_toc_many(conn, slugs=list(args["slugs"]))
 
 
 def _read_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
     return mode_read(
         conn,
-        paper_name=args["paper_name"],
+        slug=args["slug"],
         section=args.get("section"),
     )
 
@@ -546,6 +548,16 @@ def _read_code_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
 
 def _repo_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
     return mode_repo(conn, repo=args["repo"])
+
+
+def _citations_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
+    return mode_citations(
+        conn,
+        slug=args["slug"],
+        direction=args.get("direction", CitationDirection.OUTBOUND.value),
+        limit=int(args.get("limit", 50)),
+        offset=int(args.get("offset", 0)),
+    )
 
 
 def _tables_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
@@ -888,12 +900,14 @@ TOOLS: list[dict[str, Any]] = [
             "Top-down corpus map. Domains are broad research areas; each "
             "domain contains collections that subdivide it by approach or "
             "technique. This tool returns the nested domains → collections "
-            "tree with paper counts. Use it FIRST when you want to navigate "
-            "by structure rather than keywords (the complement to "
+            "tree with per-kind counts (paper_count, post_count, "
+            "repo_count). Use it FIRST when you want to navigate by "
+            "structure rather than keywords (the complement to "
             "'search'). Then drill into one or more collections via "
-            "'collection' to see papers with abstracts/topics, and feed "
-            "paper_names into 'toc_many' to inspect structures side-by-side. "
-            "The tree drops empty domains/collections (zero papers)."
+            "'collection' to see papers/posts with abstracts/topics, and "
+            "feed slugs into 'toc_many' to inspect structures "
+            "side-by-side. The tree drops empty domains/collections "
+            "(zero rows)."
         ),
         "inputSchema": {
             "type": "object",
@@ -959,12 +973,14 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "toc",
         "description": (
-            "Return the level-1..3 ATX header table of contents for a paper."
+            "Return the level-1..3 ATX header table of contents for a "
+            "paper or blog post. 'slug' accepts either kind — the slug "
+            "namespace is shared."
         ),
         "inputSchema": {
             "type": "object",
-            "properties": {"paper_name": {"type": "string"}},
-            "required": ["paper_name"],
+            "properties": {"slug": {"type": "string"}},
+            "required": ["slug"],
         },
         "dispatch": _toc_dispatch,
         "attach": AttachMode.NONE,
@@ -972,23 +988,24 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "toc_many",
         "description": (
-            "Return the level-1..3 ATX header table of contents for multiple "
-            "papers in one call. Use this after 'search' / 'bm25' / 'lookup' "
-            "surfaces several candidate papers and you want to scan their "
-            "structures side-by-side before deciding where to 'read'. "
-            "Names that don't resolve are reported in 'missing' instead of "
-            "raising — a typo in one name doesn't abandon the rest."
+            "Return the level-1..3 ATX header table of contents for "
+            "multiple sources in one call. 'slugs' may mix paper and "
+            "post slugs freely. Use this after 'search' / 'bm25' / "
+            "'lookup' surfaces several candidates and you want to scan "
+            "their structures side-by-side before deciding where to "
+            "'read'. Slugs that don't resolve are reported in 'missing' "
+            "instead of raising — a typo in one doesn't abandon the rest."
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "paper_names": {
+                "slugs": {
                     "type": "array",
                     "items": {"type": "string"},
                     "minItems": 1,
                 },
             },
-            "required": ["paper_names"],
+            "required": ["slugs"],
         },
         "dispatch": _toc_many_dispatch,
         "attach": AttachMode.NONE,
@@ -996,23 +1013,25 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "read",
         "description": (
-            "Read a paper's markdown — full body, or a hierarchical "
+            "Read a source's markdown — full body, or a hierarchical "
             "section slice via 'section' (e.g. 'Method' or "
-            "'Method > Setup'). Any (figure:N) refs in the returned "
-            "markdown are appended as inline image content blocks "
-            "following the JSON; each image is preceded by a "
-            "'--- paper_id=X figure=N caption=... ---' text marker."
+            "'Method > Setup'). 'slug' accepts either a paper or post "
+            "slug. Any (figure:N) refs in the returned markdown are "
+            "appended as inline image content blocks following the JSON; "
+            "each image is preceded by a '--- paper_id=X figure=N "
+            "caption=... ---' text marker. (Posts don't carry figure "
+            "refs in v1.)"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "paper_name": {"type": "string"},
+                "slug": {"type": "string"},
                 "section": {
                     "type": "string",
                     "description": "Optional 'Parent > Child' breadcrumb.",
                 },
             },
-            "required": ["paper_name"],
+            "required": ["slug"],
         },
         "dispatch": _read_dispatch,
         "attach": AttachMode.SCAN,
@@ -1103,6 +1122,70 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["repo"],
         },
         "dispatch": _repo_dispatch,
+        "attach": AttachMode.NONE,
+    },
+    {
+        "name": "citations",
+        "description": (
+            "Outbound or inbound citation graph for a paper or post slug.\n\n"
+            "Outbound (direction='outbound', default): the references this "
+            "source cites, bucketed by resolution state:\n"
+            "  - resolved — cited paper is already in the corpus "
+            "(carries slug, title, arxiv_id, raw_text, cited_status); pivot "
+            "to it via `read` / `toc`.\n"
+            "  - missing — cited an arxiv id we haven't ingested "
+            "(carries arxiv_id, raw_text, ingest_hint with the exact "
+            "`ingest_paper` call to run).\n"
+            "  - unresolvable — reference has no arxiv id at all "
+            "(non-arxiv venues / hand-typed bibitems with missing eprint).\n"
+            "Outbound returns ALL refs (no pagination); response is capped "
+            "at 500 rows with truncated=true if exceeded — paper "
+            "bibliographies are O(50-200) refs in practice.\n\n"
+            "Inbound (direction='inbound'): papers + posts in the corpus "
+            "that cite this paper, unioned and ordered by date DESC. "
+            "Paginated by `limit` / `offset` — response carries "
+            "`total_hits` and `has_more`. Inbound is paper-only — passing a "
+            "post slug returns soft-status `unsupported_direction` because "
+            "the schema's cited_paper_id only points at papers.\n\n"
+            "Soft statuses: `not_found` (slug missed all three "
+            "namespaces), `unsupported_direction` (post + inbound, repo + "
+            "anything), `invalid_pagination` (negative limit/offset)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "slug": {
+                    "type": "string",
+                    "description": "paper_name or post_name.",
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": [d.value for d in CitationDirection],
+                    "default": CitationDirection.OUTBOUND.value,
+                    "description": (
+                        "outbound (what this source cites) or inbound "
+                        "(what cites this paper)."
+                    ),
+                },
+                "limit": {
+                    "type": "integer",
+                    "default": 50,
+                    "minimum": 1,
+                    "description": "inbound only — page size (default 50).",
+                },
+                "offset": {
+                    "type": "integer",
+                    "default": 0,
+                    "minimum": 0,
+                    "description": (
+                        "inbound only — skip this many ranked rows. Pair "
+                        "with `limit` to walk forward."
+                    ),
+                },
+            },
+            "required": ["slug"],
+        },
+        "dispatch": _citations_dispatch,
         "attach": AttachMode.NONE,
     },
     {

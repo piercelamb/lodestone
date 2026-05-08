@@ -2288,36 +2288,36 @@ def mode_collection(
 # ---------------------------------------------------------------------------
 
 
-def mode_toc(conn: sqlite3.Connection, *, paper_name: str) -> dict[str, Any]:
+def mode_toc(conn: sqlite3.Connection, *, slug: str) -> dict[str, Any]:
     """Flatten ``papers.markdown`` (or ``posts.markdown``) into level-1..3
     headers via the shared :func:`split_sections` walker. The slug
-    namespace is shared, so a ``paper_name`` argument may resolve to
-    either a paper or a post — both share the same ToC contract.
+    namespace is shared across papers and posts, so ``slug`` may resolve
+    to either kind — both share the same ToC contract.
     """
-    markdown = _read_source_markdown(conn, paper_name)
+    markdown = _read_source_markdown(conn, slug)
     if markdown is None:
-        raise ValueError(f"paper not found: paper_name={paper_name!r}")
+        raise ValueError(f"source not found: slug={slug!r}")
 
     toc = [
         {"level": chunk.level, "title": chunk.title}
         for chunk in split_sections(markdown)
     ]
-    return {"mode": "toc", "paper_name": paper_name, "toc": toc}
+    return {"mode": "toc", "slug": slug, "toc": toc}
 
 
 def mode_toc_many(
-    conn: sqlite3.Connection, *, paper_names: list[str]
+    conn: sqlite3.Connection, *, slugs: list[str]
 ) -> dict[str, Any]:
-    """Multi-paper ToC. Resolves each name independently; missing names are
-    reported in ``missing`` rather than raising, so a typo in one name doesn't
-    abandon the rest. Empty list raises — that's a caller bug.
+    """Multi-source ToC. Resolves each slug independently; missing slugs
+    are reported in ``missing`` rather than raising, so a typo in one
+    doesn't abandon the rest. Empty list raises — that's a caller bug.
     """
-    if not paper_names:
-        raise ValueError("paper_names must contain at least one paper name")
+    if not slugs:
+        raise ValueError("slugs must contain at least one slug")
 
     seen: set[str] = set()
     ordered: list[str] = []
-    for name in paper_names:
+    for name in slugs:
         if name not in seen:
             seen.add(name)
             ordered.append(name)
@@ -2326,12 +2326,12 @@ def mode_toc_many(
     missing: list[str] = []
     for name in ordered:
         try:
-            results.append(mode_toc(conn, paper_name=name))
+            results.append(mode_toc(conn, slug=name))
         except ValueError:
             missing.append(name)
     return {
         "mode": "toc_many",
-        "paper_names": ordered,
+        "slugs": ordered,
         "results": results,
         "missing": missing,
     }
@@ -2345,32 +2345,33 @@ def mode_toc_many(
 def mode_read(
     conn: sqlite3.Connection,
     *,
-    paper_name: str,
+    slug: str,
     section: str | None,
 ) -> dict[str, Any]:
-    """Return the full markdown or a hierarchical section slice.
+    """Return the full markdown or a hierarchical section slice. ``slug``
+    accepts either a paper or post slug — the namespace is shared.
 
     Failures of the section slice are NOT raised — they're emitted as
     structured payloads so the agent can recover. ``status`` is one of:
 
     - missing: ``"section_not_found"`` — well-formed query, no matching
-      header in this paper. Payload includes the actual top-level section
-      titles + a hint pointing at ``--toc`` and the whole-paper fallback.
+      header in this source. Payload includes the actual top-level section
+      titles + a hint pointing at ``--toc`` and the whole-source fallback.
     - malformed: ``"malformed_section_query"`` — Claude's query violates
       breadcrumb syntax. Payload echoes the bad query and the rule message.
 
-    A non-existent paper still raises ``ValueError`` — that's a hard error
+    A non-existent slug still raises ``ValueError`` — that's a hard error
     (the caller picked the wrong arg), not a recoverable agent miss.
     """
-    markdown = _read_source_markdown(conn, paper_name)
+    markdown = _read_source_markdown(conn, slug)
     if markdown is None:
-        raise ValueError(f"paper not found: paper_name={paper_name!r}")
+        raise ValueError(f"source not found: slug={slug!r}")
 
     if section is None:
         return {
             "mode": "read",
             "status": "ok",
-            "paper_name": paper_name,
+            "slug": slug,
             "section": None,
             "text": markdown,
         }
@@ -2381,7 +2382,7 @@ def mode_read(
         return {
             "mode": "read",
             "status": "malformed_section_query",
-            "paper_name": paper_name,
+            "slug": slug,
             "requested_section": section,
             "error": str(e),
             "hint": (
@@ -2397,19 +2398,19 @@ def mode_read(
         return {
             "mode": "read",
             "status": "section_not_found",
-            "paper_name": paper_name,
+            "slug": slug,
             "requested_section": section,
             "available_top_level_sections": available,
             "hint": (
-                f"Run --toc {paper_name} for the full hierarchy, or drop "
-                f"--section to read the whole paper."
+                f"Run --toc {slug} for the full hierarchy, or drop "
+                f"--section to read the whole source."
             ),
         }
 
     return {
         "mode": "read",
         "status": "ok",
-        "paper_name": paper_name,
+        "slug": slug,
         "section": section,
         "text": text,
     }
@@ -2480,6 +2481,353 @@ def mode_repo(
         "paper_name": row[17],
         "paper_title": row[18],
         "topics": topics_by_id.get(repo_id, []),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Mode 6b — Citations (outbound + inbound)
+# ---------------------------------------------------------------------------
+
+
+class CitationDirection(StrEnum):
+    OUTBOUND = "outbound"
+    INBOUND = "inbound"
+
+
+# Hard cap on outbound bucket size. Paper bibliographies are typically
+# 50-200 refs; 500 leaves headroom for pathological cases without
+# unbounded payload growth.
+_OUTBOUND_REF_CAP = 500
+
+
+def _arxiv_ingest_hint(arxiv_id: str) -> str:
+    return f"ingest_paper(url='https://arxiv.org/abs/{arxiv_id}')"
+
+
+def _papers_meta_by_id(
+    conn: sqlite3.Connection, paper_ids: list[int]
+) -> dict[int, tuple[str, str, str]]:
+    """Batch-load (paper_name, title, status) for the given paper IDs."""
+    if not paper_ids:
+        return {}
+    placeholders = ",".join("?" for _ in paper_ids)
+    meta: dict[int, tuple[str, str, str]] = {}
+    for cid, paper_name, title, status in conn.execute(
+        f"SELECT id, paper_name, title, status FROM papers "
+        f" WHERE id IN ({placeholders})",
+        paper_ids,
+    ).fetchall():
+        meta[int(cid)] = (paper_name, title, status)
+    return meta
+
+
+def _outbound_paper_refs(
+    conn: sqlite3.Connection, paper_id: int
+) -> dict[str, Any]:
+    """Bucket a paper's outbound references into resolved / missing /
+    unresolvable. One SELECT over ``paper_references`` plus one batch
+    enrichment SELECT over ``papers`` for the resolved cited_paper_ids.
+    """
+    rows = conn.execute(
+        """
+        SELECT bibitem_id, ref_number, raw_text, cited_arxiv_id, cited_paper_id
+          FROM paper_references
+         WHERE paper_id = ?
+         ORDER BY ref_number
+         LIMIT ?
+        """,
+        (paper_id, _OUTBOUND_REF_CAP + 1),
+    ).fetchall()
+
+    truncated = len(rows) > _OUTBOUND_REF_CAP
+    if truncated:
+        rows = rows[:_OUTBOUND_REF_CAP]
+
+    cited_meta = _papers_meta_by_id(
+        conn, [int(r[4]) for r in rows if r[4] is not None]
+    )
+
+    resolved: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    unresolvable: list[dict[str, Any]] = []
+
+    for bibitem_id, ref_number, raw_text, cited_arxiv_id, cited_paper_id in rows:
+        ref_no = int(ref_number)
+        if cited_paper_id is not None:
+            meta = cited_meta.get(int(cited_paper_id))
+            if meta is None:
+                continue
+            paper_name, title, status = meta
+            resolved.append({
+                "slug": paper_name,
+                "title": title,
+                "arxiv_id": cited_arxiv_id,
+                "raw_text": raw_text,
+                "ref_number": ref_no,
+                "bibitem_id": bibitem_id,
+                "cited_status": status,
+            })
+        elif cited_arxiv_id is not None:
+            missing.append({
+                "arxiv_id": cited_arxiv_id,
+                "raw_text": raw_text,
+                "ref_number": ref_no,
+                "bibitem_id": bibitem_id,
+                "ingest_hint": _arxiv_ingest_hint(cited_arxiv_id),
+            })
+        else:
+            unresolvable.append({
+                "raw_text": raw_text,
+                "ref_number": ref_no,
+            })
+
+    return {
+        "resolved": resolved,
+        "missing": missing,
+        "unresolvable": unresolvable,
+        "truncated": truncated,
+    }
+
+
+def _outbound_post_refs(
+    conn: sqlite3.Connection, post_id: int
+) -> dict[str, Any]:
+    """Sibling of :func:`_outbound_paper_refs` for posts. ``post_references``
+    has no ``bibitem_id`` / ``ref_number``, so those keys are omitted from
+    every bucket entry.
+    """
+    rows = conn.execute(
+        """
+        SELECT id, raw_text, cited_arxiv_id, cited_paper_id
+          FROM post_references
+         WHERE post_id = ?
+         ORDER BY id
+         LIMIT ?
+        """,
+        (post_id, _OUTBOUND_REF_CAP + 1),
+    ).fetchall()
+
+    truncated = len(rows) > _OUTBOUND_REF_CAP
+    if truncated:
+        rows = rows[:_OUTBOUND_REF_CAP]
+
+    cited_meta = _papers_meta_by_id(
+        conn, [int(r[3]) for r in rows if r[3] is not None]
+    )
+
+    resolved: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    unresolvable: list[dict[str, Any]] = []
+
+    for _row_id, raw_text, cited_arxiv_id, cited_paper_id in rows:
+        if cited_paper_id is not None:
+            meta = cited_meta.get(int(cited_paper_id))
+            if meta is None:
+                continue
+            paper_name, title, status = meta
+            resolved.append({
+                "slug": paper_name,
+                "title": title,
+                "arxiv_id": cited_arxiv_id,
+                "raw_text": raw_text,
+                "cited_status": status,
+            })
+        elif cited_arxiv_id is not None:
+            missing.append({
+                "arxiv_id": cited_arxiv_id,
+                "raw_text": raw_text,
+                "ingest_hint": _arxiv_ingest_hint(cited_arxiv_id),
+            })
+        else:
+            unresolvable.append({
+                "raw_text": raw_text,
+            })
+
+    return {
+        "resolved": resolved,
+        "missing": missing,
+        "unresolvable": unresolvable,
+        "truncated": truncated,
+    }
+
+
+def _inbound_refs(
+    conn: sqlite3.Connection, paper_id: int
+) -> list[dict[str, Any]]:
+    """Union papers and posts that cite this paper. Sorted by
+    (date DESC, slug ASC) so the agent sees the most recent citing
+    sources first. Caller paginates the returned list.
+    """
+    paper_rows = conn.execute(
+        """
+        SELECT p.paper_name, p.title, p.date, pr.raw_text, pr.ref_number
+          FROM paper_references pr
+          JOIN papers p ON p.id = pr.paper_id
+         WHERE pr.cited_paper_id = ?
+        """,
+        (paper_id,),
+    ).fetchall()
+    post_rows = conn.execute(
+        """
+        SELECT po.post_name, po.title, po.date, por.raw_text
+          FROM post_references por
+          JOIN posts po ON po.id = por.post_id
+         WHERE por.cited_paper_id = ?
+        """,
+        (paper_id,),
+    ).fetchall()
+
+    merged: list[dict[str, Any]] = []
+    for slug, title, date, raw_text, ref_number in paper_rows:
+        merged.append({
+            "kind": "paper",
+            "slug": slug,
+            "title": title,
+            "date": date,
+            "raw_text": raw_text,
+            "ref_number": int(ref_number),
+        })
+    for slug, title, date, raw_text in post_rows:
+        merged.append({
+            "kind": "post",
+            "slug": slug,
+            "title": title,
+            "date": date,
+            "raw_text": raw_text,
+        })
+
+    # Date is ISO YYYY-MM-DD so lexicographic compare matches chronological.
+    merged.sort(key=lambda r: r["slug"])
+    merged.sort(key=lambda r: r["date"] or "", reverse=True)
+    return merged
+
+
+def mode_citations(
+    conn: sqlite3.Connection,
+    *,
+    slug: str,
+    direction: str = CitationDirection.OUTBOUND.value,
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Return outbound or inbound citations for a paper or post slug.
+
+    Outbound bucketed by resolution state (resolved / missing /
+    unresolvable). Inbound returns a paginated, recency-ordered union of
+    citing papers + posts. ``slug`` resolves via the shared papers/posts
+    namespace; a ``repo_slug`` is detected separately and returns
+    ``unsupported_direction`` (repos have no reference graph). Unknown
+    slugs return ``not_found``.
+    """
+    try:
+        direction_enum = CitationDirection(direction)
+    except ValueError:
+        raise ValueError(
+            f"direction must be 'outbound' or 'inbound', got {direction!r}"
+        )
+
+    if limit < 0 or offset < 0:
+        return {
+            "mode": "citations",
+            "status": "invalid_pagination",
+            "slug": slug,
+            "direction": direction_enum.value,
+            "error": (
+                f"limit and offset must be non-negative; "
+                f"got limit={limit}, offset={offset}"
+            ),
+        }
+
+    resolved = lookup_slug(conn, slug)
+    if resolved is None:
+        # Distinguish "repo slug, doesn't make sense" from "truly unknown".
+        repo_row = conn.execute(
+            "SELECT 1 FROM repos WHERE repo_slug = ?", (slug,),
+        ).fetchone()
+        if repo_row is not None:
+            return {
+                "mode": "citations",
+                "status": "unsupported_direction",
+                "slug": slug,
+                "kind": "repo",
+                "direction": direction_enum.value,
+                "hint": (
+                    f"repo {slug!r} has no reference graph. Citations are "
+                    f"tracked on papers and posts only — try the linked "
+                    f"paper via `repo` to find the paper_name, then call "
+                    f"citations on that slug."
+                ),
+            }
+        return {
+            "mode": "citations",
+            "status": "not_found",
+            "slug": slug,
+            "direction": direction_enum.value,
+            "hint": (
+                f"slug {slug!r} not found in papers, posts, or repos. "
+                f"Use `lookup` to find candidate slugs."
+            ),
+        }
+
+    kind_str = "paper" if resolved.kind is SourceKind.PAPER else "post"
+
+    if direction_enum is CitationDirection.OUTBOUND:
+        if resolved.kind is SourceKind.PAPER:
+            buckets = _outbound_paper_refs(conn, resolved.id)
+        else:
+            buckets = _outbound_post_refs(conn, resolved.id)
+        total = (
+            len(buckets["resolved"])
+            + len(buckets["missing"])
+            + len(buckets["unresolvable"])
+        )
+        return {
+            "mode": "citations",
+            "status": "ok",
+            "slug": slug,
+            "kind": kind_str,
+            "direction": direction_enum.value,
+            "resolved": buckets["resolved"],
+            "missing": buckets["missing"],
+            "unresolvable": buckets["unresolvable"],
+            "resolved_count": len(buckets["resolved"]),
+            "missing_count": len(buckets["missing"]),
+            "unresolvable_count": len(buckets["unresolvable"]),
+            "total": total,
+            "truncated": buckets["truncated"],
+        }
+
+    # Inbound — only meaningful for papers (posts aren't citable: nothing
+    # in the schema points cited_paper_id at a post).
+    if resolved.kind is SourceKind.POST:
+        return {
+            "mode": "citations",
+            "status": "unsupported_direction",
+            "slug": slug,
+            "kind": "post",
+            "direction": direction_enum.value,
+            "hint": (
+                f"posts are not themselves citable — no row in "
+                f"paper_references / post_references points its "
+                f"cited_paper_id at a post. Inbound citations are "
+                f"defined for papers only."
+            ),
+        }
+
+    merged = _inbound_refs(conn, resolved.id)
+    total_hits = len(merged)
+    page = merged[offset:offset + limit]
+    return {
+        "mode": "citations",
+        "status": "ok",
+        "slug": slug,
+        "kind": "paper",
+        "direction": direction_enum.value,
+        "results": page,
+        "total_hits": total_hits,
+        "offset": offset,
+        "limit": limit,
+        "has_more": offset + len(page) < total_hits,
     }
 
 
@@ -3670,14 +4018,14 @@ def to_human(payload: dict[str, Any]) -> str:
             )
 
     elif mode == "toc":
-        lines.append(f"== ToC {payload.get('paper_name')} ==")
+        lines.append(f"== ToC {payload.get('slug')} ==")
         for entry in payload.get("toc", []):
             indent = "  " * (entry["level"] - 1)
             lines.append(f"{indent}{'#' * entry['level']} {entry['title']}")
 
     elif mode == "toc_many":
         for sub in payload.get("results", []):
-            lines.append(f"== ToC {sub.get('paper_name')} ==")
+            lines.append(f"== ToC {sub.get('slug')} ==")
             for entry in sub.get("toc", []):
                 indent = "  " * (entry["level"] - 1)
                 lines.append(
@@ -3694,7 +4042,7 @@ def to_human(payload: dict[str, Any]) -> str:
 
     elif mode == "read":
         status = payload.get("status", "ok")
-        paper = payload.get("paper_name")
+        paper = payload.get("slug")
         if status == "section_not_found":
             lines.append(
                 f"section not found in {paper}: "
@@ -4012,16 +4360,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--toc", default=None, action="append",
         help=(
-            "ToC of PAPER (paper_name). Repeat the flag to fetch multiple "
-            "papers in one call: --toc paper_a --toc paper_b. Single use "
-            "returns a flat envelope; repeated use returns a toc_many "
-            "envelope with per-paper results plus a 'missing' list for "
-            "names that didn't resolve."
+            "ToC of SLUG (paper or post — the slug namespace is shared). "
+            "Repeat the flag to fetch multiple sources in one call: "
+            "--toc slug_a --toc slug_b. Single use returns a flat "
+            "envelope; repeated use returns a toc_many envelope with "
+            "per-source results plus a 'missing' list for slugs that "
+            "didn't resolve."
         ),
     )
 
     p.add_argument("--read", default=None,
-                   help="read full markdown of PAPER (paper_name)")
+                   help="read full markdown of SLUG (paper or post)")
     p.add_argument("--section", default=None,
                    help="when --read is set, slice to this section "
                         "(supports 'Parent > Child' breadcrumb)")
@@ -4048,6 +4397,24 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="repo-relative file path for --read-code")
     p.add_argument("--lines", default=None,
                    help="line range A-B (1-based, inclusive) for --read-code")
+
+    p.add_argument(
+        "--citations", default=None,
+        help=(
+            "outbound or inbound citation graph for SLUG (paper or post). "
+            "Outbound (default) returns three buckets — resolved (cited "
+            "sources we have), missing (arxiv ids worth ingesting), "
+            "unresolvable (no arxiv id at all). Inbound returns papers + "
+            "posts that cite this paper (paginated, recency-ordered). "
+            "Use --direction to switch. --limit/--offset apply to inbound."
+        ),
+    )
+    p.add_argument(
+        "--direction",
+        default=CitationDirection.OUTBOUND.value,
+        choices=tuple(d.value for d in CitationDirection),
+        help="--citations direction: outbound (default) or inbound.",
+    )
 
     p.add_argument(
         "--tables", action="store_true",
@@ -4145,6 +4512,8 @@ def _check_mode_conflicts(
         modes.append("--read-code")
     if args.read_code_slug is not None:
         modes.append("--read-code-slug")
+    if args.citations is not None:
+        modes.append("--citations")
     if args.overview:
         modes.append("--overview")
     if args.collection_name is not None:
@@ -4160,6 +4529,17 @@ def _check_mode_conflicts(
         parser.error(
             f"mutually exclusive modes selected: {', '.join(modes)}. "
             f"Pick exactly one."
+        )
+
+    # `--direction` is a `--citations` modifier; reject it elsewhere so a
+    # stray flag doesn't get silently dropped.
+    if (
+        args.direction != CitationDirection.OUTBOUND.value
+        and args.citations is None
+    ):
+        parser.error(
+            "--direction requires --citations SLUG. It is ignored by "
+            "every other mode."
         )
 
     # `--scope` is a Mode-1 modifier, not a mode. It MUST NOT count above,
@@ -4206,6 +4586,16 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
             limit=args.collection_limit,
         )
 
+    # Mode 6b: citations
+    if args.citations is not None:
+        return mode_citations(
+            conn,
+            slug=args.citations,
+            direction=args.direction,
+            limit=50 if args.limit is None else args.limit,
+            offset=args.offset,
+        )
+
     # Mode 6: repo tree / read code
     if args.repo_tree is not None:
         return mode_repo_tree(conn, paper_name=args.repo_tree)
@@ -4233,15 +4623,15 @@ def _dispatch(args: argparse.Namespace, conn: sqlite3.Connection) -> dict[str, A
 
     # Mode 5a: read
     if args.read is not None:
-        return mode_read(conn, paper_name=args.read, section=args.section)
+        return mode_read(conn, slug=args.read, section=args.section)
 
     # Mode 4: toc. action='append' gives ['name'] for one --toc and
     # ['a', 'b', ...] for repeated use. Single → flat mode_toc envelope;
     # multi → mode_toc_many envelope.
     if args.toc:
         if len(args.toc) == 1:
-            return mode_toc(conn, paper_name=args.toc[0])
-        return mode_toc_many(conn, paper_names=args.toc)
+            return mode_toc(conn, slug=args.toc[0])
+        return mode_toc_many(conn, slugs=args.toc)
 
     # Mode 3: browse
     domain_filter: dict[str, Any] = {"domain": args.domain}
@@ -4353,6 +4743,14 @@ _SOFT_FAILURE_STATUSES = frozenset({
     "read_only_violation",
     "query_timeout",
     "query_failed",
+    # citations tool: slug missed all three namespaces (papers / posts /
+    # repos) → soft-fail so the agent can recover. Also covers the
+    # latent miss in `mode_repo` (search.py:2451), which already returns
+    # ``not_found`` but wasn't previously in this set.
+    "not_found",
+    # citations tool: direction/kind combo has no defined semantics
+    # (post + inbound, repo + anything).
+    "unsupported_direction",
 })
 
 

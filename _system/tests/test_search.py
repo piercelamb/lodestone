@@ -2189,9 +2189,9 @@ class TestModeBrowse:
 
 class TestModeToc:
     def test_returns_header_hierarchy(self, seeded_db):
-        r = search_mod.mode_toc(seeded_db, paper_name="bookrag_2024")
+        r = search_mod.mode_toc(seeded_db, slug="bookrag_2024")
         assert r["mode"] == "toc"
-        assert r["paper_name"] == "bookrag_2024"
+        assert r["slug"] == "bookrag_2024"
         # Flatten to titles — the fixture has # Abstract, # Introduction,
         # # Method, ## Setup, # Experiments, ## Setup at minimum.
         levels_titles = [(e["level"], e["title"]) for e in r["toc"]]
@@ -2212,50 +2212,50 @@ class TestModeToc:
             "UPDATE papers SET markdown = ? WHERE paper_name = ?",
             (md, "bookrag_2024"),
         )
-        r = search_mod.mode_toc(seeded_db, paper_name="bookrag_2024")
+        r = search_mod.mode_toc(seeded_db, slug="bookrag_2024")
         titles = [e["title"] for e in r["toc"]]
         assert "Not A Header" not in titles
         assert "Real Header" in titles
         assert "Another Real Header" in titles
 
-    def test_unknown_paper_raises(self, seeded_db):
+    def test_unknown_slug_raises(self, seeded_db):
         with pytest.raises(ValueError):
-            search_mod.mode_toc(seeded_db, paper_name="nope_2099")
+            search_mod.mode_toc(seeded_db, slug="nope_2099")
 
 
 class TestModeTocMany:
-    def test_returns_per_paper_results(self, seeded_db):
+    def test_returns_per_source_results(self, seeded_db):
         r = search_mod.mode_toc_many(
-            seeded_db, paper_names=["bookrag_2024", "stale_2024"]
+            seeded_db, slugs=["bookrag_2024", "stale_2024"]
         )
         assert r["mode"] == "toc_many"
-        assert r["paper_names"] == ["bookrag_2024", "stale_2024"]
-        names = [sub["paper_name"] for sub in r["results"]]
+        assert r["slugs"] == ["bookrag_2024", "stale_2024"]
+        names = [sub["slug"] for sub in r["results"]]
         assert names == ["bookrag_2024", "stale_2024"]
         for sub in r["results"]:
             assert sub["mode"] == "toc"
             assert "toc" in sub
         assert r["missing"] == []
 
-    def test_missing_paper_collected_not_raised(self, seeded_db):
+    def test_missing_slug_collected_not_raised(self, seeded_db):
         r = search_mod.mode_toc_many(
-            seeded_db, paper_names=["bookrag_2024", "no_such_paper"],
+            seeded_db, slugs=["bookrag_2024", "no_such_paper"],
         )
-        names = [sub["paper_name"] for sub in r["results"]]
+        names = [sub["slug"] for sub in r["results"]]
         assert names == ["bookrag_2024"]
         assert r["missing"] == ["no_such_paper"]
 
     def test_dedupes_input_order_preserved(self, seeded_db):
         r = search_mod.mode_toc_many(
             seeded_db,
-            paper_names=["bookrag_2024", "bookrag_2024", "stale_2024"],
+            slugs=["bookrag_2024", "bookrag_2024", "stale_2024"],
         )
-        assert r["paper_names"] == ["bookrag_2024", "stale_2024"]
+        assert r["slugs"] == ["bookrag_2024", "stale_2024"]
         assert len(r["results"]) == 2
 
     def test_empty_list_raises(self, seeded_db):
         with pytest.raises(ValueError):
-            search_mod.mode_toc_many(seeded_db, paper_names=[])
+            search_mod.mode_toc_many(seeded_db, slugs=[])
 
 
 # ===========================================================================
@@ -2265,16 +2265,16 @@ class TestModeTocMany:
 
 class TestModeRead:
     def test_full_markdown(self, seeded_db):
-        r = search_mod.mode_read(seeded_db, paper_name="bookrag_2024", section=None)
+        r = search_mod.mode_read(seeded_db, slug="bookrag_2024", section=None)
         assert r["mode"] == "read"
         assert r["status"] == "ok"
-        assert r["paper_name"] == "bookrag_2024"
+        assert r["slug"] == "bookrag_2024"
         assert r["section"] is None
         assert "BookRAG" in r["text"]
 
     def test_section_returns_hierarchical_slice(self, seeded_db):
         r = search_mod.mode_read(
-            seeded_db, paper_name="bookrag_2024", section="Method"
+            seeded_db, slug="bookrag_2024", section="Method"
         )
         assert r["status"] == "ok"
         assert r["section"] == "Method"
@@ -2289,7 +2289,7 @@ class TestModeRead:
         # Experiments. The breadcrumb query picks the right one.
         r = search_mod.mode_read(
             seeded_db,
-            paper_name="bookrag_2024",
+            slug="bookrag_2024",
             section="Experiments > Setup",
         )
         assert r["status"] == "ok"
@@ -2299,22 +2299,22 @@ class TestModeRead:
     def test_missing_section_emits_structured_payload(self, seeded_db):
         """Well-formed --section that doesn't match: structured payload, no raise."""
         r = search_mod.mode_read(
-            seeded_db, paper_name="bookrag_2024", section="NoSuchSection"
+            seeded_db, slug="bookrag_2024", section="NoSuchSection"
         )
         assert r["mode"] == "read"
         assert r["status"] == "section_not_found"
-        assert r["paper_name"] == "bookrag_2024"
+        assert r["slug"] == "bookrag_2024"
         assert r["requested_section"] == "NoSuchSection"
         assert "text" not in r  # Don't leak any partial markdown.
-        # The fallback hint must reference --toc and the whole-paper option
+        # The fallback hint must reference --toc and the whole-source option
         # — that's the actionable recovery path for the agent.
         assert "--toc" in r["hint"]
         assert "bookrag_2024" in r["hint"]
 
     def test_missing_section_lists_top_level_titles(self, seeded_db):
-        """The available-sections payload exposes levels 1-2 from the paper."""
+        """The available-sections payload exposes levels 1-2 from the source."""
         r = search_mod.mode_read(
-            seeded_db, paper_name="bookrag_2024", section="ZZZ Nope"
+            seeded_db, slug="bookrag_2024", section="ZZZ Nope"
         )
         assert r["status"] == "section_not_found"
         avail = r["available_top_level_sections"]
@@ -2328,10 +2328,10 @@ class TestModeRead:
     def test_malformed_section_query_emits_structured_payload(self, seeded_db):
         """Malformed breadcrumb (empty segment): structured payload with rule message."""
         r = search_mod.mode_read(
-            seeded_db, paper_name="bookrag_2024", section="A >> B"
+            seeded_db, slug="bookrag_2024", section="A >> B"
         )
         assert r["status"] == "malformed_section_query"
-        assert r["paper_name"] == "bookrag_2024"
+        assert r["slug"] == "bookrag_2024"
         assert r["requested_section"] == "A >> B"
         # The error string carries the actual rule violated, not just the input.
         assert "empty segment" in r["error"]
@@ -2345,14 +2345,14 @@ class TestModeRead:
     def test_malformed_section_query_variants(self, seeded_db, bad):
         """Every malformed shape gets caught and translated to the structured payload."""
         r = search_mod.mode_read(
-            seeded_db, paper_name="bookrag_2024", section=bad
+            seeded_db, slug="bookrag_2024", section=bad
         )
         assert r["status"] == "malformed_section_query"
 
-    def test_unknown_paper_raises(self, seeded_db):
-        """Wrong paper_name is a hard error (not an agent miss) — keep raising."""
+    def test_unknown_slug_raises(self, seeded_db):
+        """Wrong slug is a hard error (not an agent miss) — keep raising."""
         with pytest.raises(ValueError):
-            search_mod.mode_read(seeded_db, paper_name="nope_2099", section=None)
+            search_mod.mode_read(seeded_db, slug="nope_2099", section=None)
 
 
 class TestModeReadFailureRendering:
@@ -2360,7 +2360,7 @@ class TestModeReadFailureRendering:
 
     def test_human_section_not_found_mentions_toc(self, seeded_db):
         payload = search_mod.mode_read(
-            seeded_db, paper_name="bookrag_2024", section="ZZZ Nope"
+            seeded_db, slug="bookrag_2024", section="ZZZ Nope"
         )
         out = search_mod.to_human(payload)
         assert "ZZZ Nope" in out
@@ -2368,7 +2368,7 @@ class TestModeReadFailureRendering:
 
     def test_human_malformed_query_includes_rule(self, seeded_db):
         payload = search_mod.mode_read(
-            seeded_db, paper_name="bookrag_2024", section="A >> B"
+            seeded_db, slug="bookrag_2024", section="A >> B"
         )
         out = search_mod.to_human(payload)
         assert "malformed" in out.lower()
@@ -2532,11 +2532,11 @@ class TestOutputFormatting:
         )
         assert br["mode"] == "needs_review"
 
-        toc = search_mod.mode_toc(seeded_db, paper_name="bookrag_2024")
+        toc = search_mod.mode_toc(seeded_db, slug="bookrag_2024")
         assert toc["mode"] == "toc"
 
         read = search_mod.mode_read(
-            seeded_db, paper_name="bookrag_2024", section=None
+            seeded_db, slug="bookrag_2024", section=None
         )
         assert read["mode"] == "read"
 
@@ -2555,8 +2555,8 @@ class TestOutputFormatting:
             search_mod.mode_browse(
                 seeded_db, which="aliases", filters={"aliases_term": "RAPTOR"}
             ),
-            search_mod.mode_toc(seeded_db, paper_name="bookrag_2024"),
-            search_mod.mode_read(seeded_db, paper_name="bookrag_2024", section=None),
+            search_mod.mode_toc(seeded_db, slug="bookrag_2024"),
+            search_mod.mode_read(seeded_db, slug="bookrag_2024", section=None),
             search_mod.mode_figure(seeded_db, paper="bookrag_2024", n="3"),
         ]
         for payload in payloads:
@@ -3259,3 +3259,439 @@ class TestIntrospectionConflicts:
         result = self._run(["--include-internal", "--sql", "SELECT 1"])
         assert result.returncode != 0
         assert "include-internal" in result.stderr
+
+
+# ===========================================================================
+# Mode 6b — Citations
+# ===========================================================================
+
+
+def _insert_post_for_citations(
+    conn: sqlite3.Connection,
+    *,
+    post_name: str,
+    title: str,
+    domain: str,
+    collection: str,
+    date: str,
+    ingested_at: str,
+) -> int:
+    """Minimal post row sufficient to back the citations seeds.
+
+    Posts have a NOT NULL invariant on (domain, collection) once their
+    status is past `converted`, so we land them straight at `classified`
+    with both fields populated.
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
+        "VALUES (?, ?, NULL)",
+        (domain, collection),
+    )
+    cur = conn.execute(
+        """
+        INSERT INTO posts (
+            post_name, source_url, canonical_url, title, author, site_name,
+            date, abstract, domain, collection, ingested_at, status,
+            section_count, needs_review
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            post_name,
+            f"https://example.com/{post_name}",
+            f"https://example.com/{post_name}",
+            title,
+            "Author",
+            "example.com",
+            date,
+            "Stub abstract.",
+            domain,
+            collection,
+            ingested_at,
+            "classified",
+            0,
+            0,
+        ),
+    )
+    return cur.lastrowid
+
+
+def _insert_paper_reference(
+    conn: sqlite3.Connection,
+    *,
+    paper_id: int,
+    bibitem_id: str | None,
+    ref_number: int,
+    raw_text: str,
+    cited_arxiv_id: str | None,
+    cited_paper_id: int | None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO paper_references
+            (paper_id, bibitem_id, ref_number, raw_text,
+             cited_arxiv_id, cited_paper_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (paper_id, bibitem_id, ref_number, raw_text,
+         cited_arxiv_id, cited_paper_id),
+    )
+
+
+def _insert_post_reference(
+    conn: sqlite3.Connection,
+    *,
+    post_id: int,
+    raw_text: str,
+    cited_arxiv_id: str | None,
+    cited_paper_id: int | None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO post_references
+            (post_id, raw_text, cited_arxiv_id, cited_paper_id)
+        VALUES (?, ?, ?, ?)
+        """,
+        (post_id, raw_text, cited_arxiv_id, cited_paper_id),
+    )
+
+
+@pytest.fixture
+def seeded_citations_db(conn: sqlite3.Connection) -> sqlite3.Connection:
+    """Tiny corpus tailored to mode_citations.
+
+    Layout:
+      - paper ``citing_2024`` (paper_id=p_citer)  — has 4 outbound refs:
+        one resolved to ``cited_2023``, one resolved to ``stale_2022``
+        (status=``failed_fetch`` to exercise non-`converted` cited_status),
+        one missing arxiv id ``9999.99999``, one unresolvable.
+      - paper ``cited_2023``  — referenced by the citer paper AND by the
+        post; serves as the inbound target.
+      - paper ``stale_2022`` (status=failed_fetch) — second resolved ref.
+      - post ``post_2024`` — single outbound ref pointing at ``cited_2023``.
+    """
+    _seed_domain(conn, "rag")
+
+    # Cited paper — the inbound-target.
+    p_cited = _insert_paper(
+        conn,
+        arxiv_id="2301.12345",
+        paper_name="cited_2023",
+        title="Cited: Foundational Method",
+        abstract="Foundational method.",
+        markdown="# Abstract\n\nFoundation.\n",
+        domain="rag",
+        collection="hierarchical indexing",
+        needs_review=0,
+        ingested_at="2023-01-15T00:00:00+00:00",
+    )
+
+    # Second cited paper, with non-`converted` status to exercise the
+    # cited_status passthrough. It still gets a domain/collection so the
+    # invariant trigger is satisfied (status='failed_fetch' is exempt
+    # from the invariant, but it's harmless to set them).
+    p_stale = _insert_paper(
+        conn,
+        arxiv_id="2202.00002",
+        paper_name="stale_2022",
+        title="Stale: Failed Fetch",
+        abstract="Stub.",
+        markdown=None,
+        domain="rag",
+        collection="hierarchical indexing",
+        needs_review=0,
+        ingested_at="2022-02-01T00:00:00+00:00",
+    )
+    conn.execute(
+        "UPDATE papers SET status = 'failed_fetch' WHERE id = ?",
+        (p_stale,),
+    )
+
+    # Citer paper — the outbound subject.
+    p_citer = _insert_paper(
+        conn,
+        arxiv_id="2401.00001",
+        paper_name="citing_2024",
+        title="Citing: Survey",
+        abstract="A survey.",
+        markdown="# Abstract\n\nSurvey.\n",
+        domain="rag",
+        collection="hierarchical indexing",
+        needs_review=0,
+        ingested_at="2024-01-01T00:00:00+00:00",
+    )
+
+    # 4 outbound paper_references on citer.
+    _insert_paper_reference(
+        conn,
+        paper_id=p_citer,
+        bibitem_id="bib.bib1",
+        ref_number=1,
+        raw_text="Cited et al., 2023, arXiv:2301.12345",
+        cited_arxiv_id="2301.12345",
+        cited_paper_id=p_cited,
+    )
+    _insert_paper_reference(
+        conn,
+        paper_id=p_citer,
+        bibitem_id="bib.bib2",
+        ref_number=2,
+        raw_text="Stale et al., 2022, arXiv:2202.00002",
+        cited_arxiv_id="2202.00002",
+        cited_paper_id=p_stale,
+    )
+    _insert_paper_reference(
+        conn,
+        paper_id=p_citer,
+        bibitem_id="bib.bib3",
+        ref_number=3,
+        raw_text="Future et al., 2025, arXiv:9999.99999",
+        cited_arxiv_id="9999.99999",
+        cited_paper_id=None,
+    )
+    _insert_paper_reference(
+        conn,
+        paper_id=p_citer,
+        bibitem_id=None,
+        ref_number=4,
+        raw_text="Smith et al., NeurIPS 2023.",
+        cited_arxiv_id=None,
+        cited_paper_id=None,
+    )
+
+    # Post that cites cited_2023 — exercises inbound union and outbound
+    # post path simultaneously.
+    p_post = _insert_post_for_citations(
+        conn,
+        post_name="post_2024",
+        title="Blog: Discussion of Cited",
+        domain="rag",
+        collection="hierarchical indexing",
+        date="2024-03-15",
+        ingested_at="2024-03-15T00:00:00+00:00",
+    )
+    _insert_post_reference(
+        conn,
+        post_id=p_post,
+        raw_text="See https://arxiv.org/abs/2301.12345 for the foundation.",
+        cited_arxiv_id="2301.12345",
+        cited_paper_id=p_cited,
+    )
+
+    # Standalone repo so the unsupported_direction-vs-not_found split has
+    # a real repo_slug to land on.
+    conn.execute(
+        "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
+        "VALUES ('rag', 'standalone', NULL)"
+    )
+    conn.execute(
+        """
+        INSERT INTO repos (
+            repo_slug, url, host, owner, name, description,
+            default_branch, fetched_at, ingested_at,
+            domain, collection, status, needs_review,
+            file_count, has_readme
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "gh-acme-demo", "https://github.com/acme/demo", "github.com",
+            "acme", "demo", "demo repo",
+            "main", "2024-01-01T00:00:00+00:00", "2024-01-01T00:00:00+00:00",
+            "rag", "standalone", "ingested", 0, 0, 1,
+        ),
+    )
+
+    return conn
+
+
+class TestModeCitations:
+    def test_outbound_paper_buckets_resolved_missing_unresolvable(
+        self, seeded_citations_db
+    ):
+        r = search_mod.mode_citations(
+            seeded_citations_db, slug="citing_2024",
+        )
+        assert r["mode"] == "citations"
+        assert r["status"] == "ok"
+        assert r["kind"] == "paper"
+        assert r["direction"] == "outbound"
+        assert r["resolved_count"] == 2
+        assert r["missing_count"] == 1
+        assert r["unresolvable_count"] == 1
+        assert r["total"] == 4
+        assert r["truncated"] is False
+
+        resolved_slugs = {row["slug"] for row in r["resolved"]}
+        assert resolved_slugs == {"cited_2023", "stale_2022"}
+        # Resolved rows carry the citing-side numbering.
+        cited_row = next(x for x in r["resolved"] if x["slug"] == "cited_2023")
+        assert cited_row["arxiv_id"] == "2301.12345"
+        assert cited_row["ref_number"] == 1
+        assert cited_row["bibitem_id"] == "bib.bib1"
+        assert cited_row["title"].startswith("Cited:")
+
+        missing_row = r["missing"][0]
+        assert missing_row["arxiv_id"] == "9999.99999"
+        assert missing_row["ref_number"] == 3
+        assert "ingest_paper" in missing_row["ingest_hint"]
+        assert "9999.99999" in missing_row["ingest_hint"]
+
+        unresolvable_row = r["unresolvable"][0]
+        assert unresolvable_row["ref_number"] == 4
+        assert "NeurIPS" in unresolvable_row["raw_text"]
+        # Unresolvable rows omit arxiv_id / ingest_hint.
+        assert "arxiv_id" not in unresolvable_row
+        assert "ingest_hint" not in unresolvable_row
+
+    def test_outbound_paper_resolved_row_carries_cited_status(
+        self, seeded_citations_db
+    ):
+        r = search_mod.mode_citations(
+            seeded_citations_db, slug="citing_2024",
+        )
+        by_slug = {row["slug"]: row for row in r["resolved"]}
+        assert by_slug["cited_2023"]["cited_status"] == "indexed"
+        # `failed_fetch` cited paper passes through verbatim — agent
+        # uses this to decide whether the cited source is readable.
+        assert by_slug["stale_2022"]["cited_status"] == "failed_fetch"
+
+    def test_outbound_post_omits_ref_number_and_bibitem(
+        self, seeded_citations_db
+    ):
+        r = search_mod.mode_citations(
+            seeded_citations_db, slug="post_2024",
+        )
+        assert r["status"] == "ok"
+        assert r["kind"] == "post"
+        assert r["direction"] == "outbound"
+        assert r["resolved_count"] == 1
+        assert r["missing_count"] == 0
+        assert r["unresolvable_count"] == 0
+        row = r["resolved"][0]
+        assert row["slug"] == "cited_2023"
+        assert "ref_number" not in row
+        assert "bibitem_id" not in row
+
+    def test_outbound_repo_returns_unsupported_direction(
+        self, seeded_citations_db
+    ):
+        r = search_mod.mode_citations(
+            seeded_citations_db, slug="gh-acme-demo",
+        )
+        assert r["status"] == "unsupported_direction"
+        assert r["kind"] == "repo"
+        assert r["direction"] == "outbound"
+        assert "hint" in r
+
+    def test_outbound_truncated_at_500(self, seeded_citations_db):
+        # Pile up 501 cheap unresolvable refs on cited_2023 so the cap
+        # path fires without dragging in 501 papers.
+        cited_id = seeded_citations_db.execute(
+            "SELECT id FROM papers WHERE paper_name = 'cited_2023'"
+        ).fetchone()[0]
+        for n in range(1, 502):
+            _insert_paper_reference(
+                seeded_citations_db,
+                paper_id=cited_id,
+                bibitem_id=None,
+                ref_number=n,
+                raw_text=f"Filler ref {n}",
+                cited_arxiv_id=None,
+                cited_paper_id=None,
+            )
+        r = search_mod.mode_citations(
+            seeded_citations_db, slug="cited_2023",
+        )
+        assert r["status"] == "ok"
+        assert r["truncated"] is True
+        assert r["unresolvable_count"] == 500
+        assert r["total"] == 500
+
+    def test_inbound_paper_unions_papers_and_posts_recency_ordered(
+        self, seeded_citations_db
+    ):
+        r = search_mod.mode_citations(
+            seeded_citations_db, slug="cited_2023", direction="inbound",
+        )
+        assert r["status"] == "ok"
+        assert r["kind"] == "paper"
+        assert r["direction"] == "inbound"
+        # Two citers: paper 2024-01-01, post 2024-03-15. Recency-first.
+        kinds_in_order = [row["kind"] for row in r["results"]]
+        assert kinds_in_order == ["post", "paper"]
+        assert r["results"][0]["slug"] == "post_2024"
+        assert r["results"][1]["slug"] == "citing_2024"
+        # Paper rows carry ref_number; post rows do not.
+        assert "ref_number" not in r["results"][0]
+        assert r["results"][1]["ref_number"] == 1
+        assert r["total_hits"] == 2
+        assert r["has_more"] is False
+
+    def test_inbound_paginates_with_limit_offset_has_more(
+        self, seeded_citations_db
+    ):
+        r1 = search_mod.mode_citations(
+            seeded_citations_db, slug="cited_2023",
+            direction="inbound", limit=1, offset=0,
+        )
+        assert len(r1["results"]) == 1
+        assert r1["results"][0]["slug"] == "post_2024"
+        assert r1["total_hits"] == 2
+        assert r1["has_more"] is True
+
+        r2 = search_mod.mode_citations(
+            seeded_citations_db, slug="cited_2023",
+            direction="inbound", limit=1, offset=1,
+        )
+        assert len(r2["results"]) == 1
+        assert r2["results"][0]["slug"] == "citing_2024"
+        assert r2["has_more"] is False
+
+    def test_inbound_post_returns_unsupported_direction(
+        self, seeded_citations_db
+    ):
+        r = search_mod.mode_citations(
+            seeded_citations_db, slug="post_2024", direction="inbound",
+        )
+        assert r["status"] == "unsupported_direction"
+        assert r["kind"] == "post"
+        assert r["direction"] == "inbound"
+
+    def test_inbound_repo_returns_unsupported_direction(
+        self, seeded_citations_db
+    ):
+        r = search_mod.mode_citations(
+            seeded_citations_db, slug="gh-acme-demo", direction="inbound",
+        )
+        assert r["status"] == "unsupported_direction"
+        assert r["kind"] == "repo"
+        assert r["direction"] == "inbound"
+
+    def test_unknown_slug_returns_not_found(self, seeded_citations_db):
+        r = search_mod.mode_citations(
+            seeded_citations_db, slug="no_such_slug",
+        )
+        assert r["status"] == "not_found"
+        assert r["slug"] == "no_such_slug"
+
+    def test_outbound_with_zero_references_returns_empty_buckets_status_ok(
+        self, seeded_citations_db
+    ):
+        # cited_2023 has no outbound references in the fixture.
+        r = search_mod.mode_citations(
+            seeded_citations_db, slug="cited_2023",
+        )
+        assert r["status"] == "ok"
+        assert r["kind"] == "paper"
+        assert r["resolved"] == []
+        assert r["missing"] == []
+        assert r["unresolvable"] == []
+        assert r["total"] == 0
+        assert r["truncated"] is False
+
+    def test_invalid_direction_raises_value_error(self, seeded_citations_db):
+        with pytest.raises(ValueError):
+            search_mod.mode_citations(
+                seeded_citations_db,
+                slug="citing_2024",
+                direction="sideways",
+            )
