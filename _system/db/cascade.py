@@ -2,20 +2,23 @@
 
 Used by ``fetch_paper`` (force-refetch path), ``ingest`` (``--force``
 cascade), and the standalone-repo path. Per-target rows (figures,
-sections, topics, code_files, ...) are removed alongside the parent;
-canonical taxonomy rows are touched only via orphan-GC at the end of
-the cascade. Domains and collections are curated categories — they
+sections, topics, code_files, polymorphic ``collections`` membership
+rows, ...) are removed alongside the parent; canonical taxonomy rows
+are touched only via orphan-GC at the end of the cascade. Domains and
+``collection_definitions`` (the catalog) are curated categories — they
 survive the deletion of their last paper / repo so future targets can
-fill them; only humans delete those. Entity canonicals are never GC'd —
-under the synonym-index regime, tier-1 mentions leave no per-paper
-trace, so substantiation can't be proven.
+fill them; only humans delete those. The polymorphic ``collections``
+junction rows DO go with the parent, since they record per-target
+membership rather than the curated category itself. Entity canonicals
+are never GC'd — under the synonym-index regime, tier-1 mentions leave
+no per-paper trace, so substantiation can't be proven.
 """
 from __future__ import annotations
 
 import sqlite3
 
 from _system.db.orphan_gc import gc_orphan_topic_canonicals
-from _system.schemas.repo_metadata import TopicTarget
+from _system.utils.source_resolution import SourceKind
 
 
 def delete_paper_cascade(conn: sqlite3.Connection, *, paper_id: int) -> None:
@@ -25,8 +28,10 @@ def delete_paper_cascade(conn: sqlite3.Connection, *, paper_id: int) -> None:
     children before the papers row (PRAGMA foreign_keys=ON); FTS5 tables
     have no FK cascade, so their rows must be deleted explicitly. Orphan
     topic canonicals are GC'd at the end, after the paper is gone, when
-    "zero remaining bindings" is a clean truth. Collections survive —
-    they're curated categories, not per-paper concepts.
+    "zero remaining bindings" is a clean truth. The catalog
+    (``collection_definitions``) survives — it's the curated set of
+    categories, not per-paper bookkeeping; only the polymorphic
+    ``collections`` membership rows go with the paper.
 
     Any ``repos`` rows linked to this paper are cascaded too — the repo
     has no independent identity once its anchoring paper is gone.
@@ -54,11 +59,12 @@ def delete_paper_cascade(conn: sqlite3.Connection, *, paper_id: int) -> None:
         (paper_id,),
     )
     conn.execute(
-        "DELETE FROM paper_collections WHERE paper_id = ?", (paper_id,)
+        "DELETE FROM collections WHERE target_kind = ? AND target_id = ?",
+        (SourceKind.PAPER.value, paper_id),
     )
     conn.execute(
         "DELETE FROM topics WHERE target_kind = ? AND target_id = ?",
-        (TopicTarget.PAPER.value, paper_id),
+        (SourceKind.PAPER.value, paper_id),
     )
     conn.execute("DELETE FROM sections     WHERE paper_id = ?", (paper_id,))
 
@@ -99,11 +105,12 @@ def delete_post_cascade(conn: sqlite3.Connection, *, post_id: int) -> None:
         (post_id,),
     )
     conn.execute(
-        "DELETE FROM post_collections WHERE post_id = ?", (post_id,)
+        "DELETE FROM collections WHERE target_kind = ? AND target_id = ?",
+        (SourceKind.POST.value, post_id),
     )
     conn.execute(
         "DELETE FROM topics WHERE target_kind = ? AND target_id = ?",
-        (TopicTarget.POST.value, post_id),
+        (SourceKind.POST.value, post_id),
     )
     # sections.paper_name is the shared slug column — used here by post_name.
     conn.execute(
@@ -126,7 +133,8 @@ def delete_repo_cascade(
     """DELETE one repo and every per-repo child row.
 
     Mirrors :func:`delete_paper_cascade` for the repo-side state. Topics
-    with ``target_kind='repo'`` are wiped; ``code_files`` and the
+    with ``target_kind='repo'`` and the repo's polymorphic
+    ``collections`` membership rows are wiped; ``code_files`` and the
     matching ``readmes_fts`` row go with the repo. Orphan topic
     canonicals are GC'd at the end (caller can suppress when chained
     inside ``delete_paper_cascade``, which runs its own GC after
@@ -134,7 +142,11 @@ def delete_repo_cascade(
     """
     conn.execute(
         "DELETE FROM topics WHERE target_kind = ? AND target_id = ?",
-        (TopicTarget.REPO.value, repo_id),
+        (SourceKind.REPO.value, repo_id),
+    )
+    conn.execute(
+        "DELETE FROM collections WHERE target_kind = ? AND target_id = ?",
+        (SourceKind.REPO.value, repo_id),
     )
     conn.execute("DELETE FROM code_files  WHERE repo_id = ?", (repo_id,))
     conn.execute("DELETE FROM readmes_fts WHERE repo_id = ?", (repo_id,))

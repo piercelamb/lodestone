@@ -10,8 +10,12 @@ from the script and guarded by a ``sqlite_master`` existence check —
 pattern to FTS5 for uniformity.
 
 The repos refactor wiped legacy ``papers.code_repo`` columns and the
-``paper_topics`` table; the DB is wipe-and-reingest at that point so no
-data-preserving migration is provided. Older databases must be deleted.
+``paper_topics`` table; the collections-polymorphic refactor collapsed
+the per-kind ``paper_collections`` and ``post_collections`` tables into
+a single polymorphic ``collections(target_kind, target_id, ...)``
+junction and renamed the catalog ``collections`` → ``collection_definitions``.
+The DB is wipe-and-reingest at both points so no data-preserving
+migration is provided. Older databases must be deleted.
 
 One pre-script migration runs first: ``_migrate_entities_to_aliases``
 folds older shapes of ``term_aliases`` into the current

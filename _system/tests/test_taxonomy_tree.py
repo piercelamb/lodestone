@@ -38,7 +38,7 @@ def _seed_collection(
     description: str | None = None,
 ) -> None:
     conn.execute(
-        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
         "VALUES (?, ?, ?)",
         (domain, name, description),
     )
@@ -70,8 +70,9 @@ def _seed_paper(
     )
     if domain is not None and collection is not None:
         conn.execute(
-            "INSERT OR IGNORE INTO paper_collections "
-            " (paper_id, domain, collection, is_primary) VALUES (?, ?, ?, 1)",
+            "INSERT OR IGNORE INTO collections "
+            " (target_kind, target_id, domain, collection, is_primary) "
+            " VALUES ('paper', ?, ?, ?, 1)",
             (cur.lastrowid, domain, collection),
         )
 

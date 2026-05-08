@@ -1,4 +1,4 @@
-"""Bulk-seed ``domains`` and ``collections`` from a consolidated taxonomy file.
+"""Bulk-seed ``domains`` and ``collection_definitions`` from a consolidated taxonomy file.
 
     uv run _system/scripts/seed_taxonomy.py --file path/to/taxonomy.json
 
@@ -72,7 +72,7 @@ def seed_taxonomy(
             for c in d["collections"]:
                 cur = conn.execute(
                     """
-                    INSERT OR IGNORE INTO collections (domain, name, description)
+                    INSERT OR IGNORE INTO collection_definitions (domain, name, description)
                     VALUES (?, ?, ?)
                     """,
                     (sanitized, c["name"], c["description"]),
@@ -92,7 +92,7 @@ def seed_taxonomy(
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Bulk-seed Lodestone domains + collections from a taxonomy JSON file.",
+        description="Bulk-seed Lodestone domains + collection_definitions from a taxonomy JSON file.",
     )
     parser.add_argument(
         "--file", required=True, type=Path,

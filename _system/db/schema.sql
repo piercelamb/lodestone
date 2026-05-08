@@ -7,48 +7,16 @@ CREATE TABLE IF NOT EXISTS domains (
     description TEXT
 );
 
-CREATE TABLE IF NOT EXISTS collections (
+-- Catalog of curated collection definitions. One row per
+-- (domain, collection) pair; descriptions are populated by classify_*
+-- when the LLM proposes a new collection. Polymorphic `collections`
+-- junction rows FK back here.
+CREATE TABLE IF NOT EXISTS collection_definitions (
     domain TEXT NOT NULL REFERENCES domains(name),
     name TEXT NOT NULL,
     description TEXT,
     PRIMARY KEY(domain, name)
 );
-
--- Many-to-(few) join: a paper carries one PRIMARY collection plus 0..N
--- secondary collections, all within the paper's single domain. The
--- denormalized `papers.collection` scalar mirrors the primary row.
-CREATE TABLE IF NOT EXISTS paper_collections (
-    paper_id   INTEGER NOT NULL REFERENCES papers(id),
-    domain     TEXT    NOT NULL,
-    collection TEXT    NOT NULL,
-    is_primary INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (paper_id, collection),
-    FOREIGN KEY (domain, collection) REFERENCES collections(domain, name)
-);
-
-CREATE INDEX IF NOT EXISTS idx_paper_collections_collection
-  ON paper_collections(domain, collection);
-
--- Exactly one primary per paper.
-CREATE UNIQUE INDEX IF NOT EXISTS idx_paper_collections_primary
-  ON paper_collections(paper_id) WHERE is_primary = 1;
-
--- Intra-domain invariant: paper_collections.domain must match papers.domain.
-CREATE TRIGGER IF NOT EXISTS paper_collections_intra_domain_insert
-BEFORE INSERT ON paper_collections
-FOR EACH ROW
-WHEN NEW.domain != (SELECT domain FROM papers WHERE id = NEW.paper_id)
-BEGIN
-    SELECT RAISE(ABORT, 'paper_collections invariant: domain must match papers.domain');
-END;
-
-CREATE TRIGGER IF NOT EXISTS paper_collections_intra_domain_update
-BEFORE UPDATE ON paper_collections
-FOR EACH ROW
-WHEN NEW.domain != (SELECT domain FROM papers WHERE id = NEW.paper_id)
-BEGIN
-    SELECT RAISE(ABORT, 'paper_collections invariant: domain must match papers.domain');
-END;
 
 CREATE TABLE IF NOT EXISTS papers (
     id INTEGER PRIMARY KEY,
@@ -346,6 +314,57 @@ CREATE TABLE IF NOT EXISTS topics (
 CREATE INDEX IF NOT EXISTS idx_topics_target ON topics(target_kind, target_id);
 CREATE INDEX IF NOT EXISTS idx_topics_topic ON topics(domain, topic);
 
+-- Polymorphic collection-membership junction. One row per (target,
+-- collection) pair across papers, posts, and repos. ``target_kind``
+-- discriminates; ``target_id`` references the parent row in the matching
+-- table. Carries one PRIMARY collection plus 0..3 secondaries per
+-- target, all within the target's single domain. Denormalized
+-- ``papers.collection`` / ``posts.collection`` / ``repos.collection``
+-- scalars mirror the primary row.
+CREATE TABLE IF NOT EXISTS collections (
+    target_kind TEXT NOT NULL,
+    target_id   INTEGER NOT NULL,
+    domain      TEXT NOT NULL,
+    collection  TEXT NOT NULL,
+    is_primary  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (target_kind, target_id, collection),
+    FOREIGN KEY (domain, collection) REFERENCES collection_definitions(domain, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_collections_lookup
+  ON collections(domain, collection);
+
+-- Exactly one primary per target.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_collections_primary
+  ON collections(target_kind, target_id) WHERE is_primary = 1;
+
+-- Intra-domain invariant: collections.domain must match the parent
+-- table's domain. The CASE arm dispatches on target_kind to read the
+-- right parent table.
+CREATE TRIGGER IF NOT EXISTS collections_intra_domain_insert
+BEFORE INSERT ON collections
+FOR EACH ROW
+WHEN NEW.domain != (CASE NEW.target_kind
+        WHEN 'paper' THEN (SELECT domain FROM papers WHERE id = NEW.target_id)
+        WHEN 'post'  THEN (SELECT domain FROM posts  WHERE id = NEW.target_id)
+        WHEN 'repo'  THEN (SELECT domain FROM repos  WHERE id = NEW.target_id)
+     END)
+BEGIN
+    SELECT RAISE(ABORT, 'collections invariant: domain must match parent.domain');
+END;
+
+CREATE TRIGGER IF NOT EXISTS collections_intra_domain_update
+BEFORE UPDATE ON collections
+FOR EACH ROW
+WHEN NEW.domain != (CASE NEW.target_kind
+        WHEN 'paper' THEN (SELECT domain FROM papers WHERE id = NEW.target_id)
+        WHEN 'post'  THEN (SELECT domain FROM posts  WHERE id = NEW.target_id)
+        WHEN 'repo'  THEN (SELECT domain FROM repos  WHERE id = NEW.target_id)
+     END)
+BEGIN
+    SELECT RAISE(ABORT, 'collections invariant: domain must match parent.domain');
+END;
+
 -- ============================================================
 -- GROUP 4b: BLOG POSTS
 -- ============================================================
@@ -353,8 +372,10 @@ CREATE INDEX IF NOT EXISTS idx_topics_topic ON topics(domain, topic);
 -- namespace (`papers.paper_name` and `posts.post_name` form a global set
 -- so downstream tables that key on a slug TEXT column — `sections`,
 -- `term_aliases`, `topics` — work uniformly across kinds without a
--- discriminator. Tables that hard-FK to `papers.id` get sibling tables
--- here for the post case (`post_collections`, `post_references`).
+-- discriminator. Tables that hard-FK to `papers.id` (e.g.
+-- `post_references`) get sibling tables here for the post case;
+-- collection bookkeeping lives in the polymorphic `collections` junction
+-- above.
 
 CREATE TABLE IF NOT EXISTS posts (
     id INTEGER PRIMARY KEY,
@@ -406,37 +427,6 @@ BEGIN
     SELECT RAISE(ABORT, 'posts invariant violated: classified+ rows must have both domain and collection set');
 END;
 
-CREATE TABLE IF NOT EXISTS post_collections (
-    post_id    INTEGER NOT NULL REFERENCES posts(id),
-    domain     TEXT    NOT NULL,
-    collection TEXT    NOT NULL,
-    is_primary INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (post_id, collection),
-    FOREIGN KEY (domain, collection) REFERENCES collections(domain, name)
-);
-
-CREATE INDEX IF NOT EXISTS idx_post_collections_collection
-  ON post_collections(domain, collection);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_post_collections_primary
-  ON post_collections(post_id) WHERE is_primary = 1;
-
-CREATE TRIGGER IF NOT EXISTS post_collections_intra_domain_insert
-BEFORE INSERT ON post_collections
-FOR EACH ROW
-WHEN NEW.domain != (SELECT domain FROM posts WHERE id = NEW.post_id)
-BEGIN
-    SELECT RAISE(ABORT, 'post_collections invariant: domain must match posts.domain');
-END;
-
-CREATE TRIGGER IF NOT EXISTS post_collections_intra_domain_update
-BEFORE UPDATE ON post_collections
-FOR EACH ROW
-WHEN NEW.domain != (SELECT domain FROM posts WHERE id = NEW.post_id)
-BEGIN
-    SELECT RAISE(ABORT, 'post_collections invariant: domain must match posts.domain');
-END;
-
 -- Outbound arxiv citations from a post. Mirrors `paper_references` but
 -- without `bibitem_id` / `ref_number` (blogs don't have a numbered
 -- bibliography). `raw_text` is the link anchor text or surrounding
@@ -456,19 +446,39 @@ CREATE INDEX IF NOT EXISTS idx_post_refs_cited_paper ON post_references(cited_pa
 -- ============================================================
 -- GROUP 5: ONE-SHOT BACKFILL
 -- ============================================================
--- Register collections already implied by classified papers so the
--- first-class `collections` table matches reality on any database that
--- predates it. Idempotent: INSERT OR IGNORE is a no-op once each
--- (domain, collection) pair exists. Descriptions land NULL for these
--- legacy rows — classify_paper fills them in when the LLM proposes new.
-INSERT OR IGNORE INTO collections (domain, name, description)
+-- Register collection definitions already implied by classified
+-- sources (papers + posts + repos), then seed the polymorphic
+-- `collections` junction with primary rows from the denormalized scalar
+-- pointers. Idempotent: INSERT OR IGNORE is a no-op once each row
+-- exists. Descriptions land NULL for legacy rows — classify_* fills them
+-- in when the LLM proposes new collections. This also serves as the
+-- safety net if a write path inserts a junction row before populating
+-- the catalog.
+INSERT OR IGNORE INTO collection_definitions (domain, name, description)
 SELECT DISTINCT domain, collection, NULL
   FROM papers
+ WHERE domain IS NOT NULL AND collection IS NOT NULL
+UNION
+SELECT DISTINCT domain, collection, NULL
+  FROM posts
+ WHERE domain IS NOT NULL AND collection IS NOT NULL
+UNION
+SELECT DISTINCT domain, collection, NULL
+  FROM repos
  WHERE domain IS NOT NULL AND collection IS NOT NULL;
 
--- Backfill paper_collections from the legacy scalar `papers.collection`
--- so DBs that predate the join table get a primary row per classified paper.
-INSERT OR IGNORE INTO paper_collections (paper_id, domain, collection, is_primary)
-SELECT id, domain, collection, 1
+-- Backfill polymorphic `collections` from the per-table scalar
+-- pointers so DBs that predate the polymorphic junction get a primary
+-- row per classified source.
+INSERT OR IGNORE INTO collections (target_kind, target_id, domain, collection, is_primary)
+SELECT 'paper', id, domain, collection, 1
   FROM papers
+ WHERE domain IS NOT NULL AND collection IS NOT NULL
+UNION ALL
+SELECT 'post', id, domain, collection, 1
+  FROM posts
+ WHERE domain IS NOT NULL AND collection IS NOT NULL
+UNION ALL
+SELECT 'repo', id, domain, collection, 1
+  FROM repos
  WHERE domain IS NOT NULL AND collection IS NOT NULL;

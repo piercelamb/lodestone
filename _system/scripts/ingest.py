@@ -427,6 +427,7 @@ def ingest(
         if repo_row is not None:
             _propagate_taxonomy_to_repo(
                 conn,
+                paper_id=paper_id,
                 repo_id=repo_row.id,
                 domain=paper_domain,
                 collection=paper_collection,
@@ -439,23 +440,45 @@ def ingest(
 def _propagate_taxonomy_to_repo(
     conn: sqlite3.Connection,
     *,
+    paper_id: int,
     repo_id: int,
     domain: str | None,
     collection: str | None,
 ) -> None:
-    """Inherit ``papers.{domain,collection}`` onto the linked repo.
+    """Inherit the parent paper's taxonomy onto the linked repo.
 
-    Idempotent — re-running on a repo that already has the same values
-    is a no-op COALESCE update. The schema-level trigger only enforces
-    domain+collection on CLASSIFIED rows, so paper-linked repos that
-    sit at REPO_FETCHED with the inherited values written are fine.
+    Writes the denormalized scalar ``repos.{domain, collection}`` (mirrors
+    the primary collection) AND mirrors every polymorphic ``collections``
+    membership the paper carries — so a paper-linked repo lives in the
+    same set of collections as the paper, including secondaries.
+    Idempotent: the polymorphic write is DELETE-then-INSERT.
+
+    The schema-level trigger only enforces domain+collection on
+    CLASSIFIED rows, so paper-linked repos that sit at REPO_FETCHED with
+    the inherited values written are fine.
     """
     if domain is None or collection is None:
         return
     with transaction(conn):
+        # Scalar primary pointer must be written first so the polymorphic
+        # collections trigger reads the new repos.domain when the
+        # mirrored rows land.
         conn.execute(
             "UPDATE repos SET domain = ?, collection = ? WHERE id = ?",
             (domain, collection, repo_id),
+        )
+        conn.execute(
+            "DELETE FROM collections WHERE target_kind = 'repo' AND target_id = ?",
+            (repo_id,),
+        )
+        conn.execute(
+            """
+            INSERT INTO collections (target_kind, target_id, domain, collection, is_primary)
+            SELECT 'repo', ?, domain, collection, is_primary
+              FROM collections
+             WHERE target_kind = 'paper' AND target_id = ?
+            """,
+            (repo_id, paper_id),
         )
 
 

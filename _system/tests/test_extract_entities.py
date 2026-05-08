@@ -139,7 +139,7 @@ def _seed_paper(
     # are provided so the trigger sees a valid state.
     if domain is not None and collection is not None:
         conn.execute(
-            "INSERT OR IGNORE INTO collections (domain, name, description) "
+            "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
             "VALUES (?, ?, NULL)",
             (domain, collection),
         )

@@ -24,14 +24,6 @@ class RepoStatus(StrEnum):
     FAILED_REPO = "failed_repo"
 
 
-class TopicTarget(StrEnum):
-    """Discriminator for the unified ``topics`` table."""
-
-    PAPER = "paper"
-    REPO = "repo"
-    POST = "post"
-
-
 # CLASSIFIED is the standalone happy-path terminus for repos with a usable
 # README; ORPHANED is the terminus for repos without one. Paper-linked repos
 # inherit domain/collection from the paper and skip the CLASSIFY stage —

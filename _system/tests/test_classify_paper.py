@@ -135,16 +135,17 @@ def _seed_paper(
     paper_id = cur.lastrowid
     # Mirror the invariant production maintains: a paper with a collection
     # means that (domain, collection) is registered AND has a primary
-    # paper_collections row.
+    # `collections` row keyed by (target_kind='paper', target_id=paper_id).
     if domain is not None and collection is not None:
         conn.execute(
-            "INSERT OR IGNORE INTO collections (domain, name, description) "
+            "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
             "VALUES (?, ?, NULL)",
             (domain, collection),
         )
         conn.execute(
-            "INSERT OR IGNORE INTO paper_collections "
-            " (paper_id, domain, collection, is_primary) VALUES (?, ?, ?, 1)",
+            "INSERT OR IGNORE INTO collections "
+            " (target_kind, target_id, domain, collection, is_primary) "
+            " VALUES ('paper', ?, ?, ?, 1)",
             (paper_id, domain, collection),
         )
     return paper_id
@@ -701,7 +702,7 @@ def test_new_domain_inserts_into_domains_and_sets_paper_needs_review(tmp_db_with
 
     # Collection description also lands in the first-class collections table.
     coll_row = tmp_db_with_domain.execute(
-        "SELECT domain, name, description FROM collections "
+        "SELECT domain, name, description FROM collection_definitions "
         " WHERE domain = ? AND name = ?",
         ("multi-agent_systems", "orchestration patterns"),
     ).fetchone()
@@ -718,7 +719,7 @@ def test_existing_collection_description_is_not_overwritten(tmp_db_with_domain):
     # canonicalization would, in principle, pick up this name). The
     # INSERT OR IGNORE must leave the curated description intact.
     tmp_db_with_domain.execute(
-        "INSERT INTO collections (domain, name, description) VALUES (?, ?, ?)",
+        "INSERT INTO collection_definitions (domain, name, description) VALUES (?, ?, ?)",
         ("rag", "hierarchical indexing", "curated by a human"),
     )
     _seed_paper(tmp_db_with_domain)
@@ -731,7 +732,7 @@ def test_existing_collection_description_is_not_overwritten(tmp_db_with_domain):
         call_llm=_fake_runner(),
     )
     row = tmp_db_with_domain.execute(
-        "SELECT description FROM collections "
+        "SELECT description FROM collection_definitions "
         " WHERE domain = ? AND name = ?",
         ("rag", "hierarchical indexing"),
     ).fetchone()
@@ -926,8 +927,9 @@ def test_multi_collection_pick_writes_primary_and_secondary(tmp_db_with_domain):
     assert row[2] == 1  # secondary is new
 
     pc_rows = tmp_db_with_domain.execute(
-        "SELECT collection, is_primary FROM paper_collections "
-        " WHERE paper_id = ? ORDER BY is_primary DESC, collection",
+        "SELECT collection, is_primary FROM collections "
+        " WHERE target_kind = 'paper' AND target_id = ?"
+        " ORDER BY is_primary DESC, collection",
         (paper_id,),
     ).fetchall()
     assert pc_rows == [
@@ -958,13 +960,13 @@ def test_multi_collection_canonical_collision_dedupes_keeping_primary(tmp_db_wit
     classify(paper_name="paper_name_2024", conn=tmp_db_with_domain, call_llm=runner)
 
     pc_rows = tmp_db_with_domain.execute(
-        "SELECT collection, is_primary FROM paper_collections WHERE paper_id = ?",
+        "SELECT collection, is_primary FROM collections WHERE target_kind = 'paper' AND target_id = ?",
         (paper_id,),
     ).fetchall()
     assert pc_rows == [("hierarchical indexing", 1)]
 
 
-def test_rerun_replaces_paper_collections_rows(tmp_db_with_domain):
+def test_rerun_replaces_polymorphic_collections_rows(tmp_db_with_domain):
     """Re-classify wipes the prior paper_collections rows so secondaries
     that the second run dropped don't linger."""
     paper_id = _seed_paper(tmp_db_with_domain)
@@ -981,7 +983,7 @@ def test_rerun_replaces_paper_collections_rows(tmp_db_with_domain):
         )),
     )
     rows1 = tmp_db_with_domain.execute(
-        "SELECT collection FROM paper_collections WHERE paper_id = ? ORDER BY collection",
+        "SELECT collection FROM collections WHERE target_kind = 'paper' AND target_id = ? ORDER BY collection",
         (paper_id,),
     ).fetchall()
     assert {r[0] for r in rows1} == {"primary one", "secondary one"}
@@ -998,7 +1000,7 @@ def test_rerun_replaces_paper_collections_rows(tmp_db_with_domain):
         )),
     )
     rows2 = tmp_db_with_domain.execute(
-        "SELECT collection, is_primary FROM paper_collections WHERE paper_id = ?",
+        "SELECT collection, is_primary FROM collections WHERE target_kind = 'paper' AND target_id = ?",
         (paper_id,),
     ).fetchall()
     assert rows2 == [("different primary", 1)]

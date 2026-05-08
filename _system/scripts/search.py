@@ -696,20 +696,21 @@ def _bm25_sections(
         where_params.append(paper_name)
     if collection:
         # Sections does not carry collection in FTS5 (by design; the
-        # source owns the collection). Match against `paper_collections`
-        # / `post_collections` via the slug — sections.paper_id is
+        # source owns the collection). Match against the polymorphic
+        # `collections` junction via the slug — sections.paper_id is
         # ambiguous across kinds (a post_id may equal a paper_id), but
-        # the slug is globally unique. Secondary memberships filter
-        # through too.
+        # the slug is globally unique. Repos aren't slug-addressable
+        # through this surface, so the UNION covers paper + post only.
+        # Secondary memberships filter through too.
         wheres.append(
             "s.paper_name IN ("
             "  SELECT p.paper_name FROM papers p "
-            "    JOIN paper_collections pc ON pc.paper_id = p.id "
-            "   WHERE pc.collection = ? "
+            "    JOIN collections c ON c.target_kind = 'paper' AND c.target_id = p.id "
+            "   WHERE c.collection = ? "
             "  UNION ALL "
             "  SELECT po.post_name FROM posts po "
-            "    JOIN post_collections poc ON poc.post_id = po.id "
-            "   WHERE poc.collection = ? "
+            "    JOIN collections c ON c.target_kind = 'post' AND c.target_id = po.id "
+            "   WHERE c.collection = ? "
             ")"
         )
         where_params.append(collection)
@@ -1759,23 +1760,17 @@ def mode_browse(
         raise ValueError(f"unknown browse view: {which!r}") from exc
     domain = filters.get("domain")
     if view is BrowseView.COLLECTIONS:
-        # *_collections counts a paper or post once per primary/secondary
-        # membership it carries. UNION ALL across paper + post tables so
-        # the count reflects everything in the collection regardless of
-        # source kind.
+        # Polymorphic `collections` counts each paper / post / repo once
+        # per primary/secondary membership it carries. The single table
+        # naturally aggregates across all three source kinds.
         params: list[Any] = []
         domain_filter = ""
         if domain:
             domain_filter = " WHERE domain = ?"
             params.append(domain)
         sql = (
-            "WITH all_bindings AS ("
-            "  SELECT collection, domain FROM paper_collections "
-            "  UNION ALL "
-            "  SELECT collection, domain FROM post_collections "
-            ") "
             "SELECT collection, COUNT(*) AS n "
-            "  FROM all_bindings "
+            "  FROM collections "
             f" {domain_filter}"
             " GROUP BY collection ORDER BY n DESC, collection"
         )
@@ -1789,56 +1784,29 @@ def mode_browse(
         collection = filters.get("collection")
         # Aggregate paper + post + repo bindings — all three kinds count.
         if collection:
-            # Scope to one collection: papers via paper_collections,
-            # posts via post_collections, repos via the scalar
-            # repos.collection. `domain` disambiguates collection names
-            # that exist in multiple domains.
-            paper_clauses = ["pc.collection = ?"]
-            paper_params: list[Any] = [collection]
-            post_clauses = ["poc.collection = ?"]
-            post_params: list[Any] = [collection]
-            repo_clauses = ["r.collection = ?"]
-            repo_params: list[Any] = [collection]
+            # Scope to one collection via the polymorphic `collections`
+            # junction. `domain` disambiguates collection names that
+            # exist in multiple domains.
+            clauses = ["c.collection = ?"]
+            cparams: list[Any] = [collection]
             if domain:
-                paper_clauses.append("pc.domain = ?")
-                paper_params.append(domain)
-                post_clauses.append("poc.domain = ?")
-                post_params.append(domain)
-                repo_clauses.append("r.domain = ?")
-                repo_params.append(domain)
+                clauses.append("c.domain = ?")
+                cparams.append(domain)
             sql = (
-                "WITH bindings AS ( "
-                "  SELECT t.topic, t.target_kind "
-                "    FROM topics t "
-                "    JOIN paper_collections pc "
-                "      ON t.target_kind = 'paper' "
-                "     AND t.target_id = pc.paper_id "
-                f"    WHERE {' AND '.join(paper_clauses)} "
-                "  UNION ALL "
-                "  SELECT t.topic, t.target_kind "
-                "    FROM topics t "
-                "    JOIN post_collections poc "
-                "      ON t.target_kind = 'post' "
-                "     AND t.target_id = poc.post_id "
-                f"    WHERE {' AND '.join(post_clauses)} "
-                "  UNION ALL "
-                "  SELECT t.topic, t.target_kind "
-                "    FROM topics t "
-                "    JOIN repos r "
-                "      ON t.target_kind = 'repo' "
-                "     AND t.target_id = r.id "
-                f"    WHERE {' AND '.join(repo_clauses)} "
-                ") "
-                "SELECT topic, "
+                "SELECT t.topic, "
                 "       COUNT(*) AS n, "
-                "       SUM(CASE WHEN target_kind='paper' THEN 1 ELSE 0 END) AS paper_n, "
-                "       SUM(CASE WHEN target_kind='post'  THEN 1 ELSE 0 END) AS post_n, "
-                "       SUM(CASE WHEN target_kind='repo'  THEN 1 ELSE 0 END) AS repo_n "
-                "  FROM bindings "
-                " GROUP BY topic "
-                " ORDER BY n DESC, topic"
+                "       SUM(CASE WHEN t.target_kind='paper' THEN 1 ELSE 0 END) AS paper_n, "
+                "       SUM(CASE WHEN t.target_kind='post'  THEN 1 ELSE 0 END) AS post_n, "
+                "       SUM(CASE WHEN t.target_kind='repo'  THEN 1 ELSE 0 END) AS repo_n "
+                "  FROM topics t "
+                "  JOIN collections c "
+                "    ON c.target_kind = t.target_kind "
+                "   AND c.target_id = t.target_id "
+                f" WHERE {' AND '.join(clauses)} "
+                " GROUP BY t.topic "
+                " ORDER BY n DESC, t.topic"
             )
-            params = paper_params + post_params + repo_params
+            params = cparams
         else:
             sql = (
                 "SELECT topic, "
@@ -1950,6 +1918,7 @@ def _serialize_collection(node: CollectionNode) -> dict[str, Any]:
         "name": node.name,
         "description": node.description,
         "paper_count": node.paper_count,
+        "post_count": node.post_count,
         "repo_count": node.repo_count,
     }
 
@@ -1959,6 +1928,7 @@ def _serialize_domain(node: DomainNode) -> dict[str, Any]:
         "name": node.name,
         "description": node.description,
         "paper_count": node.paper_count,
+        "post_count": node.post_count,
         "repo_count": node.repo_count,
         "collection_count": len(node.collections),
         "collections": [_serialize_collection(c) for c in node.collections],
@@ -1978,6 +1948,7 @@ def _domain_node_from_dict(d: dict[str, Any]) -> DomainNode:
             description=c.get("description"),
             paper_count=int(c.get("paper_count") or 0),
             repo_count=int(c.get("repo_count") or 0),
+            post_count=int(c.get("post_count") or 0),
         )
         for c in (d.get("collections") or [])
     ]
@@ -1988,6 +1959,7 @@ def _domain_node_from_dict(d: dict[str, Any]) -> DomainNode:
         collections=tuple(colls),
         overflow=int(d.get("overflow") or 0),
         repo_count=int(d.get("repo_count") or 0),
+        post_count=int(d.get("post_count") or 0),
     )
 
 
@@ -2042,15 +2014,16 @@ def _resolve_collection_targets(
             continue
         if domain_filter:
             row = conn.execute(
-                "SELECT domain, name, description FROM collections "
+                "SELECT domain, name, description FROM collection_definitions "
                 " WHERE domain = ? AND name = ?",
                 (domain_filter, name),
             ).fetchone()
             if row is None:
-                # Fall back to paper_collections — legacy rows may not
-                # be registered in the curated `collections` table.
+                # Fall back to the polymorphic `collections` junction —
+                # legacy rows may not be registered in the curated
+                # `collection_definitions` catalog.
                 fallback = conn.execute(
-                    "SELECT 1 FROM paper_collections "
+                    "SELECT 1 FROM collections "
                     " WHERE domain = ? AND collection = ? LIMIT 1",
                     (domain_filter, name),
                 ).fetchone()
@@ -2071,23 +2044,24 @@ def _resolve_collection_targets(
             continue
 
         rows = conn.execute(
-            "SELECT domain, name, description FROM collections WHERE name = ? "
+            "SELECT domain, name, description FROM collection_definitions WHERE name = ? "
             " ORDER BY domain",
             (name,),
         ).fetchall()
         if not rows:
-            # Fallback to paper_collections — covers legacy rows that
-            # aren't registered in the curated `collections` table.
-            paper_rows = conn.execute(
-                "SELECT DISTINCT domain FROM paper_collections "
+            # Fallback to the polymorphic `collections` junction —
+            # covers legacy rows that aren't registered in the
+            # curated `collection_definitions` catalog.
+            mem_rows = conn.execute(
+                "SELECT DISTINCT domain FROM collections "
                 " WHERE collection = ? "
                 " ORDER BY domain",
                 (name,),
             ).fetchall()
-            if not paper_rows:
+            if not mem_rows:
                 missing.append(name)
                 continue
-            for (d,) in paper_rows:
+            for (d,) in mem_rows:
                 pair = (d, name)
                 if pair in seen_pairs:
                     continue
@@ -2133,24 +2107,25 @@ def mode_collection(
     entries: list[dict[str, Any]] = []
     for d_name, c_name, c_desc in targets:
         total_row = conn.execute(
-            "SELECT COUNT(pc.paper_id) "
-            "  FROM paper_collections pc "
-            " WHERE pc.domain = ? AND pc.collection = ?",
+            "SELECT COUNT(*) FROM collections "
+            " WHERE target_kind = 'paper' AND domain = ? AND collection = ?",
             (d_name, c_name),
         ).fetchone()
         total_papers = int(total_row[0] or 0) if total_row else 0
 
         post_total_row = conn.execute(
-            "SELECT COUNT(poc.post_id) "
-            "  FROM post_collections poc "
-            " WHERE poc.domain = ? AND poc.collection = ?",
+            "SELECT COUNT(*) FROM collections "
+            " WHERE target_kind = 'post' AND domain = ? AND collection = ?",
             (d_name, c_name),
         ).fetchone()
         total_posts = int(post_total_row[0] or 0) if post_total_row else 0
 
+        # Includes paper-linked repos that share the collection — the
+        # polymorphic junction doesn't filter on paper_id IS NULL the way
+        # the old scalar lookup did.
         repo_total_row = conn.execute(
-            "SELECT COUNT(*) FROM repos "
-            " WHERE paper_id IS NULL AND domain = ? AND collection = ?",
+            "SELECT COUNT(*) FROM collections "
+            " WHERE target_kind = 'repo' AND domain = ? AND collection = ?",
             (d_name, c_name),
         ).fetchone()
         total_repos = int(repo_total_row[0] or 0) if repo_total_row else 0
@@ -2160,8 +2135,8 @@ def mode_collection(
             SELECT p.id, p.paper_name, p.title, p.authors, p.date,
                    p.section_count, p.figure_count{abstract_col}
               FROM papers p
-              JOIN paper_collections pc ON pc.paper_id = p.id
-             WHERE pc.domain = ? AND pc.collection = ?
+              JOIN collections c ON c.target_kind = 'paper' AND c.target_id = p.id
+             WHERE c.domain = ? AND c.collection = ?
              ORDER BY p.date DESC, p.paper_name
              LIMIT ?
             """,
@@ -2204,15 +2179,21 @@ def mode_collection(
                 paper["topics"] = topics_by_id.get(pid, [])
             papers.append(paper)
 
-        # Standalone repos in this (domain, collection).
+        # Standalone repos in this (domain, collection). Filter on
+        # paper_id IS NULL so paper-linked repos aren't duplicated —
+        # they surface via the paper they're linked to. The kind-split
+        # COUNT above (`total_repos`) does include paper-linked repos.
         repo_rows = conn.execute(
             """
-            SELECT id, repo_slug, url, owner, name, description,
-                   has_readme, file_count, status
+            SELECT repos.id, repos.repo_slug, repos.url, repos.owner,
+                   repos.name, repos.description, repos.has_readme,
+                   repos.file_count, repos.status
               FROM repos
-             WHERE paper_id IS NULL
-               AND domain = ? AND collection = ?
-             ORDER BY repo_slug
+              JOIN collections c
+                ON c.target_kind = 'repo' AND c.target_id = repos.id
+             WHERE repos.paper_id IS NULL
+               AND c.domain = ? AND c.collection = ?
+             ORDER BY repos.repo_slug
              LIMIT ?
             """,
             (d_name, c_name, limit),
@@ -2249,8 +2230,8 @@ def mode_collection(
             SELECT po.id, po.post_name, po.title, po.author, po.site_name,
                    po.date, po.section_count{post_abstract_col}
               FROM posts po
-              JOIN post_collections poc ON poc.post_id = po.id
-             WHERE poc.domain = ? AND poc.collection = ?
+              JOIN collections c ON c.target_kind = 'post' AND c.target_id = po.id
+             WHERE c.domain = ? AND c.collection = ?
              ORDER BY po.date DESC, po.post_name
              LIMIT ?
             """,
@@ -3546,10 +3527,19 @@ def to_human(payload: dict[str, Any]) -> str:
                 lines.append(
                     f"- {ident} (hits={hit['hit_count']})"
                 )
-                for s in hit.get("sections", []):
-                    lines.append(
-                        f"    §{s['section_level']} {s['section_title']}: {s.get('snippet', '')}"
-                    )
+                section_hits = hit.get("sections", [])
+                for i, s in enumerate(section_hits):
+                    crumb = _clean_breadcrumb_for_display(s.get("breadcrumb", ""))
+                    title = s.get("section_title") or ""
+                    header = crumb or title
+                    level = s.get("section_level")
+                    level_tag = f"§{level} " if level else "§ "
+                    lines.append(f"    {level_tag}{header}")
+                    snippet = s.get("snippet", "") or ""
+                    for body_line in snippet.splitlines() or [""]:
+                        lines.append(f"        {body_line}")
+                    if i != len(section_hits) - 1:
+                        lines.append("    " + "─" * 60)
                 rh = hit.get("readme_hit")
                 if rh:
                     lines.append(

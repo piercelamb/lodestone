@@ -83,7 +83,7 @@ def _stub_classify(*, paper_name, conn, force=False, domain_override=None, **_):
         "INSERT OR IGNORE INTO domains (name) VALUES (?)", ("retrieval",)
     )
     conn.execute(
-        "INSERT OR IGNORE INTO collections (domain, name) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO collection_definitions (domain, name) VALUES (?, ?)",
         ("retrieval", "rag"),
     )
     conn.execute(
@@ -93,8 +93,8 @@ def _stub_classify(*, paper_name, conn, force=False, domain_override=None, **_):
     )
     conn.execute(
         """
-        INSERT INTO post_collections (post_id, domain, collection, is_primary)
-        SELECT id, ?, ?, 1 FROM posts WHERE post_name = ?
+        INSERT INTO collections (target_kind, target_id, domain, collection, is_primary)
+        SELECT 'post', id, ?, ?, 1 FROM posts WHERE post_name = ?
         """,
         ("retrieval", "rag", paper_name),
     )
@@ -264,7 +264,7 @@ class TestDeletePostCascade:
             "INSERT OR IGNORE INTO domains (name) VALUES ('retrieval')"
         )
         conn.execute(
-            "INSERT OR IGNORE INTO collections (domain, name) VALUES ('retrieval', 'rag')"
+            "INSERT OR IGNORE INTO collection_definitions (domain, name) VALUES ('retrieval', 'rag')"
         )
         cur = conn.execute(
             """
@@ -281,8 +281,9 @@ class TestDeletePostCascade:
         )
         post_id = cur.lastrowid
         conn.execute(
-            "INSERT INTO post_collections (post_id, domain, collection, is_primary) "
-            "VALUES (?, ?, ?, 1)",
+            "INSERT INTO collections "
+            " (target_kind, target_id, domain, collection, is_primary) "
+            "VALUES ('post', ?, ?, ?, 1)",
             (post_id, "retrieval", "rag"),
         )
         conn.execute(
@@ -330,7 +331,8 @@ class TestDeletePostCascade:
             "SELECT COUNT(*) FROM post_references WHERE post_id = ?", (post_id,)
         ).fetchone()[0] == 0
         assert conn.execute(
-            "SELECT COUNT(*) FROM post_collections WHERE post_id = ?", (post_id,)
+            "SELECT COUNT(*) FROM collections "
+            " WHERE target_kind = 'post' AND target_id = ?", (post_id,)
         ).fetchone()[0] == 0
         assert conn.execute(
             "SELECT COUNT(*) FROM topics WHERE target_kind = 'post' AND target_id = ?",
@@ -356,5 +358,5 @@ class TestDeletePostCascade:
         delete_post_cascade(conn, post_id=post_id)
         # Collection registry survives.
         assert conn.execute(
-            "SELECT COUNT(*) FROM collections WHERE name = 'rag'"
+            "SELECT COUNT(*) FROM collection_definitions WHERE name = 'rag'"
         ).fetchone()[0] == 1

@@ -38,7 +38,7 @@ def _seed_repo(
         "INSERT OR IGNORE INTO domains (name) VALUES (?)", (domain,)
     )
     conn.execute(
-        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
         "VALUES (?, ?, NULL)",
         (domain, collection),
     )

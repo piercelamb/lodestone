@@ -845,9 +845,10 @@ TOOLS: list[dict[str, Any]] = [
             "List taxonomy/paper rollups: collections, topics, entities of "
             "a given type, aliases of a canonical name, or papers flagged "
             "for review. For which='topics', pass 'collection' to scope the "
-            "topic rollup to one collection (papers via paper_collections, "
-            "repos via repos.collection); pass 'domain' to disambiguate "
-            "collection names that exist in multiple domains."
+            "topic rollup to one collection (papers, posts, and repos all "
+            "flow through the polymorphic `collections` junction); pass "
+            "'domain' to disambiguate collection names that exist in "
+            "multiple domains."
         ),
         "inputSchema": {
             "type": "object",
