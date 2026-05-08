@@ -1055,6 +1055,157 @@ class TestProtocolHandshake:
 
 
 # ===========================================================================
+# HTTP transport smoke test
+# ===========================================================================
+
+
+def _free_port() -> int:
+    import socket as _socket
+    s = _socket.socket()
+    try:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
+
+
+def _http_post(url: str, body: dict, timeout: float = 5.0) -> tuple[int, dict | None]:
+    """POST one JSON-RPC message; return (status_code, parsed-body-or-None)."""
+    import urllib.error
+    import urllib.request
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            code = resp.getcode()
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        code = exc.code
+    if not raw:
+        return code, None
+    try:
+        return code, json.loads(raw)
+    except json.JSONDecodeError:
+        return code, None
+
+
+@pytest.fixture
+def http_server(real_db):
+    """Spawn ``lodestone-mcp --http`` against ``real_db`` on a free port and
+    yield the base URL. Tear down on exit. Polls the port for ~3s before
+    handing off so the first request doesn't race the bind."""
+    import socket as _socket
+    import time
+
+    port = _free_port()
+    # stderr=DEVNULL: the server logs every request through log_message →
+    # _log to stderr. A PIPE buffer (~64KB) would fill and block the
+    # server's writes mid-test. We don't read the pipe during the run, so
+    # discard it; on early-exit we re-spawn briefly to capture the error.
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "_system.scripts.mcp_server",
+         "--http", "--host", "127.0.0.1", "--port", str(port)],
+        env={**os.environ, "LODESTONE_DB": str(real_db)},
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    deadline = time.time() + 3.0
+    ready = False
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(f"server exited early rc={proc.returncode}")
+        s = _socket.socket()
+        s.settimeout(0.2)
+        try:
+            s.connect(("127.0.0.1", port))
+            ready = True
+            break
+        except OSError:
+            time.sleep(0.05)
+        finally:
+            s.close()
+    if not ready:
+        proc.terminate()
+        raise RuntimeError(f"server did not start listening on port {port}")
+    try:
+        yield f"http://127.0.0.1:{port}/mcp"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2.0)
+
+
+class TestHttpTransport:
+    def test_initialize_handshake(self, http_server):
+        code, body = _http_post(http_server, {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "t", "version": "1"}},
+        })
+        assert code == 200
+        assert body["id"] == 1
+        result = body["result"]
+        assert result["protocolVersion"] == mcp_server.PROTOCOL_VERSION
+        assert result["serverInfo"]["name"] == "lodestone"
+
+    def test_tools_list_returns_full_registry(self, http_server):
+        code, body = _http_post(http_server, {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/list",
+        })
+        assert code == 200
+        tools = body["result"]["tools"]
+        assert len(tools) == 20
+        names = {t["name"] for t in tools}
+        assert names == set(mcp_server._TOOL_INDEX.keys())
+
+    def test_tools_call_search_returns_text_block(self, http_server):
+        code, body = _http_post(http_server, {
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "search", "arguments": {"query": "tree"}},
+        })
+        assert code == 200
+        result = body["result"]
+        assert result.get("isError") in (False, None)
+        assert any(b["type"] == "text" for b in result["content"])
+
+    def test_notification_returns_202(self, http_server):
+        # Notifications (no `id`) get 202 No Content.
+        import urllib.request
+        data = json.dumps({
+            "jsonrpc": "2.0", "method": "notifications/initialized",
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            http_server, data=data,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            assert resp.getcode() == 202
+
+    def test_wrong_path_404(self, http_server):
+        url = http_server.rsplit("/", 1)[0] + "/nope"
+        code, _ = _http_post(url, {
+            "jsonrpc": "2.0", "id": 9, "method": "tools/list",
+        })
+        assert code == 404
+
+    def test_get_returns_405(self, http_server):
+        import urllib.error
+        import urllib.request
+        try:
+            with urllib.request.urlopen(http_server, timeout=5.0) as resp:
+                code = resp.getcode()
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+        assert code == 405
+
+
+# ===========================================================================
 # overview / collection MCP tools
 # ===========================================================================
 
