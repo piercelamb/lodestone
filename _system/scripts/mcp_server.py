@@ -22,6 +22,7 @@ mismatch) — that's the issue #35287 mitigation. Failures surface as
 """
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import os
@@ -31,6 +32,7 @@ import sqlite3
 import sys
 import traceback
 from enum import StrEnum
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -134,6 +136,11 @@ def _send(msg: dict) -> None:
 
 def _send_progress(token: Any, message: str, progress: int, total: int) -> None:
     """Emit one ``notifications/progress`` message keyed off the client's token.
+
+    Stdio-only by construction — writes to the same stdout stream as the
+    response envelope. Callers under non-stdio transports must not invoke
+    this; ``_handle_tools_call`` substitutes a no-op callback in those
+    cases (see the Transport check there).
 
     No-op when ``token`` is None — clients that don't request progress on
     a tools/call simply receive nothing here, and the eventual result
@@ -646,6 +653,13 @@ class AttachMode(StrEnum):
     SCAN = "scan"      # walk the payload for (figure:N) refs and inline them
     FIGURE = "figure"  # payload is itself a single figure — fetch the BLOB
     NONE = "none"      # text-only, no figure attachment
+
+
+class Transport(StrEnum):
+    """Wire transport for the MCP server. HTTP is the issue #51736 workaround."""
+
+    STDIO = "stdio"
+    HTTP = "http"
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -1427,6 +1441,7 @@ class _ServerState:
         self.db_path: Path | None = None
         self.conn: sqlite3.Connection | None = None
         self.startup_error: str | None = None
+        self.transport: Transport = Transport.STDIO
 
     def configure(self) -> None:
         """Resolve DB path and try to open. On failure, capture the error
@@ -1536,8 +1551,14 @@ def _handle_tools_call(state: _ServerState, msg: dict) -> dict:
 
     try:
         if tool.get("accepts_progress"):
-            def _progress_cb(message: str, p: int, total: int) -> None:
-                _send_progress(progress_token, message, p, total)
+            # Progress notifications are stdio-only: the HTTP transport has
+            # no out-of-band channel for them (would require SSE).
+            if state.transport is Transport.STDIO:
+                def _progress_cb(message: str, p: int, total: int) -> None:
+                    _send_progress(progress_token, message, p, total)
+            else:
+                def _progress_cb(message: str, p: int, total: int) -> None:
+                    return
             payload = tool["dispatch"](state.conn, args, _progress_cb)
         else:
             payload = tool["dispatch"](state.conn, args)
@@ -1607,26 +1628,18 @@ def _dispatch(state: _ServerState, msg: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-def main(stdin=None, stdout=None) -> int:
-    if stdin is not None:
-        sys.stdin = stdin
-    if stdout is not None:
-        sys.stdout = stdout
-
-    state = _ServerState()
-    state.configure()
-
+def _install_signal_handlers(state: _ServerState) -> None:
     def _on_signal(signum: int, frame: Any) -> None:  # noqa: ARG001
         _log("info", f"signal {signum} received; shutting down")
         state.close()
-        # Re-raise as SystemExit so the loop exits cleanly.
+        # Re-raise as SystemExit so the transport loop exits cleanly.
         raise SystemExit(0)
 
     signal.signal(signal.SIGTERM, _on_signal)
     signal.signal(signal.SIGINT, _on_signal)
 
-    _log("info", f"starting (db={state.db_path}, startup_error={state.startup_error!r})")
 
+def _run_stdio(state: _ServerState) -> int:
     try:
         for line in sys.stdin:
             line = line.strip()
@@ -1654,11 +1667,106 @@ def main(stdin=None, stdout=None) -> int:
                 _send(resp)
     except SystemExit:
         return 0
-    finally:
-        state.close()
 
     _log("info", "stdin closed; exiting")
     return 0
+
+
+def _run_http(state: _ServerState, host: str, port: int) -> int:
+    """Single-threaded HTTP transport. POST /mcp with one JSON-RPC message
+    per request; response carries the matching JSON-RPC reply (200) or 202
+    No Content for notifications. No SSE; progress notifications are
+    suppressed under this transport — see ``_send_progress``.
+    """
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802 — stdlib API
+            if self.path.rstrip("/") != "/mcp":
+                self.send_error(404)
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b""
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                self._json(400, _err(None, _ERR_PARSE, f"parse error: {exc}"))
+                return
+            if not isinstance(msg, dict):
+                self._json(400, _err(None, _ERR_INVALID_REQUEST,
+                                     "request must be a JSON object"))
+                return
+            try:
+                resp = _dispatch(state, msg)
+            except Exception as exc:  # noqa: BLE001
+                _log("error", f"dispatch failed: {exc!r}")
+                traceback.print_exc(file=sys.stderr)
+                if "id" in msg:
+                    self._json(200, _err(msg["id"], _ERR_INTERNAL, repr(exc)))
+                    return
+                self.send_response(202)
+                self.end_headers()
+                return
+            if resp is None:  # notification — no reply per JSON-RPC
+                self.send_response(202)
+                self.end_headers()
+                return
+            self._json(200, resp)
+
+        def do_GET(self):  # noqa: N802 — stdlib API
+            # Spec-optional SSE channel; v1 has no use for it.
+            self.send_error(405)
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            _log("debug", fmt % args)
+
+        def _json(self, code: int, body: dict) -> None:
+            data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    srv = HTTPServer((host, port), Handler)
+    _log("info", f"listening on http://{host}:{port}/mcp")
+    try:
+        srv.serve_forever()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        srv.server_close()
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="lodestone-mcp")
+    p.add_argument(
+        "--http",
+        action="store_true",
+        help="Serve over HTTP instead of stdio. Workaround for Claude Code "
+             "issue #51736 (stdio MCP tools silently dropped on 2.1.116+).",
+    )
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8765)
+    args = p.parse_args(argv)
+
+    state = _ServerState()
+    state.configure()
+    state.transport = Transport.HTTP if args.http else Transport.STDIO
+    _install_signal_handlers(state)
+
+    _log(
+        "info",
+        f"starting (db={state.db_path}, transport={state.transport}, "
+        f"startup_error={state.startup_error!r})",
+    )
+
+    try:
+        if args.http:
+            return _run_http(state, args.host, args.port)
+        return _run_stdio(state)
+    finally:
+        state.close()
 
 
 if __name__ == "__main__":
