@@ -1,0 +1,55 @@
+{
+  "name": "classify_post",
+  "description": "Classify a blog post into a domain, one or more collections, and topics.",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "domain_index": {
+        "type": "integer",
+        "description": "Index into existing_domains list. Use -1 to propose a new domain.",
+        "enum": "DOMAIN_INDEX_ENUM"
+      },
+      "new_domain": {
+        "type": "string",
+        "description": "Empty unless domain_index == -1; otherwise the proposed new domain name."
+      },
+      "new_domain_desc": {
+        "type": "string",
+        "description": "Empty unless domain_index == -1; otherwise a one-sentence description of the proposed domain (what it covers, not the specific post). Stored alongside the domain row."
+      },
+      "collections": {
+        "type": "array",
+        "minItems": 1,
+        "maxItems": 4,
+        "description": "Ordered list of collections this post belongs to within the chosen domain. Index 0 is the PRIMARY (post's home). Indices 1+ are SECONDARY memberships used only when the post substantively contributes to that category (not just mentions/compares against it). Use index=-1 to propose a new collection (new_name + new_desc required); existing-index entries must leave new_name and new_desc empty.",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "index": {
+              "type": "integer",
+              "description": "Index of an existing collection within the chosen domain (as shown in the tree). Use -1 to propose a new collection.",
+              "enum": "COLLECTION_INDEX_ENUM"
+            },
+            "new_name": {
+              "type": "string",
+              "description": "Empty unless index == -1; otherwise the proposed new collection name."
+            },
+            "new_desc": {
+              "type": "string",
+              "description": "Empty unless index == -1; otherwise a one-sentence description of the proposed collection (what family of work it groups, not this specific post). Stored alongside the collection row."
+            }
+          },
+          "required": ["index", "new_name", "new_desc"]
+        }
+      },
+      "topics": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Topics naming the post's salient semantic concepts. Each topic must be distinct from entities, from the chosen domain/collection, and from structural metadata, and should pass the linking/reusability/specificity tests."
+      }
+    },
+    "required": ["domain_index", "new_domain", "new_domain_desc", "collections", "topics"],
+    "additionalProperties": false
+  }
+}

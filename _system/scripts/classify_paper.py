@@ -71,6 +71,7 @@ from _system.utils.source_resolution import (
 _LOG = get_logger("scripts.classify_paper")
 
 _PAPER_CONTENT_MAX_CHARS = 8000
+_POST_CONTENT_MAX_CHARS = 10000
 # Display cap on collections per domain. Purely a prompt-size budget —
 # overflow surfaces as a sibling leaf that nudges the LLM to propose new
 # rather than guess at hidden entries.
@@ -194,8 +195,13 @@ def classify(
                 f"{status_str!r}{extra}"
             )
 
+    max_chars = (
+        _PAPER_CONTENT_MAX_CHARS
+        if kind is SourceKind.PAPER
+        else _POST_CONTENT_MAX_CHARS
+    )
     paper_content = _head_slice_paper_content(
-        markdown=markdown or "", abstract=abstract or ""
+        markdown=markdown or "", abstract=abstract or "", max_chars=max_chars,
     )
     del markdown
 
@@ -210,15 +216,21 @@ def classify(
         (len(d.collections) for d in existing_domains), default=0
     )
 
+    if kind is SourceKind.PAPER:
+        prompt_name = "classify_paper"
+        content_placeholder = "PAPER_CONTENT"
+    else:
+        prompt_name = "classify_post"
+        content_placeholder = "POST_CONTENT"
     loaded = load_prompt(
-        "classify_paper",
+        prompt_name,
         md_context={
             "EXISTING_TAXONOMY": render_taxonomy_tree(
                 existing_domains,
                 style=TaxonomyTreeStyle.INDEX,
                 overflow_message="(+ {n} more exist; feel free to propose new)",
             ),
-            "PAPER_CONTENT": paper_content,
+            content_placeholder: paper_content,
         },
         schema_replacements={
             "DOMAIN_INDEX_ENUM": [-1, *range(len(existing_domains))],
@@ -592,17 +604,20 @@ def _resolve_pick(
 # ---------------------------------------------------------------------------
 
 
-def _head_slice_paper_content(*, markdown: str, abstract: str) -> str:
-    """Return up to ~8K chars of paper content for classification.
+def _head_slice_paper_content(
+    *, markdown: str, abstract: str, max_chars: int = _PAPER_CONTENT_MAX_CHARS,
+) -> str:
+    """Return up to ``max_chars`` chars of source content for classification.
 
     The head of the markdown naturally contains title + abstract + start of
-    introduction — everything the LLM needs to pick a domain/collection/topics.
-    If markdown is missing (stale row, upstream conversion skipped), fall back
-    to the abstract column alone.
+    introduction (papers) or title + lead + opening sections (posts) —
+    everything the LLM needs to pick a domain/collection/topics. If markdown
+    is missing (stale row, upstream conversion skipped), fall back to the
+    abstract column alone.
     """
     stripped = markdown.strip()
     if stripped:
-        return stripped[:_PAPER_CONTENT_MAX_CHARS]
+        return stripped[:max_chars]
     return abstract.strip()
 
 
