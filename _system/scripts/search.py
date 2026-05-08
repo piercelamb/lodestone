@@ -61,12 +61,32 @@ from _system.utils.sections import (
     split_sections,
 )
 from _system.utils.slug import _SLUG_RE
+from _system.utils.source_resolution import SourceKind, lookup_slug
 
 _LOG = get_logger("scripts.search")
 
 # BM25 enrichment size cap. Keeping each follow-up query small bounds the
 # JSON payload size even on queries that return many hits.
 _ENTITY_PREVIEW_LIMIT = 5
+
+
+def _read_source_markdown(
+    conn: sqlite3.Connection, slug: str,
+) -> str | None:
+    """Return ``markdown`` for a slug that may live in either ``papers`` or
+    ``posts``. Returns None when neither table holds the slug. Empty
+    markdown coerces to ''.
+    """
+    resolved = lookup_slug(conn, slug)
+    if resolved is None:
+        return None
+    table = "papers" if resolved.kind is SourceKind.PAPER else "posts"
+    row = conn.execute(
+        f"SELECT markdown FROM {table} WHERE id = ?", (resolved.id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return row[0] or ""
 
 
 class TaxonomyKind(StrEnum):
@@ -676,13 +696,23 @@ def _bm25_sections(
         where_params.append(paper_name)
     if collection:
         # Sections does not carry collection in FTS5 (by design; the
-        # paper owns the collection). Match against `paper_collections`
-        # so secondary memberships filter through too — a paper that's
-        # `collection` as a secondary still surfaces via this filter.
+        # source owns the collection). Match against `paper_collections`
+        # / `post_collections` via the slug — sections.paper_id is
+        # ambiguous across kinds (a post_id may equal a paper_id), but
+        # the slug is globally unique. Secondary memberships filter
+        # through too.
         wheres.append(
-            "EXISTS (SELECT 1 FROM paper_collections pc "
-            "         WHERE pc.paper_id = s.paper_id AND pc.collection = ?)"
+            "s.paper_name IN ("
+            "  SELECT p.paper_name FROM papers p "
+            "    JOIN paper_collections pc ON pc.paper_id = p.id "
+            "   WHERE pc.collection = ? "
+            "  UNION ALL "
+            "  SELECT po.post_name FROM posts po "
+            "    JOIN post_collections poc ON poc.post_id = po.id "
+            "   WHERE poc.collection = ? "
+            ")"
         )
+        where_params.append(collection)
         where_params.append(collection)
     where_clause = " WHERE " + " AND ".join(wheres)
 
@@ -1056,6 +1086,25 @@ def _topics_batch_repo(
     return result
 
 
+def _topics_batch_post(
+    conn: sqlite3.Connection, post_ids: list[int]
+) -> dict[int, list[str]]:
+    """Sibling of ``_topics_batch`` for ``target_kind='post'`` rows."""
+    if not post_ids:
+        return {}
+    placeholders = ",".join("?" * len(post_ids))
+    rows = conn.execute(
+        f"SELECT target_id, topic FROM topics "
+        f" WHERE target_kind = 'post' AND target_id IN ({placeholders}) "
+        f" ORDER BY target_id, topic",
+        post_ids,
+    ).fetchall()
+    result: dict[int, list[str]] = {pid: [] for pid in post_ids}
+    for pid, topic in rows:
+        result[pid].append(topic)
+    return result
+
+
 def _entities_preview_batch(
     conn: sqlite3.Connection, paper_ids: list[int]
 ) -> dict[int, list[dict[str, str]]]:
@@ -1291,15 +1340,27 @@ def mode_taxonomy_lookup(
                 "  JOIN papers p ON p.id = t.target_id "
                 " WHERE t.target_kind = 'paper' "
                 "   AND t.topic = ? AND t.domain = ? "
-                " ORDER BY p.paper_name",
-                (canonical_name, dom),
+                "UNION ALL "
+                "SELECT DISTINCT po.post_name "
+                "  FROM topics t "
+                "  JOIN posts po ON po.id = t.target_id "
+                " WHERE t.target_kind = 'post' "
+                "   AND t.topic = ? AND t.domain = ? "
+                " ORDER BY 1",
+                (canonical_name, dom, canonical_name, dom),
             ).fetchall()
         else:  # collection
+            # Slug-namespace union: collections can contain both papers
+            # and posts. The lookup payload renames the column to
+            # ``paper_name`` for backward compat — callers see slugs.
             prows = conn.execute(
                 "SELECT paper_name FROM papers "
                 " WHERE collection = ? AND domain = ? "
-                " ORDER BY paper_name",
-                (canonical_name, dom),
+                "UNION ALL "
+                "SELECT post_name FROM posts "
+                " WHERE collection = ? AND domain = ? "
+                "ORDER BY 1",
+                (canonical_name, dom, canonical_name, dom),
             ).fetchall()
         papers = [{"paper_name": r[0]} for r in prows]
         _attach_code_repo_to_papers(conn, papers)
@@ -1698,17 +1759,26 @@ def mode_browse(
         raise ValueError(f"unknown browse view: {which!r}") from exc
     domain = filters.get("domain")
     if view is BrowseView.COLLECTIONS:
-        # paper_collections counts a paper once per primary/secondary
-        # membership it carries.
-        sql = (
-            "SELECT collection, COUNT(paper_id) AS n "
-            "  FROM paper_collections "
-        )
+        # *_collections counts a paper or post once per primary/secondary
+        # membership it carries. UNION ALL across paper + post tables so
+        # the count reflects everything in the collection regardless of
+        # source kind.
         params: list[Any] = []
+        domain_filter = ""
         if domain:
-            sql += " WHERE domain = ? "
+            domain_filter = " WHERE domain = ?"
             params.append(domain)
-        sql += " GROUP BY collection ORDER BY n DESC, collection"
+        sql = (
+            "WITH all_bindings AS ("
+            "  SELECT collection, domain FROM paper_collections "
+            "  UNION ALL "
+            "  SELECT collection, domain FROM post_collections "
+            ") "
+            "SELECT collection, COUNT(*) AS n "
+            "  FROM all_bindings "
+            f" {domain_filter}"
+            " GROUP BY collection ORDER BY n DESC, collection"
+        )
         rows = conn.execute(sql, params).fetchall()
         return {
             "mode": view,
@@ -1717,19 +1787,23 @@ def mode_browse(
 
     if view is BrowseView.TOPICS:
         collection = filters.get("collection")
-        # Aggregate paper + repo bindings — both kinds count.
+        # Aggregate paper + post + repo bindings — all three kinds count.
         if collection:
-            # Scope to one collection: papers join via paper_collections
-            # (multi-collection), repos via the scalar repos.collection.
-            # `domain` disambiguates collection names that exist in
-            # multiple domains.
+            # Scope to one collection: papers via paper_collections,
+            # posts via post_collections, repos via the scalar
+            # repos.collection. `domain` disambiguates collection names
+            # that exist in multiple domains.
             paper_clauses = ["pc.collection = ?"]
             paper_params: list[Any] = [collection]
+            post_clauses = ["poc.collection = ?"]
+            post_params: list[Any] = [collection]
             repo_clauses = ["r.collection = ?"]
             repo_params: list[Any] = [collection]
             if domain:
                 paper_clauses.append("pc.domain = ?")
                 paper_params.append(domain)
+                post_clauses.append("poc.domain = ?")
+                post_params.append(domain)
                 repo_clauses.append("r.domain = ?")
                 repo_params.append(domain)
             sql = (
@@ -1743,6 +1817,13 @@ def mode_browse(
                 "  UNION ALL "
                 "  SELECT t.topic, t.target_kind "
                 "    FROM topics t "
+                "    JOIN post_collections poc "
+                "      ON t.target_kind = 'post' "
+                "     AND t.target_id = poc.post_id "
+                f"    WHERE {' AND '.join(post_clauses)} "
+                "  UNION ALL "
+                "  SELECT t.topic, t.target_kind "
+                "    FROM topics t "
                 "    JOIN repos r "
                 "      ON t.target_kind = 'repo' "
                 "     AND t.target_id = r.id "
@@ -1751,17 +1832,19 @@ def mode_browse(
                 "SELECT topic, "
                 "       COUNT(*) AS n, "
                 "       SUM(CASE WHEN target_kind='paper' THEN 1 ELSE 0 END) AS paper_n, "
+                "       SUM(CASE WHEN target_kind='post'  THEN 1 ELSE 0 END) AS post_n, "
                 "       SUM(CASE WHEN target_kind='repo'  THEN 1 ELSE 0 END) AS repo_n "
                 "  FROM bindings "
                 " GROUP BY topic "
                 " ORDER BY n DESC, topic"
             )
-            params = paper_params + repo_params
+            params = paper_params + post_params + repo_params
         else:
             sql = (
                 "SELECT topic, "
                 "       COUNT(*) AS n, "
                 "       SUM(CASE WHEN target_kind='paper' THEN 1 ELSE 0 END) AS paper_n, "
+                "       SUM(CASE WHEN target_kind='post'  THEN 1 ELSE 0 END) AS post_n, "
                 "       SUM(CASE WHEN target_kind='repo'  THEN 1 ELSE 0 END) AS repo_n "
                 "  FROM topics "
             )
@@ -1778,7 +1861,8 @@ def mode_browse(
                     "topic": r[0],
                     "count": int(r[1] or 0),
                     "paper_count": int(r[2] or 0),
-                    "repo_count": int(r[3] or 0),
+                    "post_count": int(r[3] or 0),
+                    "repo_count": int(r[4] or 0),
                 }
                 for r in rows
             ],
@@ -2056,6 +2140,14 @@ def mode_collection(
         ).fetchone()
         total_papers = int(total_row[0] or 0) if total_row else 0
 
+        post_total_row = conn.execute(
+            "SELECT COUNT(poc.post_id) "
+            "  FROM post_collections poc "
+            " WHERE poc.domain = ? AND poc.collection = ?",
+            (d_name, c_name),
+        ).fetchone()
+        total_posts = int(post_total_row[0] or 0) if post_total_row else 0
+
         repo_total_row = conn.execute(
             "SELECT COUNT(*) FROM repos "
             " WHERE paper_id IS NULL AND domain = ? AND collection = ?",
@@ -2148,15 +2240,57 @@ def mode_collection(
                 ),
             })
 
+        # Posts in this collection. Slim shape — title + slug + author +
+        # site_name + topics — keeps the response bounded while letting
+        # callers pivot to read/toc/bm25 with the slug.
+        post_abstract_col = ", abstract" if include_abstracts else ""
+        post_rows = conn.execute(
+            f"""
+            SELECT po.id, po.post_name, po.title, po.author, po.site_name,
+                   po.date, po.section_count{post_abstract_col}
+              FROM posts po
+              JOIN post_collections poc ON poc.post_id = po.id
+             WHERE poc.domain = ? AND poc.collection = ?
+             ORDER BY po.date DESC, po.post_name
+             LIMIT ?
+            """,
+            (d_name, c_name, limit),
+        ).fetchall()
+
+        post_ids = [int(r[0]) for r in post_rows]
+        post_topics_by_id: dict[int, list[str]] = {pid: [] for pid in post_ids}
+        if include_topics and post_ids:
+            post_topics_by_id.update(_topics_batch_post(conn, post_ids))
+
+        posts: list[dict[str, Any]] = []
+        for r in post_rows:
+            pid = int(r[0])
+            entry: dict[str, Any] = {
+                "post_name": r[1],
+                "title": r[2],
+                "author": r[3],
+                "site_name": r[4],
+                "date": r[5],
+                "section_count": int(r[6] or 0),
+            }
+            if include_abstracts:
+                entry["abstract"] = r[7]
+            if include_topics:
+                entry["topics"] = post_topics_by_id.get(pid, [])
+            posts.append(entry)
+
         entries.append({
             "domain": d_name,
             "collection": c_name,
             "description": c_desc,
             "paper_count": total_papers,
+            "post_count": total_posts,
             "repo_count": total_repos,
             "papers_truncated": total_papers > len(papers),
+            "posts_truncated": total_posts > len(posts),
             "repos_truncated": total_repos > len(repos),
             "papers": papers,
+            "posts": posts,
             "repos": repos,
         })
 
@@ -2174,16 +2308,14 @@ def mode_collection(
 
 
 def mode_toc(conn: sqlite3.Connection, *, paper_name: str) -> dict[str, Any]:
-    """Flatten ``papers.markdown`` into level-1..3 headers via the shared
-    :func:`split_sections` walker — keeps ToC boundaries in lockstep with
-    how the indexer chunked the paper, including fenced-code suppression.
+    """Flatten ``papers.markdown`` (or ``posts.markdown``) into level-1..3
+    headers via the shared :func:`split_sections` walker. The slug
+    namespace is shared, so a ``paper_name`` argument may resolve to
+    either a paper or a post — both share the same ToC contract.
     """
-    row = conn.execute(
-        "SELECT markdown FROM papers WHERE paper_name = ?", (paper_name,)
-    ).fetchone()
-    if row is None:
+    markdown = _read_source_markdown(conn, paper_name)
+    if markdown is None:
         raise ValueError(f"paper not found: paper_name={paper_name!r}")
-    markdown = row[0] or ""
 
     toc = [
         {"level": chunk.level, "title": chunk.title}
@@ -2249,12 +2381,9 @@ def mode_read(
     A non-existent paper still raises ``ValueError`` — that's a hard error
     (the caller picked the wrong arg), not a recoverable agent miss.
     """
-    row = conn.execute(
-        "SELECT markdown FROM papers WHERE paper_name = ?", (paper_name,)
-    ).fetchone()
-    if row is None:
+    markdown = _read_source_markdown(conn, paper_name)
+    if markdown is None:
         raise ValueError(f"paper not found: paper_name={paper_name!r}")
-    markdown = row[0] or ""
 
     if section is None:
         return {
@@ -2398,12 +2527,22 @@ def _resolve_repo_target(
         return int(row[0]), row[1], row[2]
 
     assert paper_name is not None
-    paper_row = conn.execute(
-        "SELECT id FROM papers WHERE paper_name = ?", (paper_name,),
-    ).fetchone()
-    if paper_row is None:
+    resolved = lookup_slug(conn, paper_name)
+    if resolved is None:
         raise ValueError(f"paper not found: paper_name={paper_name!r}")
-    paper_id = paper_row[0]
+    if resolved.kind is SourceKind.POST:
+        # Posts have no linked repo in v1, so surface that as a soft
+        # no_repo status rather than raising.
+        return {
+            "mode": "repo_tree",
+            "status": "no_repo",
+            "paper_name": paper_name,
+            "hint": (
+                f"slug {paper_name!r} resolves to a post; post→repo "
+                "linkage is not implemented in v1."
+            ),
+        }
+    paper_id = resolved.id
     repo_row = conn.execute(
         "SELECT id, repo_slug FROM repos WHERE paper_id = ?", (paper_id,),
     ).fetchone()
@@ -2610,13 +2749,22 @@ def _safe_n_for_filename(n: Any) -> str:
 
 
 def _lookup_paper_id(conn: sqlite3.Connection, paper: str) -> int:
+    """Resolve a slug to a ``papers.id``.
+
+    Posts are rejected with :class:`ValueError` — figures are paper-only
+    in v1 (blog posts don't yet ingest inline images, see
+    ``planning/blog-posts.md`` for the v2 plan).
+    """
     _assert_safe_paper_name(paper)
-    prow = conn.execute(
-        "SELECT id FROM papers WHERE paper_name = ?", (paper,)
-    ).fetchone()
-    if prow is None:
+    resolved = lookup_slug(conn, paper)
+    if resolved is None:
         raise ValueError(f"paper not found: paper_name={paper!r}")
-    return prow[0]
+    if resolved.kind is SourceKind.POST:
+        raise ValueError(
+            f"figures unavailable for posts: slug={paper!r} resolves to a "
+            "post, but blog-post figure extraction is not implemented in v1"
+        )
+    return resolved.id
 
 
 def _write_blob_tempfile(image: bytes, *, prefix: str, suffix: str = ".png") -> str:

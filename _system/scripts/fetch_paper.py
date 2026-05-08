@@ -33,12 +33,6 @@ from pathlib import Path
 from typing import Callable
 import httpx
 from PIL import Image
-from tenacity import (
-    retry,
-    retry_if_exception,
-    stop_after_attempt,
-    wait_exponential,
-)
 
 from _system.db.cascade import delete_paper_cascade
 from _system.db.connection import get_conn, transaction
@@ -49,15 +43,19 @@ from _system.latex import eprint as latex_eprint
 from _system.latex import figures as latex_figures
 from _system.schemas.paper_metadata import HtmlSource, PaperMetadata, PaperStatus
 from _system.utils.arxiv_urls import base_url_for_source, parse_arxiv_id
+from _system.utils.http import (
+    USER_AGENT,
+    is_transient as _is_transient,
+    make_default_client as _make_default_client,
+    retry_http as _retry_http,
+)
 from _system.utils.logging import get_logger
 from _system.utils.repo_url import extract_repo_candidates, normalize_repo_url
-from _system.utils.slug import generate_paper_name
+from _system.utils.slug import existing_slugs, generate_paper_name
 
 __all__ = ["fetch", "LATEX_SENTINEL_PREFIX"]
 
 _LOG = get_logger("scripts.fetch_paper")
-
-USER_AGENT = "Lodestone/1.0 (mailto:pierce.lamb@getwhys.io)"
 
 # Per-image decompression-bomb guard; well above 1920²×4 but low enough
 # that a malicious PNG cannot OOM the worker. Catch `DecompressionBombError`
@@ -104,30 +102,6 @@ class _ProcessedFigure:
     image_bytes: bytes
     mime_type: str
 
-
-def _make_default_client() -> httpx.Client:
-    return httpx.Client(
-        headers={"User-Agent": USER_AGENT},
-        timeout=30.0,
-        follow_redirects=True,
-    )
-
-
-def _is_transient(exc: BaseException) -> bool:
-    if isinstance(exc, httpx.HTTPStatusError):
-        # Retry on 429 too — arxiv's API throttles aggressively, but a
-        # short backoff usually clears it.
-        sc = exc.response.status_code
-        return sc == 429 or 500 <= sc < 600
-    return isinstance(exc, httpx.TransportError)
-
-
-_retry_http = retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(min=0.5, max=4.0),
-    retry=retry_if_exception(_is_transient),
-    reraise=True,
-)
 
 _ARXIV_API_URL = "https://export.arxiv.org/api/query?id_list={arxiv_id}"
 
@@ -486,11 +460,6 @@ def _get_existing_paper(conn: sqlite3.Connection, arxiv_id: str) -> PaperMetadat
         needs_review=bool(row[14]),
         ingested_at=row[15],
     )
-
-
-def _existing_paper_names(conn: sqlite3.Connection) -> set[str]:
-    rows = conn.execute("SELECT paper_name FROM papers").fetchall()
-    return {r[0] for r in rows}
 
 
 def _log_soft_dedup(conn: sqlite3.Connection, content_hash: str, arxiv_id: str) -> None:
@@ -864,7 +833,7 @@ def _resolve_slug_and_timestamp(
         existing_row.paper_name
         if existing_row is not None
         else generate_paper_name(
-            meta.title, meta.published, arxiv_id, _existing_paper_names(conn),
+            meta.title, meta.published, arxiv_id, existing_slugs(conn),
         )
     )
     ingested_at = datetime.now(timezone.utc).isoformat(timespec="seconds")

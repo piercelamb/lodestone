@@ -113,6 +113,24 @@ def parse_arxiv_id(raw: str) -> str:
     )
 
 
+def iter_arxiv_id_matches(text: str):
+    """Yield ``(arxiv_id, re.Match)`` for every arxiv mention in ``text``.
+
+    Used by reference extraction to walk free text once and pull every
+    citable arxiv id with its match span (for context windowing).
+    """
+    if not text:
+        return
+    for m in _ARXIV_ID_FREE_RE.finditer(text):
+        legacy = m.group("legacy")
+        if legacy:
+            yield legacy.lower(), m
+        else:
+            modern = m.group("modern") or m.group("urlid")
+            if modern:
+                yield modern, m
+
+
 def extract_arxiv_id_from_text(text: str) -> Optional[str]:
     """Find the first arxiv-id mention inside free text.
 

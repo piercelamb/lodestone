@@ -77,6 +77,46 @@ def delete_paper_cascade(conn: sqlite3.Connection, *, paper_id: int) -> None:
     gc_orphan_topic_canonicals(conn)
 
 
+def delete_post_cascade(conn: sqlite3.Connection, *, post_id: int) -> None:
+    """DELETE one post and every per-post child row.
+
+    Mirrors :func:`delete_paper_cascade` for the blog-post side. Order
+    matters: FK-backed children before the posts row; FTS5 ``sections``
+    rows are slug-keyed (no FK) so their delete predicate goes through
+    ``post_name``. Orphan topic canonicals are GC'd at the end.
+
+    Posts have no figures, no per-post linked repos in v1, and no
+    paper_references row to null out (paper-side refs target only papers).
+    """
+    # Outbound arxiv refs from this post.
+    conn.execute("DELETE FROM post_references WHERE post_id = ?", (post_id,))
+    # term_aliases keys by slug TEXT, not id, so look up the post_name.
+    conn.execute(
+        """
+        DELETE FROM term_aliases
+         WHERE source_paper = (SELECT post_name FROM posts WHERE id = ?)
+        """,
+        (post_id,),
+    )
+    conn.execute(
+        "DELETE FROM post_collections WHERE post_id = ?", (post_id,)
+    )
+    conn.execute(
+        "DELETE FROM topics WHERE target_kind = ? AND target_id = ?",
+        (TopicTarget.POST.value, post_id),
+    )
+    # sections.paper_name is the shared slug column — used here by post_name.
+    conn.execute(
+        """
+        DELETE FROM sections
+         WHERE paper_name = (SELECT post_name FROM posts WHERE id = ?)
+        """,
+        (post_id,),
+    )
+    conn.execute("DELETE FROM posts WHERE id = ?", (post_id,))
+    gc_orphan_topic_canonicals(conn)
+
+
 def delete_repo_cascade(
     conn: sqlite3.Connection,
     *,

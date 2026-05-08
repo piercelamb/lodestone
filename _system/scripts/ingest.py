@@ -32,16 +32,23 @@ from typing import NamedTuple
 # Args: (message, done, total).
 ProgressFn = Callable[[str, int, int], None]
 
-from _system.db.cascade import delete_paper_cascade, delete_repo_cascade
+from _system.db.cascade import (
+    delete_paper_cascade,
+    delete_post_cascade,
+    delete_repo_cascade,
+)
 from _system.db.connection import get_conn, transaction
 from _system.db.migrations import init_db
 from _system.schemas.paper_metadata import PaperStatus, can_run_from as paper_can_run_from
+from _system.schemas.post_metadata import PostStatus, can_run_from as post_can_run_from
 from _system.schemas.repo_metadata import RepoStatus, can_run_from as repo_can_run_from
 from _system.scripts.classify_paper import classify as classify_paper_stage
 from _system.scripts.classify_repo import classify as classify_repo_stage
 from _system.scripts.convert_paper import convert as convert_stage
+from _system.scripts.convert_post import convert as convert_post_stage
 from _system.scripts.extract_entities import extract as extract_stage
 from _system.scripts.fetch_paper import fetch as fetch_stage
+from _system.scripts.fetch_post import fetch as fetch_post_stage
 from _system.scripts.fetch_repo import fetch_repo as fetch_repo_stage
 from _system.scripts.index_paper import index_one as index_stage
 from _system.scripts.resolve_repo import resolve as resolve_repo_stage
@@ -61,6 +68,11 @@ class Stage(StrEnum):
     RESOLVE_REPO = "resolve_repo"
     FETCH_REPO = "fetch_repo"
     CLASSIFY_REPO = "classify_repo"
+    FETCH_POST = "fetch_post"
+    CONVERT_POST = "convert_post"
+    CLASSIFY_POST = "classify_post"
+    EXTRACT_POST = "extract_post"
+    INDEX_POST = "index_post"
 
 
 class _PaperRow(NamedTuple):
@@ -579,6 +591,253 @@ def ingest_repo_only(
 
 
 # ---------------------------------------------------------------------------
+# Post-first orchestrator
+# ---------------------------------------------------------------------------
+
+
+_POST_PIPELINE: tuple[tuple[Stage, PostStatus], ...] = (
+    (Stage.FETCH_POST, PostStatus.FETCHED),
+    (Stage.CONVERT_POST, PostStatus.CONVERTED),
+    (Stage.CLASSIFY_POST, PostStatus.CLASSIFIED),
+    (Stage.EXTRACT_POST, PostStatus.EXTRACTED),
+    (Stage.INDEX_POST, PostStatus.INDEXED),
+)
+
+
+_POST_TERMINAL: frozenset[PostStatus] = frozenset({
+    PostStatus.INDEXED,
+    PostStatus.FAILED_FETCH,
+    PostStatus.FAILED_PARSE,
+})
+
+
+def _remaining_post_stages(current: PostStatus | None) -> list[Stage]:
+    remaining: list[Stage] = []
+    simulated = current
+    for stage, completed_status in _POST_PIPELINE:
+        if simulated is completed_status:
+            continue
+        if post_can_run_from(simulated, completed_status):
+            remaining.append(stage)
+            simulated = completed_status
+    return remaining
+
+
+class _PostRow(NamedTuple):
+    id: int
+    name: str
+    status: str
+
+
+def _get_post_row(conn: sqlite3.Connection, *, url: str) -> _PostRow | None:
+    """Locate an existing posts row by either source_url or canonical_url.
+
+    On force-cascade we want to find the row even if the user passed the
+    pre-canonical source URL (e.g. a syndicated mirror) — the dedup at
+    fetch time is canonical-keyed, so we need the same lookup shape here.
+    """
+    row = conn.execute(
+        """
+        SELECT id, post_name, status FROM posts
+         WHERE source_url = ? OR canonical_url = ?
+         LIMIT 1
+        """,
+        (url, url),
+    ).fetchone()
+    if row is None:
+        return None
+    return _PostRow(id=int(row[0]), name=row[1], status=row[2])
+
+
+def _force_delete_post(conn: sqlite3.Connection, *, post_id: int) -> None:
+    with transaction(conn):
+        delete_post_cascade(conn, post_id=post_id)
+
+
+def _summary_post(conn: sqlite3.Connection, url: str) -> dict:
+    row = conn.execute(
+        """
+        SELECT id, post_name, canonical_url, status, needs_review,
+               domain, collection, section_count, entity_count, title
+          FROM posts
+         WHERE source_url = ? OR canonical_url = ?
+         LIMIT 1
+        """,
+        (url, url),
+    ).fetchone()
+    if row is None:
+        return {
+            "kind": "post",
+            "post_name": None,
+            "url": url,
+            "canonical_url": None,
+            "status": None,
+            "needs_review": False,
+            "domain": None,
+            "collection": None,
+            "section_count": 0,
+            "entity_count": 0,
+            "title": None,
+        }
+    return {
+        "kind": "post",
+        "post_name": row[1],
+        "url": url,
+        "canonical_url": row[2],
+        "status": row[3],
+        "needs_review": bool(row[4]),
+        "domain": row[5],
+        "collection": row[6],
+        "section_count": int(row[7] or 0),
+        "entity_count": int(row[8] or 0),
+        "title": row[9],
+    }
+
+
+def ingest_post(
+    *,
+    conn: sqlite3.Connection,
+    url: str,
+    force: bool = False,
+    domain: str | None = None,
+    progress: ProgressFn | None = None,
+) -> dict:
+    """Run the blog-post ingest pipeline. Returns the summary dict.
+
+    Mirrors :func:`ingest`. If the post links a github repo, the discovered
+    URL is forwarded to the standalone-repo path
+    (:func:`ingest_repo_only`) AFTER the post pipeline finishes. In v1 we
+    don't link the repo back to the post (no ``repos.post_id``); the repo
+    stands on its own.
+    """
+    def _tick(msg: str, done: int, total: int) -> None:
+        if progress is not None:
+            progress(msg, done, total)
+
+    row = _get_post_row(conn, url=url)
+    if row is not None and force:
+        _LOG.info(
+            "force cascade: wiping post id=%s url=%s (taxonomy preserved)",
+            row.id, url,
+        )
+        _force_delete_post(conn, post_id=row.id)
+        _LOG.warning(
+            "cascade committed for url=%s; beginning fresh ingest", url,
+        )
+        row = None
+
+    current: PostStatus | None = None
+    post_name: str | None = None
+
+    if row is not None:
+        try:
+            current = PostStatus(row.status)
+        except ValueError as exc:
+            raise ValueError(
+                f"posts.status={row.status!r} for url={url!r} "
+                "is not a recognized PostStatus"
+            ) from exc
+        post_name = row.name
+
+        if current in (PostStatus.FAILED_FETCH, PostStatus.FAILED_PARSE):
+            _LOG.info(
+                "post %s is %s; use --force to retry", url, current.value,
+            )
+            _tick("already complete", 0, 0)
+            return _summary_post(conn, url)
+
+    stages_to_run = _remaining_post_stages(current)
+    _LOG.info(
+        "ingest_post url=%s current_status=%s stages_to_run=%s",
+        url, current, stages_to_run,
+    )
+
+    total = len(stages_to_run)
+    done = 0
+
+    if total == 0:
+        _tick("already complete", 0, 0)
+        return _summary_post(conn, url)
+
+    discovered_repo_url: str | None = None
+
+    if Stage.FETCH_POST in stages_to_run:
+        _tick(f"starting {Stage.FETCH_POST.value}", done, total)
+        pm = fetch_post_stage(
+            conn=conn,
+            url=url,
+            force=force,
+            domain_override=domain,
+        )
+        post_name = pm.post_name
+        post_status = PostStatus(pm.status) if pm.status else None
+        if post_status in (PostStatus.FAILED_FETCH, PostStatus.FAILED_PARSE):
+            _LOG.warning("fetch_post produced %s for %s; halting pipeline",
+                         post_status.value, url)
+            done += 1
+            _tick("complete", done, total)
+            return _summary_post(conn, url)
+        discovered_repo_url = pm.code_repo
+        done += 1
+
+    if post_name is None:
+        raise RuntimeError(
+            f"internal invariant: no post_name resolved for {url!r} "
+            "after resume lookup and without scheduling fetch"
+        )
+
+    if Stage.CONVERT_POST in stages_to_run:
+        _tick(f"starting {Stage.CONVERT_POST.value}", done, total)
+        result = convert_post_stage(post_name=post_name, conn=conn, force=force)
+        # convert_post may downgrade to FAILED_PARSE when trafilatura
+        # returned an empty body. Halt the pipeline before classify.
+        if result.status == PostStatus.FAILED_PARSE.value:
+            _LOG.warning("convert_post produced FAILED_PARSE for %s; halting", url)
+            done += 1
+            _tick("complete", done, total)
+            return _summary_post(conn, url)
+        done += 1
+    if Stage.CLASSIFY_POST in stages_to_run:
+        _tick(f"starting {Stage.CLASSIFY_POST.value}", done, total)
+        classify_paper_stage(
+            conn=conn,
+            paper_name=post_name,
+            force=force,
+            domain_override=domain,
+        )
+        done += 1
+    if Stage.EXTRACT_POST in stages_to_run:
+        _tick(f"starting {Stage.EXTRACT_POST.value}", done, total)
+        extract_stage(conn=conn, paper_name=post_name, force=force)
+        done += 1
+    if Stage.INDEX_POST in stages_to_run:
+        _tick(f"starting {Stage.INDEX_POST.value}", done, total)
+        index_stage(conn=conn, paper_name=post_name, force=force)
+        done += 1
+
+    _tick("complete", done, total)
+
+    # v1: discovered repos go through the standalone path. Failures must
+    # not abort the post ingest — log loud and move on.
+    if discovered_repo_url:
+        try:
+            ingest_repo_only(
+                conn=conn,
+                repo_url=discovered_repo_url,
+                force=False,
+                domain=domain,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _LOG.warning(
+                "post-linked repo ingest failed for %s url=%s: %s; "
+                "post ingest is otherwise complete",
+                url, discovered_repo_url, exc,
+            )
+
+    return _summary_post(conn, url)
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -590,6 +849,7 @@ def main(argv: list[str] | None = None) -> None:
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--url", default=None, help="arxiv URL or bare id (version preserved)")
     target.add_argument("--repo", default=None, help="github/gitlab/bitbucket URL for standalone repo ingest")
+    target.add_argument("--post", default=None, help="blog post URL")
     parser.add_argument("--force", action="store_true",
                         help="cascade-delete the target (preserving global taxonomy) and re-ingest")
     parser.add_argument("--domain", default=None,
@@ -615,7 +875,7 @@ def main(argv: list[str] | None = None) -> None:
             )
         finally:
             conn.close()
-    else:
+    elif args.repo:
         check_models()
         conn = get_conn(Path(args.db))
         try:
@@ -623,6 +883,19 @@ def main(argv: list[str] | None = None) -> None:
             summary = ingest_repo_only(
                 conn=conn,
                 repo_url=args.repo,
+                force=args.force,
+                domain=args.domain,
+            )
+        finally:
+            conn.close()
+    else:
+        check_models()
+        conn = get_conn(Path(args.db))
+        try:
+            init_db(conn)
+            summary = ingest_post(
+                conn=conn,
+                url=args.post,
                 force=args.force,
                 domain=args.domain,
             )

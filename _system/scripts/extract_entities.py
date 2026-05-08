@@ -41,10 +41,16 @@ from _system.resolution.resolver import (
     resolve,
 )
 from _system.schemas.entities import EntityType
-from _system.schemas.paper_metadata import PaperStatus, can_run_from
+from _system.schemas.paper_metadata import PaperStatus, can_run_from as paper_can_run_from
+from _system.schemas.post_metadata import PostStatus, can_run_from as post_can_run_from
 from _system.utils.config import load_gliner_config
 from _system.utils.logging import get_logger
 from _system.utils.sections import split_sections, strip_breadcrumb, sub_chunk
+from _system.utils.source_resolution import (
+    SlugNotFound,
+    SourceKind,
+    resolve_slug,
+)
 
 _LOG = get_logger("scripts.extract_entities")
 
@@ -258,36 +264,64 @@ def extract(
     to the resolver for tier 5 inserts. Fresh entity names miss tiers 1-4 and
     need an Embedder; absent one we lazily construct the real BGE embedder.
     """
+    try:
+        resolved = resolve_slug(conn, paper_name)
+    except SlugNotFound as exc:
+        raise PaperNotFound(
+            f"slug={paper_name!r} not found in papers or posts"
+        ) from exc
+    kind = resolved.kind
+    source_id = resolved.id
+    target_table = "papers" if kind is SourceKind.PAPER else "posts"
     row = conn.execute(
-        """
-        SELECT id, domain, status, markdown
-          FROM papers WHERE paper_name = ?
-        """,
-        (paper_name,),
+        f"SELECT domain, status, markdown FROM {target_table} WHERE id = ?",
+        (source_id,),
     ).fetchone()
     if row is None:
-        raise PaperNotFound(f"paper_name={paper_name!r} not found in papers table")
-    paper_id, domain, status_str, markdown = row
+        raise PaperNotFound(
+            f"slug={paper_name!r} resolved to id={source_id} but row vanished"
+        )
+    domain, status_str, markdown = row
 
     if markdown is None:
-        raise MarkdownMissing(f"paper_name={paper_name!r}: markdown is NULL")
+        raise MarkdownMissing(f"slug={paper_name!r}: markdown is NULL")
 
-    try:
-        current = PaperStatus(status_str) if status_str else None
-    except ValueError as exc:
-        raise UnknownStatusError(
-            f"paper_name={paper_name!r}: unrecognized status={status_str!r}"
-        ) from exc
-    if not force and not can_run_from(current, PaperStatus.EXTRACTED):
-        extra = (
-            " (FAILED_HTML is terminal — re-fetch required)"
-            if current is PaperStatus.FAILED_HTML
-            else ""
-        )
-        raise StatusTooLow(
-            f"paper_name={paper_name!r}: cannot run EXTRACTED from status="
-            f"{status_str!r}{extra}"
-        )
+    if kind is SourceKind.PAPER:
+        try:
+            current = PaperStatus(status_str) if status_str else None
+        except ValueError as exc:
+            raise UnknownStatusError(
+                f"paper_name={paper_name!r}: unrecognized status={status_str!r}"
+            ) from exc
+        if not force and not paper_can_run_from(current, PaperStatus.EXTRACTED):
+            extra = (
+                " (FAILED_HTML is terminal — re-fetch required)"
+                if current is PaperStatus.FAILED_HTML
+                else ""
+            )
+            raise StatusTooLow(
+                f"paper_name={paper_name!r}: cannot run EXTRACTED from status="
+                f"{status_str!r}{extra}"
+            )
+        target_status_value = PaperStatus.EXTRACTED.value
+    else:
+        try:
+            current_post = PostStatus(status_str) if status_str else None
+        except ValueError as exc:
+            raise UnknownStatusError(
+                f"post_name={paper_name!r}: unrecognized status={status_str!r}"
+            ) from exc
+        if not force and not post_can_run_from(current_post, PostStatus.EXTRACTED):
+            extra = (
+                " (terminal failure — re-fetch required)"
+                if current_post in (PostStatus.FAILED_FETCH, PostStatus.FAILED_PARSE)
+                else ""
+            )
+            raise StatusTooLow(
+                f"post_name={paper_name!r}: cannot run EXTRACTED from status="
+                f"{status_str!r}{extra}"
+            )
+        target_status_value = PostStatus.EXTRACTED.value
 
     cfg = (
         load_gliner_config(config_path)
@@ -549,13 +583,13 @@ def extract(
         entity_count = len(touched_term_ids)
 
         conn.execute(
-            """
-            UPDATE papers
+            f"""
+            UPDATE {target_table}
                SET entity_count = ?,
                    status = ?
              WHERE id = ?
             """,
-            (entity_count, PaperStatus.EXTRACTED.value, paper_id),
+            (entity_count, target_status_value, source_id),
         )
 
         # Make sure index_paper rebuilds terms_fts for every canonical we
@@ -583,14 +617,14 @@ def extract(
         )
 
     _LOG.info(
-        "extracted paper_id=%s paper_name=%s entity_count=%d",
-        paper_id, paper_name, entity_count,
+        "extracted source_id=%s paper_name=%s entity_count=%d",
+        source_id, paper_name, entity_count,
     )
 
     return ExtractResult(
         paper_name=paper_name,
         entity_count=entity_count,
-        status=PaperStatus.EXTRACTED.value,
+        status=target_status_value,
     )
 
 

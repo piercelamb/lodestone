@@ -46,7 +46,8 @@ from _system.db.orphan_gc import gc_orphan_topic_canonicals
 from _system.llm import call_structured, load_prompt
 from _system.resolution.embeddings import Embedder
 from _system.resolution.resolver import pending_fts_rebuilds, resolve
-from _system.schemas.paper_metadata import PaperStatus, can_run_from
+from _system.schemas.paper_metadata import PaperStatus, can_run_from as paper_can_run_from
+from _system.schemas.post_metadata import PostStatus, can_run_from as post_can_run_from
 from _system.schemas.repo_metadata import TopicTarget
 from _system.schemas.taxonomy import (
     ClassificationLLMOutput,
@@ -61,10 +62,16 @@ from _system.scripts.taxonomy_tree import (
 )
 from _system.utils.logging import get_logger
 from _system.utils.slug import sanitize_domain
+from _system.utils.source_resolution import (
+    SlugNotFound,
+    SourceKind,
+    resolve_slug,
+)
 
 _LOG = get_logger("scripts.classify_paper")
 
 _PAPER_CONTENT_MAX_CHARS = 8000
+_POST_CONTENT_MAX_CHARS = 10000
 # Display cap on collections per domain. Purely a prompt-size budget —
 # overflow surfaces as a sibling leaf that nudges the LLM to propose new
 # rather than guess at hidden entries.
@@ -133,39 +140,68 @@ def classify(
     """
     del force  # see docstring on orchestrator parity
 
+    try:
+        resolved = resolve_slug(conn, paper_name)
+    except SlugNotFound as exc:
+        raise ClassifyPaperNotFound(
+            f"slug={paper_name!r} not found in papers or posts"
+        ) from exc
+    kind = resolved.kind
+    source_id = resolved.id
+
+    table = "papers" if kind is SourceKind.PAPER else "posts"
     row = conn.execute(
-        """
-        SELECT id, status, abstract, markdown
-          FROM papers
-         WHERE paper_name = ?
-        """,
-        (paper_name,),
+        f"SELECT status, abstract, markdown FROM {table} WHERE id = ?",
+        (source_id,),
     ).fetchone()
     if row is None:
         raise ClassifyPaperNotFound(
-            f"paper_name={paper_name!r} not found in papers table"
+            f"slug={paper_name!r} resolved to id={source_id} but row vanished"
         )
-    paper_id, status_str, abstract, markdown = row
+    status_str, abstract, markdown = row
 
-    try:
-        current = PaperStatus(status_str) if status_str else None
-    except ValueError as exc:
-        raise ClassifyStateError(
-            f"paper_name={paper_name!r}: unrecognized status={status_str!r}"
-        ) from exc
-    if not can_run_from(current, PaperStatus.CLASSIFIED):
-        extra = (
-            " (FAILED_HTML is terminal — re-fetch required)"
-            if current is PaperStatus.FAILED_HTML
-            else ""
-        )
-        raise ClassifyStateError(
-            f"paper_name={paper_name!r}: cannot run CLASSIFIED from status="
-            f"{status_str!r}{extra}"
-        )
+    if kind is SourceKind.PAPER:
+        try:
+            current = PaperStatus(status_str) if status_str else None
+        except ValueError as exc:
+            raise ClassifyStateError(
+                f"paper_name={paper_name!r}: unrecognized status={status_str!r}"
+            ) from exc
+        if not paper_can_run_from(current, PaperStatus.CLASSIFIED):
+            extra = (
+                " (FAILED_HTML is terminal — re-fetch required)"
+                if current is PaperStatus.FAILED_HTML
+                else ""
+            )
+            raise ClassifyStateError(
+                f"paper_name={paper_name!r}: cannot run CLASSIFIED from status="
+                f"{status_str!r}{extra}"
+            )
+    else:
+        try:
+            current_post = PostStatus(status_str) if status_str else None
+        except ValueError as exc:
+            raise ClassifyStateError(
+                f"post_name={paper_name!r}: unrecognized status={status_str!r}"
+            ) from exc
+        if not post_can_run_from(current_post, PostStatus.CLASSIFIED):
+            extra = (
+                " (terminal failure — re-fetch required)"
+                if current_post in (PostStatus.FAILED_FETCH, PostStatus.FAILED_PARSE)
+                else ""
+            )
+            raise ClassifyStateError(
+                f"post_name={paper_name!r}: cannot run CLASSIFIED from status="
+                f"{status_str!r}{extra}"
+            )
 
+    max_chars = (
+        _PAPER_CONTENT_MAX_CHARS
+        if kind is SourceKind.PAPER
+        else _POST_CONTENT_MAX_CHARS
+    )
     paper_content = _head_slice_paper_content(
-        markdown=markdown or "", abstract=abstract or ""
+        markdown=markdown or "", abstract=abstract or "", max_chars=max_chars,
     )
     del markdown
 
@@ -180,15 +216,21 @@ def classify(
         (len(d.collections) for d in existing_domains), default=0
     )
 
+    if kind is SourceKind.PAPER:
+        prompt_name = "classify_paper"
+        content_placeholder = "PAPER_CONTENT"
+    else:
+        prompt_name = "classify_post"
+        content_placeholder = "POST_CONTENT"
     loaded = load_prompt(
-        "classify_paper",
+        prompt_name,
         md_context={
             "EXISTING_TAXONOMY": render_taxonomy_tree(
                 existing_domains,
                 style=TaxonomyTreeStyle.INDEX,
                 overflow_message="(+ {n} more exist; feel free to propose new)",
             ),
-            "PAPER_CONTENT": paper_content,
+            content_placeholder: paper_content,
         },
         schema_replacements={
             "DOMAIN_INDEX_ENUM": [-1, *range(len(existing_domains))],
@@ -231,9 +273,23 @@ def classify(
                 (decision.name, new_description),
             )
 
+        topic_target = (
+            TopicTarget.PAPER if kind is SourceKind.PAPER else TopicTarget.POST
+        )
+        collections_table = (
+            "paper_collections" if kind is SourceKind.PAPER else "post_collections"
+        )
+        target_table = "papers" if kind is SourceKind.PAPER else "posts"
+        target_id_col = (
+            "paper_id" if kind is SourceKind.PAPER else "post_id"
+        )
+        target_status = (
+            PaperStatus.CLASSIFIED if kind is SourceKind.PAPER else PostStatus.CLASSIFIED
+        )
+
         conn.execute(
             "DELETE FROM topics WHERE target_kind = ? AND target_id = ?",
-            (TopicTarget.PAPER.value, paper_id),
+            (topic_target.value, source_id),
         )
 
         # Track every canonical this stage resolves so index_paper can
@@ -288,13 +344,13 @@ def classify(
         primary_name = resolved[0].name
         any_new_collection = any(r.description is not None for r in resolved)
 
-        # papers UPDATE runs before paper_collections writes so the
-        # papers-invariant trigger sees a non-NULL collection in the
-        # same transaction, and so the paper_collections intra-domain
-        # trigger reads the new papers.domain.
+        # papers/posts UPDATE runs before *_collections writes so the
+        # invariant trigger sees a non-NULL collection in the same
+        # transaction, and so the *_collections intra-domain trigger
+        # reads the new domain.
         conn.execute(
-            """
-            UPDATE papers
+            f"""
+            UPDATE {target_table}
                SET domain = ?,
                    collection = ?,
                    needs_review = ?,
@@ -305,22 +361,23 @@ def classify(
                 decision.name,
                 primary_name,
                 int(decision.paper_needs_review or any_new_collection),
-                PaperStatus.CLASSIFIED.value,
-                paper_id,
+                target_status.value,
+                source_id,
             ),
         )
 
         conn.execute(
-            "DELETE FROM paper_collections WHERE paper_id = ?", (paper_id,)
+            f"DELETE FROM {collections_table} WHERE {target_id_col} = ?",
+            (source_id,),
         )
         conn.executemany(
-            """
-            INSERT INTO paper_collections
-                (paper_id, domain, collection, is_primary)
+            f"""
+            INSERT INTO {collections_table}
+                ({target_id_col}, domain, collection, is_primary)
             VALUES (?, ?, ?, ?)
             """,
             [
-                (paper_id, decision.name, r.name, int(i == 0))
+                (source_id, decision.name, r.name, int(i == 0))
                 for i, r in enumerate(resolved)
             ],
         )
@@ -346,7 +403,7 @@ def classify(
                 VALUES (?, ?, ?, ?)
                 """,
                 (
-                    TopicTarget.PAPER.value, paper_id,
+                    topic_target.value, source_id,
                     decision.name, topic_hit.canonical_name,
                 ),
             )
@@ -365,9 +422,9 @@ def classify(
 
     needs_review = bool(decision.paper_needs_review or any_new_collection)
     _LOG.info(
-        "classified paper_id=%s paper_name=%s domain=%s primary=%s "
+        "classified source_id=%s paper_name=%s domain=%s primary=%s "
         "secondaries=%d topics=%d needs_review=%s",
-        paper_id, paper_name, decision.name, primary_name,
+        source_id, paper_name, decision.name, primary_name,
         len(resolved) - 1, len(inserted_topic_names), needs_review,
     )
 
@@ -377,7 +434,7 @@ def classify(
         collections=tuple(r.name for r in resolved),
         topics=tuple(inserted_topic_names),
         needs_review=needs_review,
-        status=PaperStatus.CLASSIFIED.value,
+        status=target_status.value,
     )
 
 
@@ -547,17 +604,20 @@ def _resolve_pick(
 # ---------------------------------------------------------------------------
 
 
-def _head_slice_paper_content(*, markdown: str, abstract: str) -> str:
-    """Return up to ~8K chars of paper content for classification.
+def _head_slice_paper_content(
+    *, markdown: str, abstract: str, max_chars: int = _PAPER_CONTENT_MAX_CHARS,
+) -> str:
+    """Return up to ``max_chars`` chars of source content for classification.
 
     The head of the markdown naturally contains title + abstract + start of
-    introduction — everything the LLM needs to pick a domain/collection/topics.
-    If markdown is missing (stale row, upstream conversion skipped), fall back
-    to the abstract column alone.
+    introduction (papers) or title + lead + opening sections (posts) —
+    everything the LLM needs to pick a domain/collection/topics. If markdown
+    is missing (stale row, upstream conversion skipped), fall back to the
+    abstract column alone.
     """
     stripped = markdown.strip()
     if stripped:
-        return stripped[:_PAPER_CONTENT_MAX_CHARS]
+        return stripped[:max_chars]
     return abstract.strip()
 
 
