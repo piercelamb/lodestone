@@ -1,0 +1,73 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "piercelamb-plugins",
+  "description": "Claude Code plugins by Pierce Lamb",
+  "version": "1.0.0",
+  "owner": {
+    "name": "Pierce Lamb",
+    "url": "https://github.com/piercelamb"
+  },
+  "plugins": [
+    {
+      "name": "deep-project",
+      "description": "Split vague project requirements into well-scoped units for /deep-plan",
+      "version": "0.2.1",
+      "author": {
+        "name": "piercelamb",
+        "url": "https://github.com/piercelamb"
+      },
+      "source": {
+        "source": "url",
+        "url": "https://github.com/piercelamb/deep-project.git"
+      },
+      "category": "development",
+      "homepage": "https://github.com/piercelamb/deep-project",
+      "tags": ["planning", "decomposition", "project-management", "requirements"]
+    },
+    {
+      "name": "deep-plan",
+      "description": "AI-assisted deep planning with research, interview, external LLM review, and TDD approach",
+      "version": "0.3.2",
+      "author": {
+        "name": "piercelamb",
+        "url": "https://github.com/piercelamb"
+      },
+      "source": {
+        "source": "url",
+        "url": "https://github.com/piercelamb/deep-plan.git"
+      },
+      "category": "development",
+      "homepage": "https://github.com/piercelamb/deep-plan",
+      "tags": ["planning", "tdd", "architecture", "llm-review", "implementation"]
+    },
+    {
+      "name": "deep-implement",
+      "description": "Implement code from /deep-plan sections with TDD, code review, and git workflow",
+      "version": "0.2.1",
+      "author": {
+        "name": "piercelamb",
+        "url": "https://github.com/piercelamb"
+      },
+      "source": {
+        "source": "url",
+        "url": "https://github.com/piercelamb/deep-implement.git"
+      },
+      "category": "development",
+      "homepage": "https://github.com/piercelamb/deep-implement",
+      "tags": ["implementation", "tdd", "code-review", "git", "workflow"]
+    },
+    {
+      "name": "lodestone",
+      "description": "Local research corpus over arXiv papers, blog posts, and code repos with paper-grounded MCP search/read tools",
+      "version": "0.1.0",
+      "author": {
+        "name": "piercelamb",
+        "url": "https://github.com/piercelamb"
+      },
+      "source": "./",
+      "category": "research",
+      "homepage": "https://github.com/piercelamb/lodestone",
+      "tags": ["mcp", "arxiv", "rag", "research", "knowledge-base"]
+    }
+  ]
+}
