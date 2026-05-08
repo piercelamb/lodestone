@@ -35,8 +35,12 @@ from _system.tests.test_search import (
     _PNG_1x1,
     _insert_figure,
     _insert_paper,
+    _insert_paper_reference,
+    _insert_post_for_citations,
+    _insert_post_reference,
     _insert_sections_for_md,
     _seed_domain,
+    seeded_citations_db,  # noqa: F401 — re-exported as a pytest fixture
 )
 
 
@@ -220,14 +224,14 @@ class TestExtractFigureRefs:
 
 class TestPackResult:
     def test_text_block_carries_payload_json(self, fig_db):
-        payload = {"mode": "toc", "paper_name": "tot_2023", "toc": []}
+        payload = {"mode": "toc", "slug": "tot_2023", "toc": []}
         out = mcp_server._pack_result(payload, fig_db)
         text = _text_blocks(out["content"])[0]["text"]
         assert json.loads(text) == payload
         assert out["isError"] is False
 
     def test_structured_content_matches_text_block_when_no_image(self, fig_db):
-        payload = {"mode": "toc", "paper_name": "tot_2023", "toc": [{"level": 1, "title": "X"}]}
+        payload = {"mode": "toc", "slug": "tot_2023", "toc": [{"level": 1, "title": "X"}]}
         out = mcp_server._pack_result(payload, fig_db)
         text = _text_blocks(out["content"])[0]["text"]
         assert out["structuredContent"] == json.loads(text)
@@ -238,7 +242,7 @@ class TestPackResult:
         # envelope under which Claude Code is observed to surface image
         # blocks as multimodal input.
         payload = {
-            "mode": "read", "status": "ok", "paper_name": "tot_2023",
+            "mode": "read", "status": "ok", "slug": "tot_2023",
             "section": None, "text": _MD_WITH_FIGS,
         }
         out = mcp_server._pack_result(payload, fig_db)
@@ -248,7 +252,7 @@ class TestPackResult:
 
     def test_no_image_blocks_when_no_refs(self, fig_db):
         payload = {
-            "mode": "read", "status": "ok", "paper_name": "plain_2024",
+            "mode": "read", "status": "ok", "slug": "plain_2024",
             "section": None, "text": _MD_NO_FIGS,
         }
         out = mcp_server._pack_result(payload, fig_db)
@@ -263,7 +267,7 @@ class TestPackResult:
 class TestReadAttachesFigures:
     def test_read_attaches_image_blocks_for_figure_refs(self, fig_db):
         state = _make_state(fig_db)
-        resp = _call(state, "read", {"paper_name": "tot_2023"})
+        resp = _call(state, "read", {"slug": "tot_2023"})
         assert not _is_error(resp), resp
         content = _content(resp)
         # 1 JSON text block + (text marker + image) per figure × 2.
@@ -281,13 +285,13 @@ class TestReadAttachesFigures:
 
     def test_read_no_figure_refs_no_image_blocks(self, fig_db):
         state = _make_state(fig_db)
-        resp = _call(state, "read", {"paper_name": "plain_2024"})
+        resp = _call(state, "read", {"slug": "plain_2024"})
         assert not _is_error(resp), resp
         assert _image_blocks(_content(resp)) == []
 
     def test_read_section_slice_only_attaches_refs_in_slice(self, fig_db):
         state = _make_state(fig_db)
-        resp = _call(state, "read", {"paper_name": "tot_2023", "section": "Method"})
+        resp = _call(state, "read", {"slug": "tot_2023", "section": "Method"})
         content = _content(resp)
         # Method section only has (figure:1).
         imgs = _image_blocks(content)
@@ -366,7 +370,7 @@ class TestSilentFailures:
 
         monkeypatch.setattr(mcp_server.base64, "b64encode", boom)
         state = _make_state(fig_db)
-        resp = _call(state, "read", {"paper_name": "tot_2023"})
+        resp = _call(state, "read", {"slug": "tot_2023"})
         assert not _is_error(resp)
         assert _image_blocks(_content(resp)) == []
 
@@ -374,7 +378,7 @@ class TestSilentFailures:
         # Force the per-blob limit to 1 byte so our 1×1 PNG is "oversize".
         monkeypatch.setenv("LODESTONE_MAX_FIGURE_BYTES", "1")
         state = _make_state(fig_db)
-        resp = _call(state, "read", {"paper_name": "tot_2023"})
+        resp = _call(state, "read", {"slug": "tot_2023"})
         assert not _is_error(resp)
         content = _content(resp)
         # No image blocks (all skipped). Markers explain the skip.
@@ -388,7 +392,7 @@ class TestSilentFailures:
         # plus an overflow marker for figure 2.
         monkeypatch.setenv("LODESTONE_MAX_FIGURES_PER_RESPONSE", "1")
         state = _make_state(fig_db)
-        resp = _call(state, "read", {"paper_name": "tot_2023"})
+        resp = _call(state, "read", {"slug": "tot_2023"})
         assert not _is_error(resp)
         content = _content(resp)
         imgs = _image_blocks(content)
@@ -405,7 +409,7 @@ class TestSilentFailures:
 class TestSoftFailures:
     def test_section_not_found_is_not_isError(self, fig_db):
         state = _make_state(fig_db)
-        resp = _call(state, "read", {"paper_name": "tot_2023", "section": "NoSuchSection"})
+        resp = _call(state, "read", {"slug": "tot_2023", "section": "NoSuchSection"})
         assert not _is_error(resp)
         text = _text_blocks(_content(resp))[0]["text"]
         payload = json.loads(text)
@@ -413,9 +417,9 @@ class TestSoftFailures:
         # No image blocks on a soft-fail, so structuredContent is included.
         assert resp["result"]["structuredContent"]["status"] == "section_not_found"
 
-    def test_unknown_paper_raises_isError(self, fig_db):
+    def test_unknown_slug_raises_isError(self, fig_db):
         state = _make_state(fig_db)
-        resp = _call(state, "read", {"paper_name": "no_such_paper"})
+        resp = _call(state, "read", {"slug": "no_such_paper"})
         assert _is_error(resp)
 
 
@@ -448,15 +452,15 @@ class TestProtocolValidation:
 
 
 class TestToolsList:
-    def test_tools_list_returns_nineteen_tools(self):
+    def test_tools_list_returns_twenty_tools(self):
         out = mcp_server._handle_tools_list({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         tools = out["result"]["tools"]
-        assert len(tools) == 19
+        assert len(tools) == 20
         names = {t["name"] for t in tools}
         assert names == {
             "search", "bm25", "lookup", "browse", "overview", "collection",
             "toc", "toc_many", "read", "figure", "repo_tree", "read_code",
-            "repo", "tables", "schema", "query",
+            "repo", "citations", "tables", "schema", "query",
             "ingest_paper", "ingest_repo", "ingest_post",
         }
         for t in tools:
@@ -470,6 +474,78 @@ class TestToolsList:
         # `__` would corrupt that prefix.
         for t in mcp_server.TOOLS:
             assert "__" not in t["name"], t["name"]
+
+
+# ===========================================================================
+# citations tool — outbound buckets, inbound pagination, soft statuses
+# ===========================================================================
+
+
+class TestCitationsTool:
+    def test_outbound_dispatch_returns_buckets(self, seeded_citations_db):
+        state = _make_state(seeded_citations_db)
+        resp = _call(state, "citations", {"slug": "citing_2024"})
+        assert not _is_error(resp), resp
+        payload = resp["result"]["structuredContent"]
+        assert payload["mode"] == "citations"
+        assert payload["status"] == "ok"
+        assert payload["direction"] == "outbound"
+        assert payload["resolved_count"] == 2
+        assert payload["missing_count"] == 1
+        assert payload["unresolvable_count"] == 1
+
+    def test_inbound_dispatch_returns_paginated_results(
+        self, seeded_citations_db
+    ):
+        state = _make_state(seeded_citations_db)
+        resp = _call(
+            state,
+            "citations",
+            {"slug": "cited_2023", "direction": "inbound", "limit": 1},
+        )
+        assert not _is_error(resp), resp
+        payload = resp["result"]["structuredContent"]
+        assert payload["status"] == "ok"
+        assert payload["direction"] == "inbound"
+        assert len(payload["results"]) == 1
+        assert payload["total_hits"] == 2
+        assert payload["has_more"] is True
+
+    def test_invalid_direction_returns_isError(self, seeded_citations_db):
+        # Garbage direction → ValueError → MCP boundary marks isError=true
+        # (hard error, not a recoverable soft-fail).
+        state = _make_state(seeded_citations_db)
+        resp = _call(
+            state,
+            "citations",
+            {"slug": "citing_2024", "direction": "sideways"},
+        )
+        assert _is_error(resp)
+
+    def test_unsupported_direction_marks_isError_false(
+        self, seeded_citations_db
+    ):
+        # Post + inbound → unsupported_direction soft-status, which must
+        # pass through as isError=false so the agent can recover from
+        # the diagnostic instead of seeing a hard tool error.
+        state = _make_state(seeded_citations_db)
+        resp = _call(
+            state,
+            "citations",
+            {"slug": "post_2024", "direction": "inbound"},
+        )
+        assert not _is_error(resp), resp
+        payload = resp["result"]["structuredContent"]
+        assert payload["status"] == "unsupported_direction"
+
+    def test_unknown_slug_marks_isError_false(self, seeded_citations_db):
+        # Verifies `not_found` is now in _SOFT_FAILURE_STATUSES — without
+        # the registration this would land as isError=true.
+        state = _make_state(seeded_citations_db)
+        resp = _call(state, "citations", {"slug": "no_such_slug"})
+        assert not _is_error(resp), resp
+        payload = resp["result"]["structuredContent"]
+        assert payload["status"] == "not_found"
 
 
 # ===========================================================================
@@ -735,22 +811,22 @@ class TestLookupTool:
 
 
 # ===========================================================================
-# toc_many tool — multi-paper TOC through the MCP boundary
+# toc_many tool — multi-source TOC through the MCP boundary
 # ===========================================================================
 
 
 class TestTocManyTool:
-    def test_toc_many_returns_per_paper_results(self, fig_db):
+    def test_toc_many_returns_per_source_results(self, fig_db):
         state = _make_state(fig_db)
         resp = _call(
-            state, "toc_many", {"paper_names": ["tot_2023", "plain_2024"]},
+            state, "toc_many", {"slugs": ["tot_2023", "plain_2024"]},
         )
         assert not _is_error(resp)
         assert not _has_image(resp), "toc_many must not attach figure images"
         payload = resp["result"]["structuredContent"]
         assert payload["mode"] == "toc_many"
-        assert payload["paper_names"] == ["tot_2023", "plain_2024"]
-        assert {r["paper_name"] for r in payload["results"]} == {
+        assert payload["slugs"] == ["tot_2023", "plain_2024"]
+        assert {r["slug"] for r in payload["results"]} == {
             "tot_2023", "plain_2024",
         }
         assert payload["missing"] == []
@@ -759,21 +835,21 @@ class TestTocManyTool:
         state = _make_state(fig_db)
         resp = _call(
             state, "toc_many",
-            {"paper_names": ["tot_2023", "no_such_paper"]},
+            {"slugs": ["tot_2023", "no_such_paper"]},
         )
         assert not _is_error(resp)
         payload = resp["result"]["structuredContent"]
-        assert {r["paper_name"] for r in payload["results"]} == {"tot_2023"}
+        assert {r["slug"] for r in payload["results"]} == {"tot_2023"}
         assert payload["missing"] == ["no_such_paper"]
 
     def test_toc_many_dedupes_duplicates(self, fig_db):
         state = _make_state(fig_db)
         resp = _call(
             state, "toc_many",
-            {"paper_names": ["tot_2023", "tot_2023", "plain_2024"]},
+            {"slugs": ["tot_2023", "tot_2023", "plain_2024"]},
         )
         payload = resp["result"]["structuredContent"]
-        assert payload["paper_names"] == ["tot_2023", "plain_2024"]
+        assert payload["slugs"] == ["tot_2023", "plain_2024"]
         assert len(payload["results"]) == 2
 
     def test_toc_many_missing_args_is_invalid_params(self, fig_db):
@@ -886,7 +962,7 @@ class TestProtocolHandshake:
         list_reply = responses[1]
         assert list_reply["id"] == 2
         tools = list_reply["result"]["tools"]
-        assert len(tools) == 19
+        assert len(tools) == 20
         for t in tools:
             assert t["name"].replace("_", "").isalnum()
 
@@ -910,7 +986,7 @@ class TestProtocolHandshake:
                 _build_msg("notifications/initialized", params={}, msg_id=None),
                 _build_msg("tools/call", {
                     "name": "toc",
-                    "arguments": {"paper_name": "tot_2023"},
+                    "arguments": {"slug": "tot_2023"},
                 }, msg_id=3),
             ],
             env_overrides={"LODESTONE_DB": str(real_db)},
@@ -952,7 +1028,7 @@ class TestProtocolHandshake:
                 _build_msg("notifications/initialized", params={}, msg_id=None),
                 _build_msg("tools/call", {
                     "name": "toc",
-                    "arguments": {"paper_name": "x"},
+                    "arguments": {"slug": "x"},
                 }, msg_id=4),
             ],
             env_overrides={"LODESTONE_DB": str(bogus)},
