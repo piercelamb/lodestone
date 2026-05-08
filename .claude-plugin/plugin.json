@@ -1,0 +1,22 @@
+{
+  "name": "lodestone",
+  "description": "Local research corpus over arXiv papers, blog posts, and code repos with paper-grounded MCP search/read tools",
+  "version": "0.1.0",
+  "author": {
+    "name": "piercelamb",
+    "url": "https://github.com/piercelamb"
+  },
+  "repository": "https://github.com/piercelamb/lodestone",
+  "license": "Apache-2.0",
+  "keywords": ["mcp", "research", "arxiv", "rag", "search", "knowledge-base"],
+  "mcpServers": {
+    "lodestone": {
+      "type": "stdio",
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/lodestone-mcp-plugin.sh",
+      "env": {
+        "MCP_TIMEOUT": "30000",
+        "MCP_TOOL_TIMEOUT": "1800000"
+      }
+    }
+  }
+}
