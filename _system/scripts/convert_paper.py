@@ -15,6 +15,7 @@ from _system.latex import figures as latex_figures
 from _system.latex import walker as latex_walker
 from _system.schemas.paper_metadata import HtmlSource, PaperStatus, can_run_from
 from _system.utils.arxiv_urls import base_url_for_source
+from _system.utils.citation_resolution import resolve_arxiv_citations
 from _system.utils.logging import get_logger
 
 _LOG = get_logger("scripts.convert_paper")
@@ -169,45 +170,15 @@ def convert(
                     for r in references
                 ],
             )
-        # Forward resolve: references this paper just inserted whose
-        # cited_arxiv_id matches a paper already in the DB. The EXISTS
-        # guard restricts the UPDATE to rows that will actually link, so
-        # ``rowcount`` reflects resolved references rather than inspected
-        # ones (a row whose cited_arxiv_id has no matching paper would
-        # otherwise be touched as NULL→NULL and count toward rowcount).
-        # Self-citation (paper -> own arxiv_id) is allowed.
-        forward_cur = conn.execute(
-            """
-            UPDATE paper_references
-               SET cited_paper_id = (
-                   SELECT id FROM papers
-                    WHERE arxiv_id = paper_references.cited_arxiv_id
-               )
-             WHERE paper_id = ?
-               AND cited_arxiv_id IS NOT NULL
-               AND cited_paper_id IS NULL
-               AND EXISTS (
-                   SELECT 1 FROM papers
-                    WHERE arxiv_id = paper_references.cited_arxiv_id
-               )
-            """,
-            (paper_id,),
+        # Forward + backward arxiv-id resolution. Backward pass also
+        # touches `post_references` so a post that cited this paper before
+        # the paper landed gets its cited_paper_id linked.
+        forward_resolved, backward_resolved = resolve_arxiv_citations(
+            conn,
+            kind="paper",
+            source_id=paper_id,
+            source_arxiv_id=arxiv_id,
         )
-        forward_resolved = forward_cur.rowcount
-        # Backward resolve: any *other* paper's previously-dangling reference
-        # whose cited_arxiv_id matches THIS paper's arxiv_id. Needed because
-        # paper A may have ingested before paper B; A's row stays NULL until
-        # B's CONVERT runs.
-        backward_cur = conn.execute(
-            """
-            UPDATE paper_references
-               SET cited_paper_id = ?
-             WHERE cited_arxiv_id = ?
-               AND cited_paper_id IS NULL
-            """,
-            (paper_id, arxiv_id),
-        )
-        backward_resolved = backward_cur.rowcount
 
     _LOG.info(
         "converted paper_id=%s paper_name=%s html_source=%s markdown_chars=%d "

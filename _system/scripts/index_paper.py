@@ -52,9 +52,11 @@ from _system.db.connection import get_conn, transaction
 from _system.db.migrations import VIRTUAL_TABLE_BLOCK_RE
 from _system.resolution.embeddings import Embedder
 from _system.resolution.resolver import pending_fts_rebuilds
-from _system.schemas.paper_metadata import PaperStatus, can_run_from
+from _system.schemas.paper_metadata import PaperStatus, can_run_from as paper_can_run_from
+from _system.schemas.post_metadata import PostStatus, can_run_from as post_can_run_from
 from _system.utils.logging import get_logger
 from _system.utils.sections import split_sections
+from _system.utils.source_resolution import SourceKind, resolve_slug
 
 _LOG = get_logger("scripts.index_paper")
 
@@ -117,34 +119,62 @@ def index_one(
     with, and the canonical row of its ``collection``). Commits in a single
     transaction so a mid-stage raise leaves ``papers.status`` unchanged.
     """
+    try:
+        resolved = resolve_slug(conn, paper_name)
+    except Exception as exc:
+        raise PaperNotFound(
+            f"slug={paper_name!r} not found in papers or posts"
+        ) from exc
+    kind = resolved.kind
+    target_table = "papers" if kind is SourceKind.PAPER else "posts"
+    name_col = "paper_name" if kind is SourceKind.PAPER else "post_name"
     row = conn.execute(
-        """
-        SELECT id, domain, markdown, status
-          FROM papers WHERE paper_name = ?
-        """,
-        (paper_name,),
+        f"SELECT domain, markdown, status FROM {target_table} WHERE id = ?",
+        (resolved.id,),
     ).fetchone()
     if row is None:
-        raise PaperNotFound(f"paper_name={paper_name!r} not found in papers table")
-    paper_id, domain, markdown, status_str = row
-
-    try:
-        current = PaperStatus(status_str) if status_str else None
-    except ValueError as exc:
-        raise UnknownStatusError(
-            f"paper_name={paper_name!r}: unrecognized status={status_str!r}"
-        ) from exc
-
-    if not force and not can_run_from(current, PaperStatus.INDEXED):
-        extra = (
-            " (FAILED_HTML is terminal — re-fetch required)"
-            if current is PaperStatus.FAILED_HTML
-            else ""
+        raise PaperNotFound(
+            f"slug={paper_name!r} resolved to id={resolved.id} but row vanished"
         )
-        raise StatusTooLow(
-            f"paper_name={paper_name!r}: cannot run INDEXED from status="
-            f"{status_str!r}{extra}"
-        )
+    domain, markdown, status_str = row
+    paper_id = resolved.id
+
+    if kind is SourceKind.PAPER:
+        try:
+            current = PaperStatus(status_str) if status_str else None
+        except ValueError as exc:
+            raise UnknownStatusError(
+                f"paper_name={paper_name!r}: unrecognized status={status_str!r}"
+            ) from exc
+        if not force and not paper_can_run_from(current, PaperStatus.INDEXED):
+            extra = (
+                " (FAILED_HTML is terminal — re-fetch required)"
+                if current is PaperStatus.FAILED_HTML
+                else ""
+            )
+            raise StatusTooLow(
+                f"paper_name={paper_name!r}: cannot run INDEXED from status="
+                f"{status_str!r}{extra}"
+            )
+        target_status_value = PaperStatus.INDEXED.value
+    else:
+        try:
+            current_post = PostStatus(status_str) if status_str else None
+        except ValueError as exc:
+            raise UnknownStatusError(
+                f"post_name={paper_name!r}: unrecognized status={status_str!r}"
+            ) from exc
+        if not force and not post_can_run_from(current_post, PostStatus.INDEXED):
+            extra = (
+                " (terminal failure — re-fetch required)"
+                if current_post in (PostStatus.FAILED_FETCH, PostStatus.FAILED_PARSE)
+                else ""
+            )
+            raise StatusTooLow(
+                f"post_name={paper_name!r}: cannot run INDEXED from status="
+                f"{status_str!r}{extra}"
+            )
+        target_status_value = PostStatus.INDEXED.value
 
     with transaction(conn):
         # Rerun cleanup. FTS5 tables don't honor FK CASCADE — skipping this
@@ -161,7 +191,7 @@ def index_one(
                 markdown=markdown,
             )
 
-        touched = _touched_term_ids(conn, paper_id=paper_id)
+        touched = _touched_term_ids(conn, slug=paper_name)
         if not touched:
             _LOG.debug(
                 "paper_id=%s paper_name=%s: no touched canonical terms "
@@ -171,13 +201,13 @@ def index_one(
         _rebuild_terms_fts(conn, _fetch_canonical_rows(conn, touched))
 
         conn.execute(
-            """
-            UPDATE papers
+            f"""
+            UPDATE {target_table}
                SET section_count = ?,
                    status = ?
-             WHERE paper_name = ?
+             WHERE {name_col} = ?
             """,
-            (new_section_count, PaperStatus.INDEXED.value, paper_name),
+            (new_section_count, target_status_value, paper_name),
         )
 
     _LOG.info(
@@ -187,7 +217,7 @@ def index_one(
     return IndexResult(
         paper_name=paper_name,
         section_count=new_section_count,
-        status=PaperStatus.INDEXED.value,
+        status=target_status_value,
     )
 
 
@@ -227,29 +257,28 @@ def _insert_sections_for_paper(
 def _touched_term_ids(
     conn: sqlite3.Connection,
     *,
-    paper_id: int,
+    slug: str,
 ) -> set[int]:
-    """Union of canonical term ids this paper touches.
+    """Union of canonical term ids this paper/post touches.
 
     Two sources, unioned:
 
-    1. ``term_aliases`` synonym rows scoped by ``source_paper`` — captures
-       canonicals that gained a non-canonical surface form from this
-       paper. Load-bearing for tests that seed ``term_aliases`` directly.
+    1. ``term_aliases`` synonym rows scoped by ``source_paper`` (which is
+       the source slug under the shared papers/posts namespace) —
+       captures canonicals that gained a non-canonical surface form from
+       this source. Load-bearing for tests that seed ``term_aliases``
+       directly.
     2. ``pending_fts_rebuilds(conn)`` — captures every canonical the
        resolver call sites flagged this run, including tier-1 hits and
        tier-5 mints (which leave no alias row under the synonym-index
        regime), plus entity_type flips. Cleared after draining so the
-       queue doesn't leak into the next paper's pipeline run.
+       queue doesn't leak into the next source's pipeline run.
     """
     rows = conn.execute(
         """
-        SELECT DISTINCT ta.term_id
-          FROM term_aliases ta
-          JOIN papers p ON p.paper_name = ta.source_paper
-         WHERE p.id = ?
+        SELECT DISTINCT term_id FROM term_aliases WHERE source_paper = ?
         """,
-        (paper_id,),
+        (slug,),
     ).fetchall()
     sql_terms = {r[0] for r in rows}
     pending = pending_fts_rebuilds(conn)
@@ -346,9 +375,16 @@ def rebuild_all(
           FROM papers ORDER BY id
         """
     ).fetchall()
-    paper_count = len(paper_rows)
+    post_rows = conn.execute(
+        """
+        SELECT id, domain, post_name AS paper_name, markdown
+          FROM posts ORDER BY id
+        """
+    ).fetchall()
+    all_source_rows = list(paper_rows) + list(post_rows)
+    paper_count = len(all_source_rows)
     for i in range(0, paper_count, _PAPERS_BATCH_SIZE):
-        batch = paper_rows[i : i + _PAPERS_BATCH_SIZE]
+        batch = all_source_rows[i : i + _PAPERS_BATCH_SIZE]
         with transaction(conn):
             for row in batch:
                 _insert_sections_for_row(conn, row)

@@ -29,6 +29,7 @@ class TopicTarget(StrEnum):
 
     PAPER = "paper"
     REPO = "repo"
+    POST = "post"
 
 
 # CLASSIFIED is the standalone happy-path terminus for repos with a usable

@@ -24,6 +24,9 @@ EXPECTED_TABLES = {
     "topics",
     "code_files",
     "readmes_fts",
+    "posts",
+    "post_collections",
+    "post_references",
 }
 
 # Virtual tables (FTS5, vec0) create auxiliary shadow tables; filter by prefix.

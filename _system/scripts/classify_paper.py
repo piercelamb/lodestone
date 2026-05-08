@@ -46,7 +46,8 @@ from _system.db.orphan_gc import gc_orphan_topic_canonicals
 from _system.llm import call_structured, load_prompt
 from _system.resolution.embeddings import Embedder
 from _system.resolution.resolver import pending_fts_rebuilds, resolve
-from _system.schemas.paper_metadata import PaperStatus, can_run_from
+from _system.schemas.paper_metadata import PaperStatus, can_run_from as paper_can_run_from
+from _system.schemas.post_metadata import PostStatus, can_run_from as post_can_run_from
 from _system.schemas.repo_metadata import TopicTarget
 from _system.schemas.taxonomy import (
     ClassificationLLMOutput,
@@ -61,6 +62,7 @@ from _system.scripts.taxonomy_tree import (
 )
 from _system.utils.logging import get_logger
 from _system.utils.slug import sanitize_domain
+from _system.utils.source_resolution import SourceKind, resolve_slug
 
 _LOG = get_logger("scripts.classify_paper")
 
@@ -133,36 +135,69 @@ def classify(
     """
     del force  # see docstring on orchestrator parity
 
-    row = conn.execute(
-        """
-        SELECT id, status, abstract, markdown
-          FROM papers
-         WHERE paper_name = ?
-        """,
-        (paper_name,),
-    ).fetchone()
+    # Slug-namespace dispatch: paper_name may name a posts row instead.
+    # Status / table identity branches off `kind`; downstream logic
+    # (taxonomy load, LLM call, collection resolve) is identical.
+    try:
+        resolved = resolve_slug(conn, paper_name)
+    except Exception as exc:
+        raise ClassifyPaperNotFound(
+            f"slug={paper_name!r} not found in papers or posts"
+        ) from exc
+    kind = resolved.kind
+    row_id = resolved.id
+
+    if kind is SourceKind.PAPER:
+        row = conn.execute(
+            "SELECT status, abstract, markdown FROM papers WHERE id = ?",
+            (row_id,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT status, abstract, markdown FROM posts WHERE id = ?",
+            (row_id,),
+        ).fetchone()
     if row is None:
         raise ClassifyPaperNotFound(
-            f"paper_name={paper_name!r} not found in papers table"
+            f"slug={paper_name!r} resolved to id={row_id} but row vanished"
         )
-    paper_id, status_str, abstract, markdown = row
+    status_str, abstract, markdown = row
+    paper_id = row_id  # legacy local name; actually a paper_id or post_id
 
-    try:
-        current = PaperStatus(status_str) if status_str else None
-    except ValueError as exc:
-        raise ClassifyStateError(
-            f"paper_name={paper_name!r}: unrecognized status={status_str!r}"
-        ) from exc
-    if not can_run_from(current, PaperStatus.CLASSIFIED):
-        extra = (
-            " (FAILED_HTML is terminal — re-fetch required)"
-            if current is PaperStatus.FAILED_HTML
-            else ""
-        )
-        raise ClassifyStateError(
-            f"paper_name={paper_name!r}: cannot run CLASSIFIED from status="
-            f"{status_str!r}{extra}"
-        )
+    if kind is SourceKind.PAPER:
+        try:
+            current = PaperStatus(status_str) if status_str else None
+        except ValueError as exc:
+            raise ClassifyStateError(
+                f"paper_name={paper_name!r}: unrecognized status={status_str!r}"
+            ) from exc
+        if not paper_can_run_from(current, PaperStatus.CLASSIFIED):
+            extra = (
+                " (FAILED_HTML is terminal — re-fetch required)"
+                if current is PaperStatus.FAILED_HTML
+                else ""
+            )
+            raise ClassifyStateError(
+                f"paper_name={paper_name!r}: cannot run CLASSIFIED from status="
+                f"{status_str!r}{extra}"
+            )
+    else:
+        try:
+            current_post = PostStatus(status_str) if status_str else None
+        except ValueError as exc:
+            raise ClassifyStateError(
+                f"post_name={paper_name!r}: unrecognized status={status_str!r}"
+            ) from exc
+        if not post_can_run_from(current_post, PostStatus.CLASSIFIED):
+            extra = (
+                " (terminal failure — re-fetch required)"
+                if current_post in (PostStatus.FAILED_FETCH, PostStatus.FAILED_PARSE)
+                else ""
+            )
+            raise ClassifyStateError(
+                f"post_name={paper_name!r}: cannot run CLASSIFIED from status="
+                f"{status_str!r}{extra}"
+            )
 
     paper_content = _head_slice_paper_content(
         markdown=markdown or "", abstract=abstract or ""
@@ -231,9 +266,23 @@ def classify(
                 (decision.name, new_description),
             )
 
+        topic_target = (
+            TopicTarget.PAPER if kind is SourceKind.PAPER else TopicTarget.POST
+        )
+        collections_table = (
+            "paper_collections" if kind is SourceKind.PAPER else "post_collections"
+        )
+        target_table = "papers" if kind is SourceKind.PAPER else "posts"
+        target_id_col = (
+            "paper_id" if kind is SourceKind.PAPER else "post_id"
+        )
+        target_status = (
+            PaperStatus.CLASSIFIED if kind is SourceKind.PAPER else PostStatus.CLASSIFIED
+        )
+
         conn.execute(
             "DELETE FROM topics WHERE target_kind = ? AND target_id = ?",
-            (TopicTarget.PAPER.value, paper_id),
+            (topic_target.value, paper_id),
         )
 
         # Track every canonical this stage resolves so index_paper can
@@ -288,13 +337,13 @@ def classify(
         primary_name = resolved[0].name
         any_new_collection = any(r.description is not None for r in resolved)
 
-        # papers UPDATE runs before paper_collections writes so the
-        # papers-invariant trigger sees a non-NULL collection in the
-        # same transaction, and so the paper_collections intra-domain
-        # trigger reads the new papers.domain.
+        # papers/posts UPDATE runs before *_collections writes so the
+        # invariant trigger sees a non-NULL collection in the same
+        # transaction, and so the *_collections intra-domain trigger
+        # reads the new domain.
         conn.execute(
-            """
-            UPDATE papers
+            f"""
+            UPDATE {target_table}
                SET domain = ?,
                    collection = ?,
                    needs_review = ?,
@@ -305,18 +354,19 @@ def classify(
                 decision.name,
                 primary_name,
                 int(decision.paper_needs_review or any_new_collection),
-                PaperStatus.CLASSIFIED.value,
+                target_status.value,
                 paper_id,
             ),
         )
 
         conn.execute(
-            "DELETE FROM paper_collections WHERE paper_id = ?", (paper_id,)
+            f"DELETE FROM {collections_table} WHERE {target_id_col} = ?",
+            (paper_id,),
         )
         conn.executemany(
-            """
-            INSERT INTO paper_collections
-                (paper_id, domain, collection, is_primary)
+            f"""
+            INSERT INTO {collections_table}
+                ({target_id_col}, domain, collection, is_primary)
             VALUES (?, ?, ?, ?)
             """,
             [
@@ -346,7 +396,7 @@ def classify(
                 VALUES (?, ?, ?, ?)
                 """,
                 (
-                    TopicTarget.PAPER.value, paper_id,
+                    topic_target.value, paper_id,
                     decision.name, topic_hit.canonical_name,
                 ),
             )
@@ -377,7 +427,7 @@ def classify(
         collections=tuple(r.name for r in resolved),
         topics=tuple(inserted_topic_names),
         needs_review=needs_review,
-        status=PaperStatus.CLASSIFIED.value,
+        status=target_status.value,
     )
 
 

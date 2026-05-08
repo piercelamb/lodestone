@@ -347,6 +347,113 @@ CREATE INDEX IF NOT EXISTS idx_topics_target ON topics(target_kind, target_id);
 CREATE INDEX IF NOT EXISTS idx_topics_topic ON topics(domain, topic);
 
 -- ============================================================
+-- GROUP 4b: BLOG POSTS
+-- ============================================================
+-- Blog posts are siblings of papers — separate table, shared slug
+-- namespace (`papers.paper_name` and `posts.post_name` form a global set
+-- so downstream tables that key on a slug TEXT column — `sections`,
+-- `term_aliases`, `topics` — work uniformly across kinds without a
+-- discriminator. Tables that hard-FK to `papers.id` get sibling tables
+-- here for the post case (`post_collections`, `post_references`).
+
+CREATE TABLE IF NOT EXISTS posts (
+    id INTEGER PRIMARY KEY,
+    post_name TEXT UNIQUE NOT NULL,
+    source_url TEXT NOT NULL,
+    canonical_url TEXT UNIQUE NOT NULL,
+    title TEXT NOT NULL,
+    author TEXT,
+    site_name TEXT,
+    date TEXT NOT NULL,
+    abstract TEXT NOT NULL,
+    domain TEXT REFERENCES domains(name),
+    collection TEXT,
+    content_hash TEXT,
+    etag TEXT,
+    last_modified TEXT,
+    raw_html TEXT,
+    markdown TEXT,
+    ingested_at TEXT NOT NULL,
+    status TEXT NOT NULL,
+    section_count INTEGER DEFAULT 0,
+    entity_count INTEGER DEFAULT 0,
+    needs_review INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_posts_domain ON posts(domain);
+CREATE INDEX IF NOT EXISTS idx_posts_collection ON posts(domain, collection);
+CREATE INDEX IF NOT EXISTS idx_posts_hash ON posts(content_hash);
+CREATE INDEX IF NOT EXISTS idx_posts_review ON posts(needs_review) WHERE needs_review = 1;
+
+-- Mirror the papers invariant: classified-or-later posts must have both
+-- domain and collection. Pre-classify (FETCHED/CONVERTED) and terminal-
+-- failure rows (FAILED_FETCH / FAILED_PARSE) are exempt.
+CREATE TRIGGER IF NOT EXISTS posts_invariant_classified_has_domain_collection_insert
+BEFORE INSERT ON posts
+FOR EACH ROW
+WHEN NEW.status NOT IN ('fetched', 'converted', 'failed_fetch', 'failed_parse')
+ AND (NEW.domain IS NULL OR NEW.collection IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'posts invariant violated: classified+ rows must have both domain and collection set');
+END;
+
+CREATE TRIGGER IF NOT EXISTS posts_invariant_classified_has_domain_collection_update
+BEFORE UPDATE ON posts
+FOR EACH ROW
+WHEN NEW.status NOT IN ('fetched', 'converted', 'failed_fetch', 'failed_parse')
+ AND (NEW.domain IS NULL OR NEW.collection IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'posts invariant violated: classified+ rows must have both domain and collection set');
+END;
+
+CREATE TABLE IF NOT EXISTS post_collections (
+    post_id    INTEGER NOT NULL REFERENCES posts(id),
+    domain     TEXT    NOT NULL,
+    collection TEXT    NOT NULL,
+    is_primary INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (post_id, collection),
+    FOREIGN KEY (domain, collection) REFERENCES collections(domain, name)
+);
+
+CREATE INDEX IF NOT EXISTS idx_post_collections_collection
+  ON post_collections(domain, collection);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_post_collections_primary
+  ON post_collections(post_id) WHERE is_primary = 1;
+
+CREATE TRIGGER IF NOT EXISTS post_collections_intra_domain_insert
+BEFORE INSERT ON post_collections
+FOR EACH ROW
+WHEN NEW.domain != (SELECT domain FROM posts WHERE id = NEW.post_id)
+BEGIN
+    SELECT RAISE(ABORT, 'post_collections invariant: domain must match posts.domain');
+END;
+
+CREATE TRIGGER IF NOT EXISTS post_collections_intra_domain_update
+BEFORE UPDATE ON post_collections
+FOR EACH ROW
+WHEN NEW.domain != (SELECT domain FROM posts WHERE id = NEW.post_id)
+BEGIN
+    SELECT RAISE(ABORT, 'post_collections invariant: domain must match posts.domain');
+END;
+
+-- Outbound arxiv citations from a post. Mirrors `paper_references` but
+-- without `bibitem_id` / `ref_number` (blogs don't have a numbered
+-- bibliography). `raw_text` is the link anchor text or surrounding
+-- sentence — useful for surfacing the citation in search results.
+CREATE TABLE IF NOT EXISTS post_references (
+    id INTEGER PRIMARY KEY,
+    post_id INTEGER NOT NULL REFERENCES posts(id),
+    cited_arxiv_id TEXT,
+    cited_paper_id INTEGER REFERENCES papers(id),
+    raw_text TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_post_refs_post ON post_references(post_id);
+CREATE INDEX IF NOT EXISTS idx_post_refs_cited_arxiv ON post_references(cited_arxiv_id);
+CREATE INDEX IF NOT EXISTS idx_post_refs_cited_paper ON post_references(cited_paper_id);
+
+-- ============================================================
 -- GROUP 5: ONE-SHOT BACKFILL
 -- ============================================================
 -- Register collections already implied by classified papers so the

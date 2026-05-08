@@ -608,6 +608,26 @@ def _ingest_repo_dispatch(
     )
 
 
+def _ingest_post_dispatch(
+    conn: sqlite3.Connection, args: dict, progress=None,
+) -> dict:
+    from _system.db.migrations import init_db
+    from _system.scripts.ingest import ingest_post
+    from _system.scripts.validate_models import check_models
+
+    if progress is not None:
+        progress("checking models", 0, 1)
+    check_models()
+    init_db(conn)
+    return ingest_post(
+        conn=conn,
+        url=args["url"],
+        force=bool(args.get("force", False)),
+        domain=args.get("domain"),
+        progress=progress,
+    )
+
+
 class AttachMode(StrEnum):
     """Controls which figure-attach packer wraps a tool's payload."""
 
@@ -1256,6 +1276,40 @@ TOOLS: list[dict[str, Any]] = [
             "required": ["url"],
         },
         "dispatch": _ingest_repo_dispatch,
+        "attach": AttachMode.NONE,
+        "accepts_progress": True,
+    },
+    {
+        "name": "ingest_post",
+        "description": (
+            "Ingest a blog post URL into lodestone. Runs fetch → convert "
+            "(trafilatura HTML→markdown) → classify → extract → index. "
+            "Resumable — re-running on a post that partially ingested "
+            "picks up at the last completed stage; pass force=true to "
+            "wipe and re-ingest from scratch (preserves global taxonomy). "
+            "Outbound arxiv-id citations from the post body are pulled "
+            "into post_references and forward-resolved against the "
+            "papers table; a future paper that gets ingested will "
+            "backward-resolve the same row. If the post links a github "
+            "repo, the repo is registered via the standalone path "
+            "(no post→repo linkage in v1)."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Post URL (e.g. https://lilianweng.github.io/posts/...).",
+                },
+                "force": {"type": "boolean", "default": False},
+                "domain": {
+                    "type": "string",
+                    "description": "Optional: override the classifier's domain choice.",
+                },
+            },
+            "required": ["url"],
+        },
+        "dispatch": _ingest_post_dispatch,
         "attach": AttachMode.NONE,
         "accepts_progress": True,
     },
