@@ -27,9 +27,10 @@ they're unbounded so the 5-tier term resolver still canonicalizes them.
 
 On success we resolve every collection and every ``topic`` through the
 shared 5-tier term resolver (Section 4) and write the canonical names.
-The denormalized ``papers.collection`` scalar always points at the
-primary collection; the full set lives in ``paper_collections``. On a
-proposed new domain we sanitize the name and auto-insert it with
+The denormalized ``papers.collection`` (or ``posts.collection``) scalar
+always points at the primary collection; the full set lives in the
+polymorphic ``collections`` junction keyed by ``(target_kind, target_id)``.
+On a proposed new domain we sanitize the name and auto-insert it with
 ``needs_review=1``; ``needs_review`` is also set when any picked
 collection is new.
 """
@@ -48,7 +49,6 @@ from _system.resolution.embeddings import Embedder
 from _system.resolution.resolver import pending_fts_rebuilds, resolve
 from _system.schemas.paper_metadata import PaperStatus, can_run_from as paper_can_run_from
 from _system.schemas.post_metadata import PostStatus, can_run_from as post_can_run_from
-from _system.schemas.repo_metadata import TopicTarget
 from _system.schemas.taxonomy import (
     ClassificationLLMOutput,
     ClassificationOutput,
@@ -273,23 +273,14 @@ def classify(
                 (decision.name, new_description),
             )
 
-        topic_target = (
-            TopicTarget.PAPER if kind is SourceKind.PAPER else TopicTarget.POST
-        )
-        collections_table = (
-            "paper_collections" if kind is SourceKind.PAPER else "post_collections"
-        )
         target_table = "papers" if kind is SourceKind.PAPER else "posts"
-        target_id_col = (
-            "paper_id" if kind is SourceKind.PAPER else "post_id"
-        )
         target_status = (
             PaperStatus.CLASSIFIED if kind is SourceKind.PAPER else PostStatus.CLASSIFIED
         )
 
         conn.execute(
             "DELETE FROM topics WHERE target_kind = ? AND target_id = ?",
-            (topic_target.value, source_id),
+            (kind.value, source_id),
         )
 
         # Track every canonical this stage resolves so index_paper can
@@ -329,7 +320,7 @@ def classify(
 
             conn.execute(
                 """
-                INSERT OR IGNORE INTO collections (domain, name, description)
+                INSERT OR IGNORE INTO collection_definitions (domain, name, description)
                 VALUES (?, ?, ?)
                 """,
                 (decision.name, coll_hit.canonical_name, pick.description),
@@ -344,10 +335,10 @@ def classify(
         primary_name = resolved[0].name
         any_new_collection = any(r.description is not None for r in resolved)
 
-        # papers/posts UPDATE runs before *_collections writes so the
+        # papers/posts UPDATE runs before the collections write so the
         # invariant trigger sees a non-NULL collection in the same
-        # transaction, and so the *_collections intra-domain trigger
-        # reads the new domain.
+        # transaction, and so the collections intra-domain trigger reads
+        # the new domain off the parent row.
         conn.execute(
             f"""
             UPDATE {target_table}
@@ -367,17 +358,17 @@ def classify(
         )
 
         conn.execute(
-            f"DELETE FROM {collections_table} WHERE {target_id_col} = ?",
-            (source_id,),
+            "DELETE FROM collections WHERE target_kind = ? AND target_id = ?",
+            (kind.value, source_id),
         )
         conn.executemany(
-            f"""
-            INSERT INTO {collections_table}
-                ({target_id_col}, domain, collection, is_primary)
-            VALUES (?, ?, ?, ?)
+            """
+            INSERT INTO collections
+                (target_kind, target_id, domain, collection, is_primary)
+            VALUES (?, ?, ?, ?, ?)
             """,
             [
-                (source_id, decision.name, r.name, int(i == 0))
+                (kind.value, source_id, decision.name, r.name, int(i == 0))
                 for i, r in enumerate(resolved)
             ],
         )
@@ -403,7 +394,7 @@ def classify(
                 VALUES (?, ?, ?, ?)
                 """,
                 (
-                    topic_target.value, source_id,
+                    kind.value, source_id,
                     decision.name, topic_hit.canonical_name,
                 ),
             )

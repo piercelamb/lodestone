@@ -72,7 +72,7 @@ def _seed(
             "INSERT OR IGNORE INTO domains (name) VALUES ('rag')"
         )
         conn.execute(
-            "INSERT OR IGNORE INTO collections (domain, name, description) "
+            "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
             "VALUES ('rag', 'demo_collection', NULL)"
         )
     cur = conn.execute(

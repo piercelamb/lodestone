@@ -20,8 +20,21 @@ from typing import NamedTuple
 
 
 class SourceKind(StrEnum):
+    """Discriminator for any corpus item kind.
+
+    Used in two distinct roles:
+
+    - Slug-namespace dispatch in classify/extract/index/citation_resolution.
+      :func:`resolve_slug` only resolves PAPER and POST — repos live in a
+      separate ``repo_slug`` namespace and are looked up directly by
+      ``repos.repo_slug``.
+    - Discriminator column for polymorphic tables (``topics``,
+      ``collections`` junction). All three values appear here.
+    """
+
     PAPER = "paper"
     POST = "post"
+    REPO = "repo"
 
 
 class SlugNotFound(Exception):

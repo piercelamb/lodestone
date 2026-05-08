@@ -70,11 +70,11 @@ def fig_db(conn: sqlite3.Connection) -> sqlite3.Connection:
     """
     _seed_domain(conn, "rag")
     conn.execute(
-        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
         "VALUES ('rag', 'reasoning', NULL)"
     )
     conn.execute(
-        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
         "VALUES ('rag', 'misc', NULL)"
     )
     p_id = _insert_paper(
@@ -1003,7 +1003,7 @@ def _seed_overview_db(conn: sqlite3.Connection) -> sqlite3.Connection:
     )
     del p_id
     conn.execute(
-        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
         "VALUES (?, ?, ?)",
         ("rag", "hier_indexing", "multi-level toc"),
     )
@@ -1035,7 +1035,7 @@ def test_overview_tool_domain_filter(overview_db):
     # invariant is satisfied) that should NOT appear when filter narrows.
     _seed_domain(overview_db, "agents")
     overview_db.execute(
-        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
         "VALUES ('agents', 'tool_use', NULL)"
     )
     overview_db.execute(
@@ -1070,7 +1070,7 @@ def test_collection_tool_string_arg(overview_db):
 
 def test_collection_tool_array_arg(overview_db):
     overview_db.execute(
-        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
         "VALUES ('rag', 'hybrid', NULL)"
     )
     overview_db.execute(

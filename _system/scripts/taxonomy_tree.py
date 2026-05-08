@@ -33,6 +33,7 @@ class CollectionNode:
     description: str | None
     paper_count: int
     repo_count: int = 0
+    post_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,7 @@ class DomainNode:
     collections: tuple[CollectionNode, ...]
     overflow: int = 0
     repo_count: int = 0
+    post_count: int = 0
 
 
 def load_taxonomy(
@@ -89,19 +91,22 @@ def load_taxonomy(
             """,
         ).fetchall()
 
+    # The polymorphic `collections` junction covers papers, posts, and
+    # repos — one LEFT JOIN per (domain, collection) row in the catalog
+    # naturally aggregates across all kinds. SUM(CASE) keeps the
+    # paper-vs-repo breakdown the renderer surfaces. Posts contribute a
+    # separate `post_count` aggregate the renderer doesn't display today
+    # but consumers can read off `CollectionNode.post_count`.
     if domain is not None:
         coll_rows = conn.execute(
             """
             SELECT c.domain, c.name, c.description,
-                   COUNT(DISTINCT pc.paper_id) AS paper_count,
-                   COUNT(DISTINCT r.id) AS repo_count
-              FROM collections c
-              LEFT JOIN paper_collections pc
+                   SUM(CASE WHEN pc.target_kind='paper' THEN 1 ELSE 0 END) AS paper_count,
+                   SUM(CASE WHEN pc.target_kind='post'  THEN 1 ELSE 0 END) AS post_count,
+                   SUM(CASE WHEN pc.target_kind='repo'  THEN 1 ELSE 0 END) AS repo_count
+              FROM collection_definitions c
+              LEFT JOIN collections pc
                 ON pc.domain = c.domain AND pc.collection = c.name
-              LEFT JOIN repos r
-                ON r.domain = c.domain
-               AND r.collection = c.name
-               AND r.paper_id IS NULL
              WHERE c.domain = ?
              GROUP BY c.domain, c.name, c.description
             """,
@@ -111,37 +116,43 @@ def load_taxonomy(
         coll_rows = conn.execute(
             """
             SELECT c.domain, c.name, c.description,
-                   COUNT(DISTINCT pc.paper_id) AS paper_count,
-                   COUNT(DISTINCT r.id) AS repo_count
-              FROM collections c
-              LEFT JOIN paper_collections pc
+                   SUM(CASE WHEN pc.target_kind='paper' THEN 1 ELSE 0 END) AS paper_count,
+                   SUM(CASE WHEN pc.target_kind='post'  THEN 1 ELSE 0 END) AS post_count,
+                   SUM(CASE WHEN pc.target_kind='repo'  THEN 1 ELSE 0 END) AS repo_count
+              FROM collection_definitions c
+              LEFT JOIN collections pc
                 ON pc.domain = c.domain AND pc.collection = c.name
-              LEFT JOIN repos r
-                ON r.domain = c.domain
-               AND r.collection = c.name
-               AND r.paper_id IS NULL
              GROUP BY c.domain, c.name, c.description
             """,
         ).fetchall()
 
     by_domain: dict[str, list[CollectionNode]] = {}
-    for d, name, description, count, rcount in coll_rows:
-        # Drop entirely empty collections (no papers AND no standalone repos).
-        if not include_empty_collections and (count or 0) == 0 and (rcount or 0) == 0:
+    for d, name, description, p_count, post_count, r_count in coll_rows:
+        p_count = int(p_count or 0)
+        post_count = int(post_count or 0)
+        r_count = int(r_count or 0)
+        # Drop entirely empty collections (no entries of any kind).
+        if not include_empty_collections and (p_count + post_count + r_count) == 0:
             continue
         by_domain.setdefault(d, []).append(
             CollectionNode(
                 name=name,
                 description=description,
-                paper_count=int(count or 0),
-                repo_count=int(rcount or 0),
+                paper_count=p_count,
+                repo_count=r_count,
+                post_count=post_count,
             )
         )
 
-    # Sort each domain's collections: most-popular first (papers + repos),
-    # then alpha by name.
+    # Sort each domain's collections: most-popular first across all
+    # kinds, then alpha by name.
     for d, colls in by_domain.items():
-        colls.sort(key=lambda c: (-(c.paper_count + c.repo_count), c.name))
+        colls.sort(
+            key=lambda c: (
+                -(c.paper_count + c.post_count + c.repo_count),
+                c.name,
+            )
+        )
 
     # Per-domain repo count (standalone repos only — paper-linked repos
     # are already counted via their paper).
@@ -154,11 +165,25 @@ def load_taxonomy(
         ).fetchall()
     }
 
+    # Per-domain post count.
+    post_counts_by_domain: dict[str, int] = {
+        d: c
+        for d, c in conn.execute(
+            "SELECT domain, COUNT(*) FROM posts "
+            " WHERE domain IS NOT NULL "
+            " GROUP BY domain"
+        ).fetchall()
+    }
+
     nodes: list[DomainNode] = []
     for d_name, d_desc, d_count in domain_rows:
         d_count = int(d_count or 0)
         d_repo_count = int(repo_counts_by_domain.get(d_name, 0) or 0)
-        if not include_empty_domains and d_count == 0 and d_repo_count == 0:
+        d_post_count = int(post_counts_by_domain.get(d_name, 0) or 0)
+        if (
+            not include_empty_domains
+            and d_count == 0 and d_repo_count == 0 and d_post_count == 0
+        ):
             continue
         colls = by_domain.get(d_name, [])
         overflow = 0
@@ -176,11 +201,17 @@ def load_taxonomy(
                 collections=tuple(colls),
                 overflow=overflow,
                 repo_count=d_repo_count,
+                post_count=d_post_count,
             )
         )
 
-    # Sort domains: most-papers+repos first, then alpha.
-    nodes.sort(key=lambda n: (-(n.paper_count + n.repo_count), n.name))
+    # Sort domains: most-content first across all kinds, then alpha.
+    nodes.sort(
+        key=lambda n: (
+            -(n.paper_count + n.post_count + n.repo_count),
+            n.name,
+        )
+    )
     return nodes
 
 
@@ -188,17 +219,20 @@ def _format_count(n: int, *, label: str) -> str:
     return f"{n} {label}" if n == 1 else f"{n} {label}s"
 
 
-def _node_count_label(paper_count: int, repo_count: int) -> str:
-    """Render the ``(N papers, M repos)`` suffix.
+def _node_count_label(
+    paper_count: int, repo_count: int, post_count: int = 0
+) -> str:
+    """Render the ``(N papers, M posts, K repos)`` suffix.
 
-    Drops the repo half when ``repo_count == 0`` so existing fixtures
-    that don't exercise repos render unchanged.
+    Drops the post / repo halves when their counts are zero so existing
+    fixtures that don't exercise those kinds render unchanged.
     """
-    paper_part = _format_count(paper_count, label="paper")
-    if repo_count <= 0:
-        return paper_part
-    repo_part = _format_count(repo_count, label="repo")
-    return f"{paper_part}, {repo_part}"
+    parts: list[str] = [_format_count(paper_count, label="paper")]
+    if post_count > 0:
+        parts.append(_format_count(post_count, label="post"))
+    if repo_count > 0:
+        parts.append(_format_count(repo_count, label="repo"))
+    return ", ".join(parts)
 
 
 def render_taxonomy_tree(
@@ -268,7 +302,9 @@ def _render_count(
     blocks: list[list[str]] = []
     for node in domains:
         block: list[str] = []
-        suffix = f"({_node_count_label(node.paper_count, node.repo_count)})"
+        suffix = (
+            f"({_node_count_label(node.paper_count, node.repo_count, node.post_count)})"
+        )
         head = (
             f"{node.name} — {node.description}  {suffix}"
             if node.description
@@ -285,7 +321,9 @@ def _render_count(
         n_leaves = len(node.collections) + (1 if has_overflow else 0)
         for j, coll in enumerate(node.collections):
             connector = "└──" if j == n_leaves - 1 else "├──"
-            c_count = _node_count_label(coll.paper_count, coll.repo_count)
+            c_count = _node_count_label(
+                coll.paper_count, coll.repo_count, coll.post_count
+            )
             leaf = (
                 f"{coll.name} — {coll.description}  ({c_count})"
                 if coll.description

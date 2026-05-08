@@ -100,7 +100,7 @@ def _seed_paper(
     (none of the orphan-GC tests need that)."""
     if collection is not None:
         conn.execute(
-            "INSERT OR IGNORE INTO collections (domain, name, description) "
+            "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
             "VALUES (?, ?, NULL)",
             (domain, collection),
         )
@@ -117,10 +117,11 @@ def _seed_paper(
     )
     paper_id = cur.lastrowid
     if collection is not None:
-        # Mirror production: paper_collections carries the primary row.
+        # Mirror production: polymorphic `collections` carries the primary row.
         conn.execute(
-            "INSERT OR IGNORE INTO paper_collections "
-            " (paper_id, domain, collection, is_primary) VALUES (?, ?, ?, 1)",
+            "INSERT OR IGNORE INTO collections "
+            " (target_kind, target_id, domain, collection, is_primary) "
+            " VALUES ('paper', ?, ?, ?, 1)",
             (paper_id, domain, collection),
         )
     return paper_id
@@ -182,7 +183,7 @@ def test_collection_with_no_paper_references_survives(conn):
     humans delete categories — future papers can populate them."""
     _seed_domain(conn)
     conn.execute(
-        "INSERT INTO collections (domain, name, description) "
+        "INSERT INTO collection_definitions (domain, name, description) "
         "VALUES (?, ?, NULL)",
         ("rag", "orphan_coll"),
     )
@@ -202,7 +203,7 @@ def test_collection_with_no_paper_references_survives(conn):
         "SELECT COUNT(*) FROM canonical_terms WHERE id = ?", (term_id,)
     ).fetchone()[0] == 1
     assert conn.execute(
-        "SELECT COUNT(*) FROM collections WHERE domain = ? AND name = ?",
+        "SELECT COUNT(*) FROM collection_definitions WHERE domain = ? AND name = ?",
         ("rag", "orphan_coll"),
     ).fetchone()[0] == 1
     assert conn.execute(
@@ -213,7 +214,7 @@ def test_collection_with_no_paper_references_survives(conn):
 def test_collection_with_papers_collection_reference_survives(conn):
     _seed_domain(conn)
     conn.execute(
-        "INSERT INTO collections (domain, name, description) "
+        "INSERT INTO collection_definitions (domain, name, description) "
         "VALUES (?, ?, NULL)",
         ("rag", "bound_coll"),
     )
@@ -238,7 +239,7 @@ def test_collection_with_papers_collection_reference_survives(conn):
         "SELECT COUNT(*) FROM canonical_terms WHERE id = ?", (term_id,)
     ).fetchone()[0] == 1
     assert conn.execute(
-        "SELECT COUNT(*) FROM collections WHERE name = ?", ("bound_coll",),
+        "SELECT COUNT(*) FROM collection_definitions WHERE name = ?", ("bound_coll",),
     ).fetchone()[0] == 1
 
 
@@ -326,7 +327,7 @@ def test_returns_counts_dict(conn):
     )
     # An orphan collection — must NOT be counted or removed.
     conn.execute(
-        "INSERT INTO collections (domain, name, description) "
+        "INSERT INTO collection_definitions (domain, name, description) "
         "VALUES (?, ?, NULL)",
         ("rag", "orphan_c1"),
     )
@@ -350,19 +351,20 @@ def test_returns_counts_dict(conn):
         " WHERE term_type = 'collection' AND canonical_name = 'orphan_c1'"
     ).fetchone()[0] == 1
     assert conn.execute(
-        "SELECT COUNT(*) FROM collections WHERE name = 'orphan_c1'"
+        "SELECT COUNT(*) FROM collection_definitions WHERE name = 'orphan_c1'"
     ).fetchone()[0] == 1
 
 
 # ===========================================================================
-# delete_paper_cascade clears paper_collections
+# delete_paper_cascade clears polymorphic `collections` rows
 # ===========================================================================
 
 
-def test_delete_paper_cascade_drops_paper_collections_rows(conn):
-    """Deleting a paper must wipe all of its paper_collections rows
-    (primary + secondary) but leave the curated `collections` registry
-    rows alone — those are categories, not per-paper concepts."""
+def test_delete_paper_cascade_drops_polymorphic_collections_rows(conn):
+    """Deleting a paper must wipe all of its polymorphic `collections`
+    rows (primary + secondary) but leave the curated
+    `collection_definitions` registry rows alone — those are categories,
+    not per-paper concepts."""
     from _system.db.cascade import delete_paper_cascade
 
     _seed_domain(conn)
@@ -375,24 +377,26 @@ def test_delete_paper_cascade_drops_paper_collections_rows(conn):
     )
     # Add a SECONDARY membership.
     conn.execute(
-        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
         "VALUES (?, ?, NULL)",
         ("rag", "secondary_coll"),
     )
     conn.execute(
-        "INSERT INTO paper_collections "
-        " (paper_id, domain, collection, is_primary) VALUES (?, ?, ?, 0)",
+        "INSERT INTO collections "
+        " (target_kind, target_id, domain, collection, is_primary) "
+        " VALUES ('paper', ?, ?, ?, 0)",
         (paper_id, "rag", "secondary_coll"),
     )
 
     delete_paper_cascade(conn, paper_id=paper_id)
 
-    # All paper_collections rows for the paper are gone.
+    # All polymorphic collections rows for the paper are gone.
     assert conn.execute(
-        "SELECT COUNT(*) FROM paper_collections WHERE paper_id = ?",
+        "SELECT COUNT(*) FROM collections "
+        " WHERE target_kind = 'paper' AND target_id = ?",
         (paper_id,),
     ).fetchone()[0] == 0
-    # The two collection registry rows survive — categories, not per-paper.
+    # The two catalog rows survive — categories, not per-paper.
     assert conn.execute(
-        "SELECT COUNT(*) FROM collections WHERE domain = 'rag' AND name IN ('primary_coll', 'secondary_coll')"
+        "SELECT COUNT(*) FROM collection_definitions WHERE domain = 'rag' AND name IN ('primary_coll', 'secondary_coll')"
     ).fetchone()[0] == 2

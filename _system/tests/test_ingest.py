@@ -91,7 +91,7 @@ def _seed_paper(
             "INSERT OR IGNORE INTO domains (name) VALUES (?)", (domain,)
         )
         conn.execute(
-            "INSERT OR IGNORE INTO collections (domain, name, description) "
+            "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
             "VALUES (?, ?, NULL)",
             (domain, collection),
         )
@@ -165,7 +165,7 @@ class _StageRecorder:
         # the mock mirrors that here.
         conn.execute("INSERT OR IGNORE INTO domains (name) VALUES ('rag')")
         conn.execute(
-            "INSERT OR IGNORE INTO collections (domain, name, description) "
+            "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
             "VALUES ('rag', 'demo', NULL)"
         )
         conn.execute(
@@ -525,7 +525,7 @@ def test_force_cascade_gcs_orphan_topic_canonicals(conn):
     # touch the first-class registry; mirror what classify_paper would
     # have done so we can assert a referenced registry row survives.
     conn.execute(
-        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
         "VALUES (?, ?, NULL)",
         ("rag", "tree-search"),
     )
@@ -570,7 +570,7 @@ def test_force_cascade_gcs_orphan_topic_canonicals(conn):
         ("solo-cluster", paper_id),
     )
     conn.execute(
-        "INSERT INTO collections (domain, name, description) VALUES (?, ?, NULL)",
+        "INSERT INTO collection_definitions (domain, name, description) VALUES (?, ?, NULL)",
         ("rag", "solo-cluster"),
     )
     conn.execute(
@@ -602,12 +602,12 @@ def test_force_cascade_gcs_orphan_topic_canonicals(conn):
         "SELECT COUNT(*) FROM canonical_terms WHERE id = ?", (solo_coll_id,),
     ).fetchone()[0] == 1
     assert conn.execute(
-        "SELECT COUNT(*) FROM collections WHERE name = ?", ("solo-cluster",),
+        "SELECT COUNT(*) FROM collection_definitions WHERE name = ?", ("solo-cluster",),
     ).fetchone()[0] == 1
     # The shared 'tree-search' registry row from _seed_full_paper also
     # survives (paper_keep still references it).
     assert conn.execute(
-        "SELECT COUNT(*) FROM collections WHERE name = ?", ("tree-search",),
+        "SELECT COUNT(*) FROM collection_definitions WHERE name = ?", ("tree-search",),
     ).fetchone()[0] == 1
 
 

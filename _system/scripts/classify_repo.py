@@ -2,14 +2,18 @@
 
 Mirrors :mod:`_system.scripts.classify_paper`. Operates on the README
 plus optional GitHub metadata; writes ``repos.domain``,
-``repos.collection``, and ``topics`` rows with ``target_kind='repo'``.
-Repos without a usable README are marked ``ORPHANED`` and skip the LLM
-call entirely — they remain searchable by name/path/file content.
+``repos.collection`` (the denormalized primary pointer), polymorphic
+``collections`` rows with ``target_kind='repo'``, and ``topics`` rows
+with ``target_kind='repo'``. Repos without a usable README are marked
+``ORPHANED`` and skip the LLM call entirely — they remain searchable by
+name/path/file content.
 
 Prompt assets live under ``_system/llm/prompts/classify_repo/`` —
 deliberately separate from ``classify_paper`` because the language and
 structural cues differ (README chrome / badges / install instructions
-must not leak into topics).
+must not leak into topics) — but the response schema is identical to
+the paper side: 1 PRIMARY collection (item 0) plus 0..3 SECONDARY
+memberships within the same domain.
 """
 from __future__ import annotations
 
@@ -24,10 +28,12 @@ from _system.db.orphan_gc import gc_orphan_topic_canonicals
 from _system.llm import call_structured, load_prompt
 from _system.resolution.embeddings import Embedder
 from _system.resolution.resolver import pending_fts_rebuilds, resolve
-from _system.schemas.repo_metadata import RepoStatus, TopicTarget, can_run_from
+from _system.schemas.repo_metadata import RepoStatus, can_run_from
+from _system.utils.source_resolution import SourceKind
 from _system.schemas.taxonomy import (
-    RepoClassificationLLMOutput as ClassificationLLMOutput,
-    RepoClassificationOutput as ClassificationOutput,
+    ClassificationLLMOutput,
+    ClassificationOutput,
+    ResolvedCollection,
 )
 from _system.scripts.taxonomy_tree import (
     DomainNode,
@@ -68,7 +74,8 @@ class ClassifyRepoResult(NamedTuple):
     repo_slug: str
     status: str
     domain: str | None
-    collection: str | None
+    collection: str | None  # primary collection name (matches repos.collection scalar)
+    collections: tuple[str, ...]  # primary first, then secondaries
     topics: tuple[str, ...]
     needs_review: bool
 
@@ -151,6 +158,7 @@ def classify(
             status=RepoStatus.ORPHANED.value,
             domain=None,
             collection=None,
+            collections=(),
             topics=(),
             needs_review=False,
         )
@@ -179,6 +187,7 @@ def classify(
             status=RepoStatus.ORPHANED.value,
             domain=None,
             collection=None,
+            collections=(),
             topics=(),
             needs_review=False,
         )
@@ -253,31 +262,92 @@ def classify(
 
         conn.execute(
             "DELETE FROM topics WHERE target_kind = ? AND target_id = ?",
-            (TopicTarget.REPO.value, repo_id),
+            (SourceKind.REPO.value, repo_id),
         )
 
         touched_term_ids: set[int] = set()
 
-        collection_hit = resolve(
-            conn,
-            output.collection,
-            domain=decision.name,
-            term_type="collection",
-            source_paper=source_token,
-            embedder=embedder,
-        )
-        touched_term_ids.add(collection_hit.term_id)
+        resolved: list[ResolvedCollection] = []
+        seen_raw_names: set[str] = set()
+        seen_canonicals: set[str] = set()
+        for i, pick in enumerate(output.collections):
+            raw_key = pick.name.casefold()
+            if raw_key in seen_raw_names:
+                continue
+            seen_raw_names.add(raw_key)
 
+            coll_hit = resolve(
+                conn,
+                pick.name,
+                domain=decision.name,
+                term_type="collection",
+                source_paper=source_token,
+                embedder=embedder,
+            )
+            touched_term_ids.add(coll_hit.term_id)
+
+            if coll_hit.canonical_name in seen_canonicals:
+                _LOG.warning(
+                    "classify repo_slug=%s: collection pick #%d (%r) "
+                    "canonicalized to %r — already present; dropping",
+                    repo_slug, i, pick.name, coll_hit.canonical_name,
+                )
+                continue
+            seen_canonicals.add(coll_hit.canonical_name)
+
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO collection_definitions (domain, name, description)
+                VALUES (?, ?, ?)
+                """,
+                (decision.name, coll_hit.canonical_name, pick.description),
+            )
+            resolved.append(
+                ResolvedCollection(
+                    name=coll_hit.canonical_name,
+                    description=pick.description,
+                )
+            )
+
+        primary_name = resolved[0].name
+        any_new_collection = any(r.description is not None for r in resolved)
+
+        # repos UPDATE runs before the collections write so the
+        # invariant trigger sees a non-NULL collection in the same
+        # transaction, and so the collections intra-domain trigger reads
+        # the new domain off the parent row.
         conn.execute(
             """
-            INSERT OR IGNORE INTO collections (domain, name, description)
-            VALUES (?, ?, ?)
+            UPDATE repos
+               SET domain = ?,
+                   collection = ?,
+                   needs_review = ?,
+                   status = ?
+             WHERE id = ?
             """,
             (
                 decision.name,
-                collection_hit.canonical_name,
-                output.collection_description,
+                primary_name,
+                int(decision.repo_needs_review or any_new_collection),
+                RepoStatus.CLASSIFIED.value,
+                repo_id,
             ),
+        )
+
+        conn.execute(
+            "DELETE FROM collections WHERE target_kind = ? AND target_id = ?",
+            (SourceKind.REPO.value, repo_id),
+        )
+        conn.executemany(
+            """
+            INSERT INTO collections
+                (target_kind, target_id, domain, collection, is_primary)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (SourceKind.REPO.value, repo_id, decision.name, r.name, int(i == 0))
+                for i, r in enumerate(resolved)
+            ],
         )
 
         seen_term_ids: set[int] = set()
@@ -301,50 +371,31 @@ def classify(
                 VALUES (?, ?, ?, ?)
                 """,
                 (
-                    TopicTarget.REPO.value, repo_id,
+                    SourceKind.REPO.value, repo_id,
                     decision.name, topic_hit.canonical_name,
                 ),
             )
             inserted_topic_names.append(topic_hit.canonical_name)
 
-        # Update repo with new taxonomy + status. The triggers in
-        # schema.sql require domain+collection set on CLASSIFIED rows —
-        # both are written above before we set the status.
-        conn.execute(
-            """
-            UPDATE repos
-               SET domain = ?,
-                   collection = ?,
-                   needs_review = ?,
-                   status = ?
-             WHERE id = ?
-            """,
-            (
-                decision.name,
-                collection_hit.canonical_name,
-                int(decision.repo_needs_review),
-                RepoStatus.CLASSIFIED.value,
-                repo_id,
-            ),
-        )
-
         pending_fts_rebuilds(conn).update(touched_term_ids)
         gc_orphan_topic_canonicals(conn)
 
+    needs_review = bool(decision.repo_needs_review or any_new_collection)
     _LOG.info(
-        "classified repo_id=%s repo_slug=%s domain=%s collection=%s "
-        "topics=%d needs_review=%s",
-        repo_id, repo_slug, decision.name, collection_hit.canonical_name,
-        len(inserted_topic_names), decision.repo_needs_review,
+        "classified repo_id=%s repo_slug=%s domain=%s primary=%s "
+        "secondaries=%d topics=%d needs_review=%s",
+        repo_id, repo_slug, decision.name, primary_name,
+        len(resolved) - 1, len(inserted_topic_names), needs_review,
     )
 
     return ClassifyRepoResult(
         repo_slug=repo_slug,
         status=RepoStatus.CLASSIFIED.value,
         domain=decision.name,
-        collection=collection_hit.canonical_name,
+        collection=primary_name,
+        collections=tuple(r.name for r in resolved),
         topics=tuple(inserted_topic_names),
-        needs_review=decision.repo_needs_review,
+        needs_review=needs_review,
     )
 
 
@@ -399,6 +450,12 @@ def _resolve_raw(
     raw: ClassificationLLMOutput,
     existing_domains: list[DomainNode],
 ) -> ClassificationOutput:
+    """Translate the index-based LLM output to a name-based pipeline shape.
+
+    Mirrors :func:`classify_paper._resolve_raw`. Domain uses the
+    index-replace pattern; ``collections`` is a 1..4-entry list with the
+    first entry the PRIMARY membership.
+    """
     if raw.domain_index == -1:
         domain_name = raw.new_domain
         domain_is_new = True
@@ -426,53 +483,79 @@ def _resolve_raw(
             f"[-1, {len(existing_domains) - 1}]"
         )
 
-    if raw.collection_index == -1:
-        proposed = raw.new_collection.strip()
-        if not proposed:
-            raise ClassifyRepoLLMError(
-                "LLM returned collection_index=-1 but new_collection is empty"
-            )
-        collection_name = proposed
-        collection_description: str | None = raw.new_collection_desc.strip()
-        if not collection_description:
-            raise ClassifyRepoLLMError(
-                "LLM returned collection_index=-1 but new_collection_desc is empty"
-            )
-    elif raw.collection_index >= 0:
-        if domain_is_new or domain_node is None:
-            raise ClassifyRepoLLMError(
-                f"LLM proposed new domain={domain_name!r} but set "
-                f"collection_index={raw.collection_index}; new domains have "
-                "no existing collections — collection_index must be -1"
-            )
-        domain_colls = domain_node.collections
-        if raw.collection_index >= len(domain_colls):
-            raise ClassifyRepoLLMError(
-                f"LLM returned collection_index={raw.collection_index} "
-                f"for domain={domain_name!r}, which has "
-                f"{len(domain_colls)} collection(s) — index out of range"
-            )
-        collection_name = domain_colls[raw.collection_index].name
-        if raw.new_collection_desc.strip():
-            raise ClassifyRepoLLMError(
-                f"LLM picked existing collection_index={raw.collection_index} "
-                f"but also set new_collection_desc={raw.new_collection_desc!r}; "
-                "description must be empty unless collection_index == -1"
-            )
-        collection_description = None
-    else:
+    if not raw.collections:
         raise ClassifyRepoLLMError(
-            f"LLM returned collection_index={raw.collection_index} outside "
-            f"[-1, max)"
+            "LLM returned an empty collections list; schema minItems was "
+            "supposed to make this impossible"
         )
+
+    resolved_picks = [
+        _resolve_pick(pick, i, domain_name, domain_is_new, domain_node)
+        for i, pick in enumerate(raw.collections)
+    ]
 
     return ClassificationOutput(
         domain=domain_name,
         domain_is_new=domain_is_new,
         domain_description=domain_description,
-        collection=collection_name,
-        collection_description=collection_description,
+        collections=resolved_picks,
         topics=raw.topics,
+    )
+
+
+def _resolve_pick(
+    pick,
+    i: int,
+    domain_name: str,
+    domain_is_new: bool,
+    domain_node: DomainNode | None,
+) -> ResolvedCollection:
+    """Validate one CollectionPick and return its ResolvedCollection.
+
+    Mirrors :func:`classify_paper._resolve_pick`.
+    """
+    if pick.index == -1:
+        proposed = pick.new_name.strip()
+        if not proposed:
+            raise ClassifyRepoLLMError(
+                f"LLM collection pick #{i} has index=-1 but new_name is empty"
+            )
+        description = pick.new_desc.strip()
+        if not description:
+            raise ClassifyRepoLLMError(
+                f"LLM collection pick #{i} has index=-1 but new_desc is "
+                f"empty; new collections must include a one-sentence description"
+            )
+        return ResolvedCollection(name=proposed, description=description)
+
+    if domain_is_new or domain_node is None:
+        raise ClassifyRepoLLMError(
+            f"LLM proposed new domain={domain_name!r} but pick #{i} has "
+            f"index={pick.index}; new domains have no existing collections "
+            f"— every pick's index must be -1"
+        )
+    domain_colls = domain_node.collections
+    if pick.index >= len(domain_colls):
+        raise ClassifyRepoLLMError(
+            f"LLM collection pick #{i} has index={pick.index} for "
+            f"domain={domain_name!r}, which has {len(domain_colls)} "
+            f"collection(s) — index out of range"
+        )
+    if pick.new_name.strip():
+        raise ClassifyRepoLLMError(
+            f"LLM collection pick #{i} picked existing index={pick.index} "
+            f"but also set new_name={pick.new_name!r}; new_name must be "
+            f"empty when index >= 0"
+        )
+    if pick.new_desc.strip():
+        raise ClassifyRepoLLMError(
+            f"LLM collection pick #{i} picked existing index={pick.index} "
+            f"but also set new_desc={pick.new_desc!r}; new_desc must be "
+            f"empty when index >= 0"
+        )
+    return ResolvedCollection(
+        name=domain_colls[pick.index].name,
+        description=None,
     )
 
 

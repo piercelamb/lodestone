@@ -110,16 +110,17 @@ def _insert_paper(
     )
     paper_id = cur.lastrowid
     # Mirror production: a classified paper carries a primary
-    # paper_collections row pointing at its denormalized collection.
+    # `collections` row pointing at its denormalized collection.
     if collection is not None:
         conn.execute(
-            "INSERT OR IGNORE INTO collections (domain, name, description) "
+            "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
             "VALUES (?, ?, NULL)",
             (domain, collection),
         )
         conn.execute(
-            "INSERT OR IGNORE INTO paper_collections "
-            " (paper_id, domain, collection, is_primary) VALUES (?, ?, ?, 1)",
+            "INSERT OR IGNORE INTO collections "
+            " (target_kind, target_id, domain, collection, is_primary) "
+            " VALUES ('paper', ?, ?, ?, 1)",
             (paper_id, domain, collection),
         )
     return paper_id
@@ -132,16 +133,17 @@ def _add_secondary_collection(
     domain: str,
     collection: str,
 ) -> None:
-    """Attach a SECONDARY paper_collections row (is_primary=0) — keeps
+    """Attach a SECONDARY `collections` row (is_primary=0) — keeps
     `papers.collection` (the primary) untouched."""
     conn.execute(
-        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
         "VALUES (?, ?, NULL)",
         (domain, collection),
     )
     conn.execute(
-        "INSERT INTO paper_collections "
-        " (paper_id, domain, collection, is_primary) VALUES (?, ?, ?, 0)",
+        "INSERT INTO collections "
+        " (target_kind, target_id, domain, collection, is_primary) "
+        " VALUES ('paper', ?, ?, ?, 0)",
         (paper_id, domain, collection),
     )
 
@@ -377,7 +379,7 @@ def seeded_db(conn: sqlite3.Connection) -> sqlite3.Connection:
     # to confirm it; the paper still has both domain and collection
     # (system invariant for classified+ rows).
     conn.execute(
-        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
         "VALUES ('other', 'misc', NULL)"
     )
     p2_id = _insert_paper(
@@ -931,7 +933,7 @@ class TestModeBM25Pagination:
             ("solo", "solo domain"),
         )
         seeded_db.execute(
-            "INSERT OR IGNORE INTO collections (domain, name, description) "
+            "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
             "VALUES ('solo', 'misc', NULL)"
         )
         solo_id = _insert_paper(
@@ -2012,8 +2014,8 @@ class TestModeBrowse:
             domain="rag",
             topic="dense embeddings",
         )
-        # A repo in the target collection contributes via the scalar
-        # repos.collection column.
+        # A repo in the target collection contributes via the polymorphic
+        # `collections` junction.
         seeded_db.execute(
             "INSERT INTO repos (repo_slug, url, host, owner, name, "
             "  ingested_at, status, domain, collection) "
@@ -2025,6 +2027,17 @@ class TestModeBrowse:
         repo_id = seeded_db.execute(
             "SELECT id FROM repos WHERE repo_slug = 'owner-hier'"
         ).fetchone()[0]
+        seeded_db.execute(
+            "INSERT INTO collection_definitions (domain, name) VALUES (?, ?) "
+            " ON CONFLICT DO NOTHING",
+            ("rag", "hierarchical indexing"),
+        )
+        seeded_db.execute(
+            "INSERT INTO collections "
+            " (target_kind, target_id, domain, collection, is_primary) "
+            " VALUES ('repo', ?, 'rag', 'hierarchical indexing', 1)",
+            (repo_id,),
+        )
         seeded_db.execute(
             "INSERT INTO topics (target_kind, target_id, domain, topic) "
             "VALUES ('repo', ?, 'rag', 'tree retrieval')",
@@ -2042,6 +2055,17 @@ class TestModeBrowse:
         other_repo_id = seeded_db.execute(
             "SELECT id FROM repos WHERE repo_slug = 'owner-dense'"
         ).fetchone()[0]
+        seeded_db.execute(
+            "INSERT INTO collection_definitions (domain, name) VALUES (?, ?) "
+            " ON CONFLICT DO NOTHING",
+            ("rag", "dense retrieval"),
+        )
+        seeded_db.execute(
+            "INSERT INTO collections "
+            " (target_kind, target_id, domain, collection, is_primary) "
+            " VALUES ('repo', ?, 'rag', 'dense retrieval', 1)",
+            (other_repo_id,),
+        )
         seeded_db.execute(
             "INSERT INTO topics (target_kind, target_id, domain, topic) "
             "VALUES ('repo', ?, 'rag', 'dense embeddings')",
@@ -2072,7 +2096,7 @@ class TestModeBrowse:
         # Re-use the existing collection name "misc" (only registered under
         # the 'other' domain by the fixture) and also create it under 'rag'.
         seeded_db.execute(
-            "INSERT OR IGNORE INTO collections (domain, name, description) "
+            "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
             "VALUES ('rag', 'misc', NULL)"
         )
         rag_misc_id = _insert_paper(
@@ -2555,7 +2579,7 @@ def _seed_collection_row(
     # UPSERT so an explicit description here overrides any prior NULL row
     # left by _insert_paper's auto-seed of (domain, name).
     conn.execute(
-        "INSERT INTO collections (domain, name, description) VALUES (?, ?, ?) "
+        "INSERT INTO collection_definitions (domain, name, description) VALUES (?, ?, ?) "
         "ON CONFLICT(domain, name) DO UPDATE SET description = excluded.description",
         (domain, name, description),
     )

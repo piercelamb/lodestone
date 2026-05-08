@@ -75,7 +75,7 @@ def patched(conn):
             "INSERT OR IGNORE INTO domains (name) VALUES ('rag')"
         )
         c.execute(
-            "INSERT OR IGNORE INTO collections (domain, name) VALUES ('rag', 'tools')"
+            "INSERT OR IGNORE INTO collection_definitions (domain, name) VALUES ('rag', 'tools')"
         )
         c.execute(
             "UPDATE repos SET status = ?, domain = ?, collection = ? "

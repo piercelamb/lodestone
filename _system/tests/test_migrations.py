@@ -10,8 +10,8 @@ from _system.db.migrations import init_db
 
 EXPECTED_TABLES = {
     "domains",
+    "collection_definitions",
     "collections",
-    "paper_collections",
     "papers",
     "repos",
     "figures",
@@ -25,7 +25,6 @@ EXPECTED_TABLES = {
     "code_files",
     "readmes_fts",
     "posts",
-    "post_collections",
     "post_references",
 }
 
@@ -48,7 +47,7 @@ def _user_tables(conn: sqlite3.Connection) -> set[str]:
 
 # Plain (non-virtual) tables — support row-count queries directly.
 _PLAIN_TABLES = {
-    "domains", "collections", "paper_collections", "papers", "repos", "figures",
+    "domains", "collection_definitions", "collections", "papers", "repos", "figures",
     "paper_references",
     "canonical_terms", "term_aliases", "topics",
     "code_files",
@@ -338,13 +337,12 @@ def test_init_db_migrates_pr20_shape_to_synonym_index(tmp_path):
         conn.close()
 
 
-def test_init_db_backfills_collections_from_legacy_papers(conn):
-    """Papers predating the `collections` table must be registered by `init_db`.
+def test_init_db_backfills_collection_definitions_from_legacy_papers(conn):
+    """Papers predating the `collection_definitions` table must be registered by `init_db`.
 
     Simulates an old database: a paper already has a (domain, collection)
-    pair but no row in `collections`. `init_db` runs its one-shot backfill
-    (``INSERT OR IGNORE INTO collections SELECT DISTINCT ...``) and the
-    pair should appear.
+    pair but no row in `collection_definitions`. `init_db` runs its
+    one-shot backfill and the pair should appear.
     """
     conn.execute(
         "INSERT OR IGNORE INTO domains (name) VALUES (?)", ("rag",)
@@ -357,14 +355,15 @@ def test_init_db_backfills_collections_from_legacy_papers(conn):
          "rag", "hierarchical indexing", "h", "http://x",
          "2026-04-20T00:00:00", "classified"),
     )
-    # Drop the backfilled row the fixture already created (if any) to prove
-    # init_db is what puts it back.
+    # Drop the backfilled rows the fixture already created (if any) to prove
+    # init_db is what puts them back.
+    conn.execute("DELETE FROM collection_definitions")
     conn.execute("DELETE FROM collections")
 
     init_db(conn)
 
     row = conn.execute(
-        "SELECT domain, name, description FROM collections "
+        "SELECT domain, name, description FROM collection_definitions "
         " WHERE domain = ? AND name = ?",
         ("rag", "hierarchical indexing"),
     ).fetchone()
@@ -372,18 +371,19 @@ def test_init_db_backfills_collections_from_legacy_papers(conn):
     assert row[2] is None  # legacy rows land with NULL description
 
 
-def test_init_db_backfills_paper_collections_from_legacy_papers(conn):
-    """Papers predating the `paper_collections` join table must be
-    promoted by `init_db`'s one-shot backfill into a primary row.
+def test_init_db_backfills_collections_from_legacy_sources(conn):
+    """Papers / posts / repos predating the polymorphic `collections`
+    junction must be promoted by `init_db`'s one-shot backfill into a
+    primary row per source kind.
 
     Idempotent: re-running `init_db` is a no-op against the PK
-    ``(paper_id, collection)``.
+    ``(target_kind, target_id, collection)``.
     """
     conn.execute(
         "INSERT OR IGNORE INTO domains (name) VALUES (?)", ("rag",)
     )
     conn.execute(
-        "INSERT OR IGNORE INTO collections (domain, name) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO collection_definitions (domain, name) VALUES (?, ?)",
         ("rag", "hierarchical indexing"),
     )
     conn.execute(
@@ -394,59 +394,103 @@ def test_init_db_backfills_paper_collections_from_legacy_papers(conn):
          "rag", "hierarchical indexing", "h", "http://x",
          "2026-04-20T00:00:00", "classified"),
     )
-    # Drop any backfilled row the conn fixture / prior init_db may have
-    # created so we observe init_db re-creating it.
-    conn.execute("DELETE FROM paper_collections")
+    conn.execute(
+        "INSERT INTO posts (post_name, source_url, canonical_url, title, date, "
+        "abstract, domain, collection, content_hash, ingested_at, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("legacy_post", "http://example.com/legacy", "http://example.com/legacy",
+         "t", "2026-04-20", "a", "rag", "hierarchical indexing", "h",
+         "2026-04-20T00:00:00", "classified"),
+    )
+    conn.execute(
+        "INSERT INTO repos (repo_slug, url, host, owner, name, ingested_at, "
+        "domain, collection, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("gh-x-y", "https://github.com/x/y", "github.com", "x", "y",
+         "2026-04-20T00:00:00", "rag", "hierarchical indexing", "classified"),
+    )
+    # Drop any backfilled rows the conn fixture / prior init_db may have
+    # created so we observe init_db re-creating them.
+    conn.execute("DELETE FROM collections")
 
     init_db(conn)
 
     rows = conn.execute(
-        "SELECT domain, collection, is_primary FROM paper_collections "
-        " WHERE paper_id = (SELECT id FROM papers WHERE paper_name = ?)",
-        ("legacy_paper",),
+        "SELECT target_kind, domain, collection, is_primary FROM collections "
+        " ORDER BY target_kind"
     ).fetchall()
-    assert rows == [("rag", "hierarchical indexing", 1)]
+    assert rows == [
+        ("paper", "rag", "hierarchical indexing", 1),
+        ("post",  "rag", "hierarchical indexing", 1),
+        ("repo",  "rag", "hierarchical indexing", 1),
+    ]
 
     # Idempotent — second init_db run does not duplicate.
     init_db(conn)
-    rows2 = conn.execute(
-        "SELECT COUNT(*) FROM paper_collections "
-        " WHERE paper_id = (SELECT id FROM papers WHERE paper_name = ?)",
-        ("legacy_paper",),
-    ).fetchone()
-    assert rows2[0] == 1
+    rows2 = conn.execute("SELECT COUNT(*) FROM collections").fetchone()
+    assert rows2[0] == 3
 
 
-def test_paper_collections_intra_domain_trigger_blocks_mismatch(conn):
-    """Inserting a paper_collections row whose `domain` doesn't match the
-    parent paper's `papers.domain` must raise on the trigger."""
+@pytest.mark.parametrize(
+    "kind,parent_table,parent_cols,parent_values",
+    [
+        (
+            "paper",
+            "papers",
+            "arxiv_id, paper_name, title, authors, date, abstract, "
+            "domain, collection, content_hash, pdf_url, ingested_at, status",
+            ("2402.99001", "p_intra", "t", "[]", "2026-01-01", "a",
+             "rag", "hybrid search", "h", "http://x", "2026-01-01T00:00:00", "fetched"),
+        ),
+        (
+            "post",
+            "posts",
+            "post_name, source_url, canonical_url, title, date, abstract, "
+            "domain, collection, content_hash, ingested_at, status",
+            ("p_post_intra", "http://e.com/p", "http://e.com/p", "t",
+             "2026-01-01", "a", "rag", "hybrid search", "h",
+             "2026-01-01T00:00:00", "fetched"),
+        ),
+        (
+            "repo",
+            "repos",
+            "repo_slug, url, host, owner, name, ingested_at, domain, collection, status",
+            ("gh-i-r", "https://github.com/i/r", "github.com", "i", "r",
+             "2026-01-01T00:00:00", "rag", "hybrid search", "repo_fetched"),
+        ),
+    ],
+)
+def test_collections_intra_domain_trigger_blocks_mismatch(
+    conn, kind, parent_table, parent_cols, parent_values,
+):
+    """Inserting a polymorphic ``collections`` row whose ``domain``
+    doesn't match the parent's ``domain`` must raise on the trigger.
+    All three CASE arms (paper / post / repo) are covered."""
     init_db(conn)
     conn.execute("INSERT OR IGNORE INTO domains (name) VALUES (?)", ("rag",))
     conn.execute("INSERT OR IGNORE INTO domains (name) VALUES (?)", ("nlp",))
     conn.execute(
-        "INSERT OR IGNORE INTO collections (domain, name) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO collection_definitions (domain, name) VALUES (?, ?)",
         ("nlp", "transformers"),
     )
+    placeholders = ", ".join("?" for _ in parent_values)
     conn.execute(
-        "INSERT INTO papers (arxiv_id, paper_name, title, authors, date, abstract, "
-        " domain, collection, content_hash, pdf_url, ingested_at, status) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        ("2402.99001", "p_intra", "t", "[]", "2026-01-01", "a",
-         "rag", "hybrid search", "h", "http://x", "2026-01-01T00:00:00", "fetched"),
+        f"INSERT INTO {parent_table} ({parent_cols}) VALUES ({placeholders})",
+        parent_values,
     )
     conn.execute(
-        "INSERT OR IGNORE INTO collections (domain, name) VALUES (?, ?)",
+        "INSERT OR IGNORE INTO collection_definitions (domain, name) VALUES (?, ?)",
         ("rag", "hybrid search"),
     )
-    paper_id = conn.execute(
-        "SELECT id FROM papers WHERE paper_name = 'p_intra'"
+    target_id = conn.execute(
+        f"SELECT id FROM {parent_table} ORDER BY id DESC LIMIT 1"
     ).fetchone()[0]
 
     with pytest.raises(sqlite3.IntegrityError) as exc_info:
         conn.execute(
-            "INSERT INTO paper_collections (paper_id, domain, collection, is_primary) "
-            "VALUES (?, ?, ?, 1)",
-            (paper_id, "nlp", "transformers"),
+            "INSERT INTO collections (target_kind, target_id, domain, collection, is_primary) "
+            "VALUES (?, ?, ?, ?, 1)",
+            (kind, target_id, "nlp", "transformers"),
         )
     assert "intra_domain" in str(exc_info.value) or "domain must match" in str(exc_info.value)
 
@@ -681,7 +725,7 @@ def test_invariant_classified_paper_requires_domain_and_collection_on_insert(con
     must be rejected by the schema-level trigger."""
     conn.execute("INSERT OR IGNORE INTO domains (name) VALUES ('rag')")
     conn.execute(
-        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
         "VALUES ('rag', 'hier', NULL)"
     )
 
@@ -751,7 +795,7 @@ def test_invariant_update_to_classified_without_domain_collection_rejected(conn)
 
     # Setting both succeeds.
     conn.execute(
-        "INSERT OR IGNORE INTO collections (domain, name, description) "
+        "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
         "VALUES ('rag', 'hier', NULL)"
     )
     conn.execute(
