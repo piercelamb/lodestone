@@ -19,30 +19,29 @@ Caller owns the enclosing transaction.
 from __future__ import annotations
 
 import sqlite3
-from typing import Literal
+
+from _system.utils.source_resolution import SourceKind
 
 
 def resolve_arxiv_citations(
     conn: sqlite3.Connection,
     *,
-    kind: Literal["paper", "post"],
+    kind: SourceKind,
     source_id: int,
     source_arxiv_id: str | None,
 ) -> tuple[int, int]:
     """Run forward + backward arxiv-citation resolution.
 
     Returns ``(forward_resolved, backward_resolved)``. ``backward_resolved``
-    is always 0 for ``kind='post'`` since posts can't be citation targets.
+    is always 0 for posts since posts can't be citation targets.
     """
-    if kind == "paper":
+    if kind is SourceKind.PAPER:
         forward_resolved = _forward_resolve_paper(conn, paper_id=source_id)
-    elif kind == "post":
-        forward_resolved = _forward_resolve_post(conn, post_id=source_id)
     else:
-        raise ValueError(f"unknown kind={kind!r}; must be 'paper' or 'post'")
+        forward_resolved = _forward_resolve_post(conn, post_id=source_id)
 
     backward_resolved = 0
-    if kind == "paper" and source_arxiv_id is not None:
+    if kind is SourceKind.PAPER and source_arxiv_id is not None:
         backward_resolved = _backward_resolve_for_paper(
             conn, paper_id=source_id, arxiv_id=source_arxiv_id,
         )

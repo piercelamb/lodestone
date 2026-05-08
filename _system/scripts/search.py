@@ -2527,27 +2527,22 @@ def _resolve_repo_target(
         return int(row[0]), row[1], row[2]
 
     assert paper_name is not None
-    paper_row = conn.execute(
-        "SELECT id FROM papers WHERE paper_name = ?", (paper_name,),
-    ).fetchone()
-    if paper_row is None:
-        # Slug may be a post — posts have no linked repo in v1, so
-        # surface that as a soft no_repo status rather than raising.
-        post_row = conn.execute(
-            "SELECT id FROM posts WHERE post_name = ?", (paper_name,),
-        ).fetchone()
-        if post_row is not None:
-            return {
-                "mode": "repo_tree",
-                "status": "no_repo",
-                "paper_name": paper_name,
-                "hint": (
-                    f"slug {paper_name!r} resolves to a post; post→repo "
-                    "linkage is not implemented in v1."
-                ),
-            }
+    resolved = lookup_slug(conn, paper_name)
+    if resolved is None:
         raise ValueError(f"paper not found: paper_name={paper_name!r}")
-    paper_id = paper_row[0]
+    if resolved.kind is SourceKind.POST:
+        # Posts have no linked repo in v1, so surface that as a soft
+        # no_repo status rather than raising.
+        return {
+            "mode": "repo_tree",
+            "status": "no_repo",
+            "paper_name": paper_name,
+            "hint": (
+                f"slug {paper_name!r} resolves to a post; post→repo "
+                "linkage is not implemented in v1."
+            ),
+        }
+    paper_id = resolved.id
     repo_row = conn.execute(
         "SELECT id, repo_slug FROM repos WHERE paper_id = ?", (paper_id,),
     ).fetchone()
@@ -2761,21 +2756,15 @@ def _lookup_paper_id(conn: sqlite3.Connection, paper: str) -> int:
     ``planning/blog-posts.md`` for the v2 plan).
     """
     _assert_safe_paper_name(paper)
-    prow = conn.execute(
-        "SELECT id FROM papers WHERE paper_name = ?", (paper,)
-    ).fetchone()
-    if prow is not None:
-        return prow[0]
-    # Fall through to posts to give a more useful error.
-    post_row = conn.execute(
-        "SELECT id FROM posts WHERE post_name = ?", (paper,)
-    ).fetchone()
-    if post_row is not None:
+    resolved = lookup_slug(conn, paper)
+    if resolved is None:
+        raise ValueError(f"paper not found: paper_name={paper!r}")
+    if resolved.kind is SourceKind.POST:
         raise ValueError(
             f"figures unavailable for posts: slug={paper!r} resolves to a "
             "post, but blog-post figure extraction is not implemented in v1"
         )
-    raise ValueError(f"paper not found: paper_name={paper!r}")
+    return resolved.id
 
 
 def _write_blob_tempfile(image: bytes, *, prefix: str, suffix: str = ".png") -> str:

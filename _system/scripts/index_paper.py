@@ -56,7 +56,11 @@ from _system.schemas.paper_metadata import PaperStatus, can_run_from as paper_ca
 from _system.schemas.post_metadata import PostStatus, can_run_from as post_can_run_from
 from _system.utils.logging import get_logger
 from _system.utils.sections import split_sections
-from _system.utils.source_resolution import SourceKind, resolve_slug
+from _system.utils.source_resolution import (
+    SlugNotFound,
+    SourceKind,
+    resolve_slug,
+)
 
 _LOG = get_logger("scripts.index_paper")
 
@@ -121,23 +125,23 @@ def index_one(
     """
     try:
         resolved = resolve_slug(conn, paper_name)
-    except Exception as exc:
+    except SlugNotFound as exc:
         raise PaperNotFound(
             f"slug={paper_name!r} not found in papers or posts"
         ) from exc
     kind = resolved.kind
+    source_id = resolved.id
     target_table = "papers" if kind is SourceKind.PAPER else "posts"
     name_col = "paper_name" if kind is SourceKind.PAPER else "post_name"
     row = conn.execute(
         f"SELECT domain, markdown, status FROM {target_table} WHERE id = ?",
-        (resolved.id,),
+        (source_id,),
     ).fetchone()
     if row is None:
         raise PaperNotFound(
-            f"slug={paper_name!r} resolved to id={resolved.id} but row vanished"
+            f"slug={paper_name!r} resolved to id={source_id} but row vanished"
         )
     domain, markdown, status_str = row
-    paper_id = resolved.id
 
     if kind is SourceKind.PAPER:
         try:
@@ -185,7 +189,7 @@ def index_one(
         if markdown:
             new_section_count = _insert_sections_for_paper(
                 conn,
-                paper_id=paper_id,
+                paper_id=source_id,
                 domain=domain,
                 paper_name=paper_name,
                 markdown=markdown,
@@ -194,9 +198,9 @@ def index_one(
         touched = _touched_term_ids(conn, slug=paper_name)
         if not touched:
             _LOG.debug(
-                "paper_id=%s paper_name=%s: no touched canonical terms "
+                "source_id=%s paper_name=%s: no touched canonical terms "
                 "(no entities, topics, or collection canonical)",
-                paper_id, paper_name,
+                source_id, paper_name,
             )
         _rebuild_terms_fts(conn, _fetch_canonical_rows(conn, touched))
 
@@ -211,8 +215,8 @@ def index_one(
         )
 
     _LOG.info(
-        "indexed paper_id=%s paper_name=%s sections=%d terms_fts_touched=%d",
-        paper_id, paper_name, new_section_count, len(touched),
+        "indexed source_id=%s paper_name=%s sections=%d terms_fts_touched=%d",
+        source_id, paper_name, new_section_count, len(touched),
     )
     return IndexResult(
         paper_name=paper_name,

@@ -32,15 +32,18 @@ import trafilatura
 
 from _system.db.connection import get_conn, transaction
 from _system.schemas.post_metadata import PostStatus, can_run_from
-from _system.utils.arxiv_urls import extract_arxiv_id_from_text
+from _system.utils.arxiv_urls import (
+    extract_arxiv_id_from_text,
+    iter_arxiv_id_matches,
+)
 from _system.utils.citation_resolution import resolve_arxiv_citations
+from _system.utils.source_resolution import SourceKind
 from _system.utils.logging import get_logger
 
 _LOG = get_logger("scripts.convert_post")
 
 _MIN_USEFUL_MARKDOWN_CHARS = 200
 _REFERENCE_CONTEXT_CHARS = 240
-_HREF_XPATH = "//a/@href"
 
 
 class PostNotFound(Exception):
@@ -163,7 +166,7 @@ def convert(
 
         forward_resolved, _ = resolve_arxiv_citations(
             conn,
-            kind="post",
+            kind=SourceKind.POST,
             source_id=post_id,
             source_arxiv_id=None,
         )
@@ -203,26 +206,22 @@ def _extract_arxiv_references(
     seen: set[str] = set()
     refs: list[_PostReference] = []
 
-    if markdown:
-        for match in re.finditer(
-            r"(?i)(arxiv|ar5iv)", markdown,
-        ):
-            window_start = max(0, match.start() - 40)
-            window_end = min(len(markdown), match.end() + 200)
-            window = markdown[window_start:window_end]
-            arxiv_id = extract_arxiv_id_from_text(window)
-            if arxiv_id and arxiv_id not in seen:
-                seen.add(arxiv_id)
-                refs.append(_PostReference(
-                    cited_arxiv_id=arxiv_id,
-                    raw_text=_trim_context(window),
-                ))
+    for arxiv_id, match in iter_arxiv_id_matches(markdown):
+        if arxiv_id in seen:
+            continue
+        seen.add(arxiv_id)
+        window_start = max(0, match.start() - 40)
+        window_end = min(len(markdown), match.end() + 200)
+        refs.append(_PostReference(
+            cited_arxiv_id=arxiv_id,
+            raw_text=_trim_context(markdown[window_start:window_end]),
+        ))
 
     try:
         tree = lxml.html.fromstring(raw_html)
     except (lxml.etree.ParserError, ValueError):
         return refs
-    for href in tree.xpath(_HREF_XPATH):
+    for href in tree.xpath("//a/@href"):
         if not isinstance(href, str):
             continue
         arxiv_id = extract_arxiv_id_from_text(href)

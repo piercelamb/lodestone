@@ -62,7 +62,11 @@ from _system.scripts.taxonomy_tree import (
 )
 from _system.utils.logging import get_logger
 from _system.utils.slug import sanitize_domain
-from _system.utils.source_resolution import SourceKind, resolve_slug
+from _system.utils.source_resolution import (
+    SlugNotFound,
+    SourceKind,
+    resolve_slug,
+)
 
 _LOG = get_logger("scripts.classify_paper")
 
@@ -135,34 +139,25 @@ def classify(
     """
     del force  # see docstring on orchestrator parity
 
-    # Slug-namespace dispatch: paper_name may name a posts row instead.
-    # Status / table identity branches off `kind`; downstream logic
-    # (taxonomy load, LLM call, collection resolve) is identical.
     try:
         resolved = resolve_slug(conn, paper_name)
-    except Exception as exc:
+    except SlugNotFound as exc:
         raise ClassifyPaperNotFound(
             f"slug={paper_name!r} not found in papers or posts"
         ) from exc
     kind = resolved.kind
-    row_id = resolved.id
+    source_id = resolved.id
 
-    if kind is SourceKind.PAPER:
-        row = conn.execute(
-            "SELECT status, abstract, markdown FROM papers WHERE id = ?",
-            (row_id,),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT status, abstract, markdown FROM posts WHERE id = ?",
-            (row_id,),
-        ).fetchone()
+    table = "papers" if kind is SourceKind.PAPER else "posts"
+    row = conn.execute(
+        f"SELECT status, abstract, markdown FROM {table} WHERE id = ?",
+        (source_id,),
+    ).fetchone()
     if row is None:
         raise ClassifyPaperNotFound(
-            f"slug={paper_name!r} resolved to id={row_id} but row vanished"
+            f"slug={paper_name!r} resolved to id={source_id} but row vanished"
         )
     status_str, abstract, markdown = row
-    paper_id = row_id  # legacy local name; actually a paper_id or post_id
 
     if kind is SourceKind.PAPER:
         try:
@@ -282,7 +277,7 @@ def classify(
 
         conn.execute(
             "DELETE FROM topics WHERE target_kind = ? AND target_id = ?",
-            (topic_target.value, paper_id),
+            (topic_target.value, source_id),
         )
 
         # Track every canonical this stage resolves so index_paper can
@@ -355,13 +350,13 @@ def classify(
                 primary_name,
                 int(decision.paper_needs_review or any_new_collection),
                 target_status.value,
-                paper_id,
+                source_id,
             ),
         )
 
         conn.execute(
             f"DELETE FROM {collections_table} WHERE {target_id_col} = ?",
-            (paper_id,),
+            (source_id,),
         )
         conn.executemany(
             f"""
@@ -370,7 +365,7 @@ def classify(
             VALUES (?, ?, ?, ?)
             """,
             [
-                (paper_id, decision.name, r.name, int(i == 0))
+                (source_id, decision.name, r.name, int(i == 0))
                 for i, r in enumerate(resolved)
             ],
         )
@@ -396,7 +391,7 @@ def classify(
                 VALUES (?, ?, ?, ?)
                 """,
                 (
-                    topic_target.value, paper_id,
+                    topic_target.value, source_id,
                     decision.name, topic_hit.canonical_name,
                 ),
             )
@@ -415,9 +410,9 @@ def classify(
 
     needs_review = bool(decision.paper_needs_review or any_new_collection)
     _LOG.info(
-        "classified paper_id=%s paper_name=%s domain=%s primary=%s "
+        "classified source_id=%s paper_name=%s domain=%s primary=%s "
         "secondaries=%d topics=%d needs_review=%s",
-        paper_id, paper_name, decision.name, primary_name,
+        source_id, paper_name, decision.name, primary_name,
         len(resolved) - 1, len(inserted_topic_names), needs_review,
     )
 

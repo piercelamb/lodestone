@@ -46,7 +46,11 @@ from _system.schemas.post_metadata import PostStatus, can_run_from as post_can_r
 from _system.utils.config import load_gliner_config
 from _system.utils.logging import get_logger
 from _system.utils.sections import split_sections, strip_breadcrumb, sub_chunk
-from _system.utils.source_resolution import SourceKind, resolve_slug
+from _system.utils.source_resolution import (
+    SlugNotFound,
+    SourceKind,
+    resolve_slug,
+)
 
 _LOG = get_logger("scripts.extract_entities")
 
@@ -262,22 +266,22 @@ def extract(
     """
     try:
         resolved = resolve_slug(conn, paper_name)
-    except Exception as exc:
+    except SlugNotFound as exc:
         raise PaperNotFound(
             f"slug={paper_name!r} not found in papers or posts"
         ) from exc
     kind = resolved.kind
+    source_id = resolved.id
     target_table = "papers" if kind is SourceKind.PAPER else "posts"
     row = conn.execute(
         f"SELECT domain, status, markdown FROM {target_table} WHERE id = ?",
-        (resolved.id,),
+        (source_id,),
     ).fetchone()
     if row is None:
         raise PaperNotFound(
-            f"slug={paper_name!r} resolved to id={resolved.id} but row vanished"
+            f"slug={paper_name!r} resolved to id={source_id} but row vanished"
         )
     domain, status_str, markdown = row
-    paper_id = resolved.id
 
     if markdown is None:
         raise MarkdownMissing(f"slug={paper_name!r}: markdown is NULL")
@@ -585,7 +589,7 @@ def extract(
                    status = ?
              WHERE id = ?
             """,
-            (entity_count, target_status_value, paper_id),
+            (entity_count, target_status_value, source_id),
         )
 
         # Make sure index_paper rebuilds terms_fts for every canonical we
@@ -613,8 +617,8 @@ def extract(
         )
 
     _LOG.info(
-        "extracted paper_id=%s paper_name=%s entity_count=%d",
-        paper_id, paper_name, entity_count,
+        "extracted source_id=%s paper_name=%s entity_count=%d",
+        source_id, paper_name, entity_count,
     )
 
     return ExtractResult(

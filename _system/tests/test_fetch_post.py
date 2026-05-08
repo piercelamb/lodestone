@@ -96,27 +96,23 @@ class TestFetchHappyPath:
         client1 = _client_returning(_LIL_HTML)
         first = fetch(conn=conn, url=url, client=client1)
 
-        # Second call hits the same handler — but with no `force`, we
-        # should NOT cascade or rewrite the row. We can verify that by
-        # using a client that would fail the network call (returns 500)
-        # and confirming we didn't make the call.
+        # Second call without --force: the source_url pre-check should
+        # short-circuit before any network call. A client that would
+        # raise on a request proves we never hit the wire.
         def explode(request: httpx.Request) -> httpx.Response:
             raise AssertionError("network should not be invoked for an existing post")
 
-        client2 = httpx.Client(
+        explode_client = httpx.Client(
             transport=httpx.MockTransport(explode),
             headers={"User-Agent": USER_AGENT},
             timeout=5.0,
             follow_redirects=True,
         )
-        # The early-skip happens AFTER fetch — so we still hit the network,
-        # the early skip is canonical-url-based. So our test should use
-        # success on the second call too, but verify the row is unchanged.
-        client2.close()
-        client3 = _client_returning(_LIL_HTML)
-        second = fetch(conn=conn, url=url, client=client3)
+        try:
+            second = fetch(conn=conn, url=url, client=explode_client)
+        finally:
+            explode_client.close()
         assert second.post_name == first.post_name
-        # ingested_at should be preserved
         rows = conn.execute(
             "SELECT COUNT(*) FROM posts WHERE canonical_url = ?", (url,)
         ).fetchone()

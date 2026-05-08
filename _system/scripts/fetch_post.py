@@ -183,17 +183,49 @@ def _extract_metadata(
     )
 
 
-def _get_existing_post_by_url(
-    conn: sqlite3.Connection, canonical_url: str,
-) -> tuple[int, str, str, str | None] | None:
-    """Look up by canonical_url. Returns (id, post_name, status, ingested_at)."""
+_POST_FULL_COLS = (
+    "id, post_name, source_url, canonical_url, title, author, "
+    "site_name, date, abstract, domain, collection, status, "
+    "markdown, raw_html, content_hash, etag, last_modified, "
+    "needs_review, ingested_at"
+)
+
+
+def _row_to_post(row: tuple) -> tuple[int, PostMetadata]:
+    """Hydrate a posts row (cols match :data:`_POST_FULL_COLS`) into PostMetadata."""
+    return int(row[0]), PostMetadata(
+        post_name=row[1],
+        source_url=row[2],
+        canonical_url=row[3],
+        title=row[4],
+        author=row[5],
+        site_name=row[6],
+        date=row[7],
+        abstract=row[8],
+        domain=row[9],
+        collection=row[10],
+        status=row[11],
+        markdown=row[12],
+        raw_html=row[13],
+        content_hash=row[14],
+        etag=row[15],
+        last_modified=row[16],
+        needs_review=bool(row[17]),
+        ingested_at=row[18],
+    )
+
+
+def _load_post_by_url(
+    conn: sqlite3.Connection, *, column: str, value: str,
+) -> tuple[int, PostMetadata] | None:
+    """Look up by ``column`` (canonical_url or source_url) and hydrate."""
     row = conn.execute(
-        "SELECT id, post_name, status, ingested_at FROM posts WHERE canonical_url = ?",
-        (canonical_url,),
+        f"SELECT {_POST_FULL_COLS} FROM posts WHERE {column} = ?",
+        (value,),
     ).fetchone()
     if row is None:
         return None
-    return int(row[0]), row[1], row[2], row[3]
+    return _row_to_post(row)
 
 
 def _log_soft_dedup(
@@ -252,46 +284,42 @@ def _persist_post(
         return int(cursor.lastrowid)
 
 
-def _persist_failed_fetch(
-    conn: sqlite3.Connection,
-    *,
-    source_url: str,
-    canonical_url: str,
-    title: str,
-    date: str,
-    abstract: str,
-    existing_id: int | None,
+def _record_failed_fetch(
+    conn: sqlite3.Connection, source_url: str,
 ) -> PostMetadata:
     """Stub a posts row in FAILED_FETCH so search.py --needs-review surfaces it.
 
-    For unrecoverable network/4xx cases we still want a row so the user
-    can see the URL was tried. canonical_url falls back to source_url
-    when no body parsed (it's UNIQUE NOT NULL on posts).
+    For unrecoverable network/4xx/parse cases we still want a row so the
+    user can see the URL was tried. ``canonical_url`` falls back to
+    ``source_url`` when no body parsed (it's UNIQUE NOT NULL on posts).
     """
-    ingested_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    if existing_id is None:
+    existing = conn.execute(
+        "SELECT id, post_name, ingested_at FROM posts WHERE source_url = ?",
+        (source_url,),
+    ).fetchone()
+    now = datetime.now(timezone.utc)
+    if existing is None:
+        existing_id: int | None = None
         post_name = generate_post_name(
-            title or "post",
-            date,
-            canonical_url,
+            "post",
+            now.strftime("%Y-%m-%d"),
+            source_url,
             existing_slugs(conn),
         )
+        ingested_at = now.isoformat(timespec="seconds")
     else:
-        prev = conn.execute(
-            "SELECT post_name, ingested_at FROM posts WHERE id = ?",
-            (existing_id,),
-        ).fetchone()
-        post_name = prev[0]
-        ingested_at = prev[1] or ingested_at
+        existing_id = int(existing[0])
+        post_name = existing[1]
+        ingested_at = existing[2] or now.isoformat(timespec="seconds")
     pm = PostMetadata(
         post_name=post_name,
         source_url=source_url,
-        canonical_url=canonical_url,
-        title=title or "(unparseable)",
+        canonical_url=source_url,
+        title="(unparseable)",
         author=None,
         site_name=None,
-        date=date,
-        abstract=abstract or "(unparseable)",
+        date=now.strftime("%Y-%m-%d"),
+        abstract="(unparseable)",
         domain=None,
         collection=None,
         status=PostStatus.FAILED_FETCH,
@@ -324,98 +352,46 @@ def fetch(
     owns_client = client is None
     client = client or make_default_client()
     try:
-        # Cheap pre-check by source_url: if the user re-runs the exact
-        # same URL we already have, skip the network unless --force.
-        # canonical_url-based dedup happens after fetch (we don't know it
-        # yet at call time).
+        # Pre-check by source_url: if the user re-runs the exact same URL
+        # without --force, skip the network. canonical_url-based dedup
+        # still runs after fetch to catch the same post reached via a
+        # different source URL (with/without trailing slash, etc.).
+        if not force:
+            cached = _load_post_by_url(conn, column="source_url", value=url)
+            if cached is not None:
+                _LOG.info(
+                    "post %s already present (status=%s), skipping fetch",
+                    url, cached[1].status,
+                )
+                return cached[1]
+
         try:
             resp = _http_get(client, url)
         except httpx.HTTPError as exc:
             _LOG.warning("post fetch %s failed at network layer: %s", url, exc)
-            existing = conn.execute(
-                "SELECT id FROM posts WHERE source_url = ?", (url,),
-            ).fetchone()
-            return _persist_failed_fetch(
-                conn,
-                source_url=url,
-                canonical_url=url,
-                title="",
-                date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                abstract="",
-                existing_id=int(existing[0]) if existing else None,
-            )
+            return _record_failed_fetch(conn, url)
 
         if 400 <= resp.status_code < 500:
             _LOG.warning("post fetch %s returned %d, marking FAILED_FETCH",
                          url, resp.status_code)
-            existing = conn.execute(
-                "SELECT id FROM posts WHERE source_url = ?", (url,),
-            ).fetchone()
-            return _persist_failed_fetch(
-                conn,
-                source_url=url,
-                canonical_url=url,
-                title="",
-                date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                abstract="",
-                existing_id=int(existing[0]) if existing else None,
-            )
-        resp.raise_for_status()
+            return _record_failed_fetch(conn, url)
         html_body = resp.text
         post_redirect_url = str(resp.url)
 
         meta = _extract_metadata(html_body, post_redirect_url)
         if meta is None:
-            existing = conn.execute(
-                "SELECT id FROM posts WHERE source_url = ?", (url,),
-            ).fetchone()
-            return _persist_failed_fetch(
-                conn,
-                source_url=url,
-                canonical_url=url,
-                title="",
-                date=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-                abstract="",
-                existing_id=int(existing[0]) if existing else None,
-            )
+            return _record_failed_fetch(conn, url)
 
-        existing = _get_existing_post_by_url(conn, meta.canonical_url)
+        existing = _load_post_by_url(
+            conn, column="canonical_url", value=meta.canonical_url,
+        )
         if existing is not None and not force:
-            existing_id, existing_name, existing_status, existing_ingested = existing
+            existing_id, existing_pm = existing
             _LOG.info(
                 "post %s already present (status=%s), skipping fetch",
-                meta.canonical_url, existing_status,
+                meta.canonical_url, existing_pm.status,
             )
-            row = conn.execute(
-                """
-                SELECT post_name, source_url, canonical_url, title, author,
-                       site_name, date, abstract, domain, collection,
-                       status, markdown, raw_html, content_hash,
-                       etag, last_modified, needs_review, ingested_at
-                  FROM posts WHERE id = ?
-                """,
-                (existing_id,),
-            ).fetchone()
-            return PostMetadata(
-                post_name=row[0],
-                source_url=row[1],
-                canonical_url=row[2],
-                title=row[3],
-                author=row[4],
-                site_name=row[5],
-                date=row[6],
-                abstract=row[7],
-                domain=row[8],
-                collection=row[9],
-                status=row[10],
-                markdown=row[11],
-                raw_html=row[12],
-                content_hash=row[13],
-                etag=row[14],
-                last_modified=row[15],
-                needs_review=bool(row[16]),
-                ingested_at=row[17],
-            )
+            return existing_pm
 
         content_hash = hashlib.sha256(
             (meta.canonical_url + html_body).encode("utf-8")
@@ -428,14 +404,14 @@ def fetch(
         repo_hits = extract_repo_candidates(html_body)
         code_repo = repo_hits[0] if repo_hits else None
 
-        existing_id: int | None = None
         if existing is not None:
             existing_id = existing[0]
-            post_name = existing[1]
-            ingested_at = existing[3] or datetime.now(timezone.utc).isoformat(
-                timespec="seconds"
-            )
+            post_name = existing[1].post_name
+            ingested_at = existing[1].ingested_at or datetime.now(
+                timezone.utc
+            ).isoformat(timespec="seconds")
         else:
+            existing_id = None
             post_name = generate_post_name(
                 meta.title,
                 meta.date,

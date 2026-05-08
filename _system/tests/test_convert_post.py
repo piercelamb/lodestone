@@ -178,6 +178,7 @@ class TestBackwardResolution:
         # has SOMETHING to walk; here we go straight to a manual paper
         # row + invoke just the backward-resolve helper.
         from _system.utils.citation_resolution import resolve_arxiv_citations
+        from _system.utils.source_resolution import SourceKind
 
         cur = conn.execute(
             """
@@ -197,7 +198,7 @@ class TestBackwardResolution:
 
         forward, backward = resolve_arxiv_citations(
             conn,
-            kind="paper",
+            kind=SourceKind.PAPER,
             source_id=new_paper_id,
             source_arxiv_id="2305.10601",
         )

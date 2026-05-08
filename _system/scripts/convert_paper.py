@@ -16,6 +16,7 @@ from _system.latex import walker as latex_walker
 from _system.schemas.paper_metadata import HtmlSource, PaperStatus, can_run_from
 from _system.utils.arxiv_urls import base_url_for_source
 from _system.utils.citation_resolution import resolve_arxiv_citations
+from _system.utils.source_resolution import SourceKind
 from _system.utils.logging import get_logger
 
 _LOG = get_logger("scripts.convert_paper")
@@ -175,7 +176,7 @@ def convert(
         # the paper landed gets its cited_paper_id linked.
         forward_resolved, backward_resolved = resolve_arxiv_citations(
             conn,
-            kind="paper",
+            kind=SourceKind.PAPER,
             source_id=paper_id,
             source_arxiv_id=arxiv_id,
         )
