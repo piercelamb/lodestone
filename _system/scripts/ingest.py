@@ -136,9 +136,35 @@ def _force_delete_repo(conn: sqlite3.Connection, *, repo_id: int) -> None:
         delete_repo_cascade(conn, repo_id=repo_id)
 
 
+def _collection_rows(
+    conn: sqlite3.Connection, *, target_kind: str, target_id: int
+) -> list[dict]:
+    """List polymorphic collection rows for a target, primary first."""
+    rows = conn.execute(
+        "SELECT collection, is_primary FROM collections "
+        " WHERE target_kind = ? AND target_id = ? "
+        " ORDER BY is_primary DESC, collection",
+        (target_kind, target_id),
+    ).fetchall()
+    return [
+        {"collection": r[0], "is_primary": bool(r[1])} for r in rows
+    ]
+
+
+def _topic_count(
+    conn: sqlite3.Connection, *, target_kind: str, target_id: int
+) -> int:
+    return int(conn.execute(
+        "SELECT COUNT(*) FROM topics "
+        " WHERE target_kind = ? AND target_id = ?",
+        (target_kind, target_id),
+    ).fetchone()[0])
+
+
 def _summary_paper(conn: sqlite3.Connection, arxiv_id: str) -> dict:
     row = conn.execute(
-        "SELECT id, paper_name, status, needs_review, entity_count "
+        "SELECT id, paper_name, status, needs_review, entity_count, "
+        "       domain, collection "
         "  FROM papers WHERE arxiv_id = ?",
         (arxiv_id,),
     ).fetchone()
@@ -149,18 +175,32 @@ def _summary_paper(conn: sqlite3.Connection, arxiv_id: str) -> dict:
             "arxiv_id": arxiv_id,
             "status": None,
             "needs_review": False,
+            "domain": None,
+            "collection": None,
+            "collections": [],
             "section_count": 0,
             "entity_count": 0,
             "figure_count": 0,
+            "topic_count": 0,
             "repo": None,
         }
-    paper_id, paper_name, status, needs_review, entity_count = row
+    (
+        paper_id,
+        paper_name,
+        status,
+        needs_review,
+        entity_count,
+        domain,
+        collection,
+    ) = row
     section_count = conn.execute(
         "SELECT COUNT(*) FROM sections WHERE paper_name = ?", (paper_name,)
     ).fetchone()[0]
     figure_count = conn.execute(
         "SELECT COUNT(*) FROM figures WHERE paper_id = ?", (paper_id,)
     ).fetchone()[0]
+    collections = _collection_rows(conn, target_kind="paper", target_id=paper_id)
+    topic_count = _topic_count(conn, target_kind="paper", target_id=paper_id)
     repo_row = conn.execute(
         "SELECT repo_slug, url, status FROM repos WHERE paper_id = ?",
         (paper_id,),
@@ -178,16 +218,20 @@ def _summary_paper(conn: sqlite3.Connection, arxiv_id: str) -> dict:
         "arxiv_id": arxiv_id,
         "status": status,
         "needs_review": bool(needs_review),
+        "domain": domain,
+        "collection": collection,
+        "collections": collections,
         "section_count": section_count,
         "entity_count": entity_count or 0,
         "figure_count": figure_count,
+        "topic_count": topic_count,
         "repo": repo_envelope,
     }
 
 
 def _summary_repo(conn: sqlite3.Connection, repo_url: str) -> dict:
     row = conn.execute(
-        "SELECT repo_slug, url, status, domain, collection, "
+        "SELECT id, repo_slug, url, status, domain, collection, "
         "       file_count, has_readme, needs_review "
         "  FROM repos WHERE url = ?",
         (repo_url,),
@@ -200,20 +244,27 @@ def _summary_repo(conn: sqlite3.Connection, repo_url: str) -> dict:
             "status": None,
             "domain": None,
             "collection": None,
+            "collections": [],
             "file_count": 0,
             "has_readme": False,
             "needs_review": False,
+            "topic_count": 0,
         }
+    repo_id = int(row[0])
+    collections = _collection_rows(conn, target_kind="repo", target_id=repo_id)
+    topic_count = _topic_count(conn, target_kind="repo", target_id=repo_id)
     return {
         "kind": "repo",
-        "repo_slug": row[0],
-        "url": row[1],
-        "status": row[2],
-        "domain": row[3],
-        "collection": row[4],
-        "file_count": int(row[5] or 0),
-        "has_readme": bool(row[6]),
-        "needs_review": bool(row[7]),
+        "repo_slug": row[1],
+        "url": row[2],
+        "status": row[3],
+        "domain": row[4],
+        "collection": row[5],
+        "collections": collections,
+        "file_count": int(row[6] or 0),
+        "has_readme": bool(row[7]),
+        "needs_review": bool(row[8]),
+        "topic_count": topic_count,
     }
 
 
@@ -698,10 +749,15 @@ def _summary_post(conn: sqlite3.Connection, url: str) -> dict:
             "needs_review": False,
             "domain": None,
             "collection": None,
+            "collections": [],
             "section_count": 0,
             "entity_count": 0,
+            "topic_count": 0,
             "title": None,
         }
+    post_id = int(row[0])
+    collections = _collection_rows(conn, target_kind="post", target_id=post_id)
+    topic_count = _topic_count(conn, target_kind="post", target_id=post_id)
     return {
         "kind": "post",
         "post_name": row[1],
@@ -711,8 +767,10 @@ def _summary_post(conn: sqlite3.Connection, url: str) -> dict:
         "needs_review": bool(row[4]),
         "domain": row[5],
         "collection": row[6],
+        "collections": collections,
         "section_count": int(row[7] or 0),
         "entity_count": int(row[8] or 0),
+        "topic_count": topic_count,
         "title": row[9],
     }
 

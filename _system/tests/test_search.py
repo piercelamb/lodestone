@@ -2948,6 +2948,118 @@ def test_to_human_routes_overview_and_collection(seeded_db):
 
 
 # ===========================================================================
+# Ingest summary formatters
+# ===========================================================================
+
+
+def test_format_ingest_paper_renders_dense_summary():
+    payload = {
+        "kind": "paper",
+        "paper_name": "smith_2023",
+        "arxiv_id": "2301.12345",
+        "status": "indexed",
+        "needs_review": False,
+        "domain": "rag",
+        "collection": "hybrid",
+        "collections": [
+            {"collection": "hybrid", "is_primary": True},
+            {"collection": "graph", "is_primary": False},
+        ],
+        "section_count": 7,
+        "entity_count": 12,
+        "figure_count": 3,
+        "topic_count": 4,
+        "repo": {
+            "repo_slug": "smith/rag",
+            "url": "https://github.com/smith/rag",
+            "status": "fetched",
+        },
+    }
+    text = search_mod.format_ingest_paper(payload)
+    assert "# ingested paper: smith_2023" in text
+    assert "arxiv_id : 2301.12345" in text
+    assert "domain   : rag" in text
+    assert "collections:" in text
+    assert "- hybrid   (primary)" in text
+    assert "- graph" in text
+    assert "sections : 7" in text
+    assert "topics: 4" in text
+    assert "figures: 3" in text
+    assert "repo     : smith/rag" in text
+
+
+def test_format_ingest_paper_no_collections_or_repo():
+    payload = {
+        "kind": "paper",
+        "paper_name": "anon",
+        "arxiv_id": "2412.99999",
+        "status": "fetched",
+        "needs_review": False,
+        "domain": None,
+        "collection": None,
+        "collections": [],
+        "section_count": 0,
+        "entity_count": 0,
+        "figure_count": 0,
+        "topic_count": 0,
+        "repo": None,
+    }
+    text = search_mod.format_ingest_paper(payload)
+    assert "domain   : (unclassified)" in text
+    assert "collections: (none)" in text
+    assert "repo     :" not in text
+
+
+def test_format_ingest_repo_renders_dense_summary():
+    payload = {
+        "kind": "repo",
+        "repo_slug": "openai/example",
+        "url": "https://github.com/openai/example",
+        "status": "classified",
+        "domain": "rag",
+        "collection": "hybrid",
+        "collections": [{"collection": "hybrid", "is_primary": True}],
+        "file_count": 42,
+        "has_readme": True,
+        "needs_review": False,
+        "topic_count": 5,
+    }
+    text = search_mod.format_ingest_repo(payload)
+    assert "# ingested repo: openai/example" in text
+    assert "url      : https://github.com/openai/example" in text
+    assert "domain   : rag" in text
+    assert "- hybrid   (primary)" in text
+    assert "files    : 42" in text
+    assert "has_readme: True" in text
+    assert "topics: 5" in text
+
+
+def test_format_ingest_post_renders_dense_summary():
+    payload = {
+        "kind": "post",
+        "post_name": "lilianweng-rag-2024",
+        "url": "https://lilianweng.github.io/posts/2024-01-01-rag/",
+        "canonical_url": "https://lilianweng.github.io/posts/2024-01-01-rag/",
+        "status": "indexed",
+        "needs_review": False,
+        "domain": "retrieval",
+        "collection": "rag",
+        "collections": [{"collection": "rag", "is_primary": True}],
+        "section_count": 9,
+        "entity_count": 18,
+        "topic_count": 6,
+        "title": "RAG Patterns",
+    }
+    text = search_mod.format_ingest_post(payload)
+    assert "# ingested post: lilianweng-rag-2024" in text
+    assert "canonical_url : https://lilianweng.github.io" in text
+    assert "domain   : retrieval" in text
+    assert "- rag   (primary)" in text
+    assert "sections : 9" in text
+    assert "topics: 6" in text
+
+
+# ===========================================================================
 # Pagination footer rendering
 # ===========================================================================
 

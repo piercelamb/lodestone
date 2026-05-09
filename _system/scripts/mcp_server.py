@@ -42,6 +42,9 @@ from _system.scripts.search import (
     Scope,
     _SOFT_FAILURE_STATUSES,
     format_collection_text,
+    format_ingest_paper,
+    format_ingest_post,
+    format_ingest_repo,
     format_overview_tree,
     format_search_markdown,
     mode_bm25,
@@ -1351,6 +1354,7 @@ TOOLS: list[dict[str, Any]] = [
         "dispatch": _ingest_paper_dispatch,
         "attach": AttachMode.NONE,
         "accepts_progress": True,
+        "text_format": format_ingest_paper,
     },
     {
         "name": "ingest_repo",
@@ -1376,6 +1380,7 @@ TOOLS: list[dict[str, Any]] = [
         "dispatch": _ingest_repo_dispatch,
         "attach": AttachMode.NONE,
         "accepts_progress": True,
+        "text_format": format_ingest_repo,
     },
     {
         "name": "ingest_post",
@@ -1410,6 +1415,7 @@ TOOLS: list[dict[str, Any]] = [
         "dispatch": _ingest_post_dispatch,
         "attach": AttachMode.NONE,
         "accepts_progress": True,
+        "text_format": format_ingest_post,
     },
 ]
 
