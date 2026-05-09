@@ -1477,6 +1477,11 @@ class _ServerState:
         self.conn: sqlite3.Connection | None = None
         self.startup_error: str | None = None
         self.transport: Transport = Transport.STDIO
+        # Inode of ``db_path`` at open time. Compared against ``stat`` on
+        # each tools/call so a path-vs-inode divergence (file unlinked and
+        # recreated under us — see "ghost DB" footgun) is caught with a
+        # loud error instead of silently serving a stale view.
+        self.opened_inode: int | None = None
 
     def configure(self) -> None:
         """Resolve DB path and try to open. On failure, capture the error
@@ -1513,6 +1518,13 @@ class _ServerState:
                 self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self.conn = get_conn(self.db_path)
             init_db(self.conn)
+            try:
+                self.opened_inode = self.db_path.stat().st_ino
+            except OSError:
+                # Path resolution issues here are cosmetic — the conn is
+                # already bound. Leave opened_inode None so the per-call
+                # check is a no-op rather than a false alarm.
+                self.opened_inode = None
         except Exception as exc:  # noqa: BLE001
             self.startup_error = f"failed to open {self.db_path}: {exc!r}"
             _log("error", self.startup_error)
@@ -1522,6 +1534,7 @@ class _ServerState:
                 except sqlite3.Error:
                     pass
             self.conn = None
+            self.opened_inode = None
 
     def close(self) -> None:
         if self.conn is not None:
@@ -1530,6 +1543,43 @@ class _ServerState:
             except sqlite3.Error as exc:
                 _log("warning", f"sqlite close failed: {exc!r}")
             self.conn = None
+        self.opened_inode = None
+
+
+def _check_db_inode_pinned(state: _ServerState) -> str | None:
+    """Verify ``state.db_path`` still resolves to the inode we opened.
+
+    Catches the "ghost DB" footgun: another process unlinks the canonical
+    DB and recreates a fresh file at the same path while this server is
+    holding the original inode open. SQLite happily keeps writing to the
+    orphaned inode — clients get stale results, and the data dies with
+    this process. Cheap (`os.stat`), runs once per ``tools/call``.
+
+    Returns ``None`` when nothing is wrong (or the check is not
+    applicable — ``:memory:`` DBs, missing ``opened_inode``). Returns an
+    error message string when the path was replaced; the caller surfaces
+    it as a tool error so the user notices immediately.
+    """
+    if state.opened_inode is None or state.db_path is None:
+        return None
+    if str(state.db_path) == ":memory:":
+        return None
+    try:
+        current_inode = state.db_path.stat().st_ino
+    except OSError as exc:
+        return (
+            f"lodestone-mcp: db path {state.db_path} is no longer accessible "
+            f"({exc!r}); restart this MCP server."
+        )
+    if current_inode == state.opened_inode:
+        return None
+    return (
+        f"lodestone-mcp: db path {state.db_path} was replaced underneath "
+        f"this server (inode {state.opened_inode} -> {current_inode}). "
+        "Another process recreated the file, so writes here are landing in "
+        "an orphaned inode. Restart this MCP server (and any other "
+        "lodestone-mcp processes) to re-pin to the live file."
+    )
 
 
 def _handle_initialize(state: _ServerState, msg: dict) -> dict:
@@ -1598,6 +1648,10 @@ def _handle_tools_call(state: _ServerState, msg: dict) -> dict:
             "lodestone-mcp startup error: "
             f"{state.startup_error or 'sqlite connection unavailable'}",
         )
+
+    swap_err = _check_db_inode_pinned(state)
+    if swap_err is not None:
+        return _tool_error(msg_id, swap_err)
 
     meta = params.get("_meta") or {}
     progress_token = meta.get("progressToken")

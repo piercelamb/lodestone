@@ -55,6 +55,50 @@ uv run python -m _system.scripts.ingest --post https://example.com/some-blog-pos
 uv run python -m _system.scripts.ingest --repo https://github.com/owner/name
 ```
 
+## Developing on lodestone itself
+
+If you're hacking on this repo (not just using the installed plugin), keep
+your dev experiments out of the canonical database. There are two
+deliberately distinct setups, and **you should never have both active in
+the same Claude Code session**:
+
+| | Plugin (prod) | Project (dev) |
+|---|---|---|
+| Source | `/plugin install lodestone` | clone of this repo |
+| Server name in MCP | `lodestone` | `lodestone-dev` |
+| Tool prefix | `mcp__lodestone__*` | `mcp__lodestone-dev__*` |
+| DB path | `$HOME/.lodestone/lodestone.db` | `./lodestone.db` (repo-local) |
+| Code | last installed plugin version | live working tree |
+
+**Setup for dev work:**
+
+1. Clone the repo and `uv sync`.
+2. `cp .mcp.json.example .mcp.json` and replace `<REPO_ROOT>` with the
+   absolute path to your clone. (`.mcp.json` is gitignored — it carries
+   absolute paths and shouldn't be shared.)
+3. In Claude Code, open this workspace and **disable the `lodestone`
+   marketplace plugin for it** (`/plugin` → disable). Otherwise both
+   servers register at once: every tool call could land in either DB
+   depending on routing, and you'll get inconsistent state.
+4. Use `mcp__lodestone-dev__*` tools or `uv run python -m _system.scripts.ingest`
+   for everything in the dev workspace. They both write to
+   `./lodestone.db` only.
+5. Open a *different* terminal/workspace (e.g. `cd ~ && claude`) when you
+   want to query the prod DB; that workspace has the plugin enabled but
+   no `.mcp.json`, so `mcp__lodestone__*` is the only lodestone surface
+   and it always points at `~/.lodestone/lodestone.db`.
+
+**What protects you if you slip up:** the MCP server pins the DB inode at
+startup and re-checks it on every `tools/call`. If the file at the path
+ever gets unlinked-and-recreated under a running server (e.g. a script
+overwrites the canonical DB), the next call returns a loud error telling
+you to restart instead of silently writing to an orphaned inode.
+
+**Don't `export LODESTONE_DB=...` in your shell rc.** The plugin script
+explicitly unsets inherited values so it always points at the canonical
+path; an exported var only affects CLI invocations and the project
+server, where it would mask the explicit `.mcp.json` config.
+
 ## Manual setup (other MCP clients)
 
 If you're not on Claude Code — Claude Desktop, Cursor, Cline, Zed,

@@ -447,6 +447,98 @@ class TestProtocolValidation:
 
 
 # ===========================================================================
+# Inode pin guard — catches "file replaced under us" / ghost-DB bug
+# ===========================================================================
+
+
+class TestDbInodePinGuard:
+    """The ``opened_inode`` pin compares the inode we opened against the
+    inode the path resolves to right now. If they diverge, another process
+    swapped the file underneath this server (the "ghost DB" footgun) and
+    every write is landing on an orphaned inode.
+    """
+
+    def _build_state_at(self, db_path: Path) -> mcp_server._ServerState:
+        """Replicate the relevant bits of configure() against a real file
+        path so we can exercise the inode comparison.
+        """
+        from _system.db.connection import get_conn
+        from _system.db.migrations import init_db
+
+        state = mcp_server._ServerState()
+        state.db_path = db_path
+        state.conn = get_conn(db_path)
+        init_db(state.conn)
+        state.opened_inode = db_path.stat().st_ino
+        return state
+
+    def test_no_op_when_opened_inode_is_none(self, fig_db):
+        # _make_state leaves opened_inode=None and uses :memory: — the
+        # full existing test suite implicitly relies on this skipping the
+        # check, but make it explicit.
+        state = _make_state(fig_db)
+        assert state.opened_inode is None
+        assert mcp_server._check_db_inode_pinned(state) is None
+
+    def test_no_op_for_memory_db_even_with_inode_set(self, fig_db):
+        state = _make_state(fig_db)
+        state.opened_inode = 12345
+        assert mcp_server._check_db_inode_pinned(state) is None
+
+    def test_passes_when_inode_unchanged(self, tmp_path):
+        state = self._build_state_at(tmp_path / "lodestone.db")
+        try:
+            assert mcp_server._check_db_inode_pinned(state) is None
+            # Drive a tools/call to confirm the per-call hook doesn't
+            # spuriously flag a swap when nothing has moved. The tool
+            # itself may or may not error on an empty DB; we only care
+            # that no swap-detection text leaks through.
+            resp = _call(state, "overview", {})
+            content = _text_blocks(_content(resp))
+            for block in content:
+                assert "was replaced underneath" not in block["text"]
+                assert "no longer accessible" not in block["text"]
+        finally:
+            state.close()
+
+    def test_detects_replace(self, tmp_path):
+        db_path = tmp_path / "lodestone.db"
+        state = self._build_state_at(db_path)
+        try:
+            # Atomically replace the file at the path. ``state.conn`` keeps
+            # the original (now-orphaned) inode; the path resolves to the
+            # new one.
+            db_path.unlink()
+            replacement = tmp_path / "replacement.db"
+            replacement.write_bytes(b"")
+            os.replace(replacement, db_path)
+            assert db_path.stat().st_ino != state.opened_inode
+
+            err = mcp_server._check_db_inode_pinned(state)
+            assert err is not None
+            assert "was replaced underneath" in err
+
+            # And it surfaces through tools/call as a tool error.
+            resp = _call(state, "browse", {"which": "domains"})
+            assert _is_error(resp)
+            text = _text_blocks(_content(resp))[0]["text"]
+            assert "was replaced underneath" in text
+        finally:
+            state.close()
+
+    def test_detects_unlink_without_recreate(self, tmp_path):
+        db_path = tmp_path / "lodestone.db"
+        state = self._build_state_at(db_path)
+        try:
+            db_path.unlink()
+            err = mcp_server._check_db_inode_pinned(state)
+            assert err is not None
+            assert "no longer accessible" in err
+        finally:
+            state.close()
+
+
+# ===========================================================================
 # Tools list — schema integrity
 # ===========================================================================
 
