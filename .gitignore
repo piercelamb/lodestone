@@ -18,3 +18,8 @@ lodestone.db-*
 # Claude Code per-user state
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
+
+# Project-local MCP server config (user-specific absolute paths).
+# Use .mcp.json.example as the shared template; copy to .mcp.json
+# locally and edit. NOT shipped via the plugin marketplace install.
+.mcp.json
