@@ -235,6 +235,35 @@ class TestIndexOneBasics:
         assert n_sections == expected
         assert section_count_col == expected
 
+    def test_empty_body_parents_are_pruned(self, conn):
+        """A header whose body is just children (no own paragraphs)
+        produces a breadcrumb-only chunk; that chunk pollutes BM25 with
+        no unique content, so the indexer skips it."""
+        md = (
+            "# Title\n\n"
+            "## 6. Results\n\n"          # parent — no own body, only children
+            "### 6.1 Layout\n\nlayout body.\n\n"
+            "### 6.2 Tables\n\ntables body.\n"
+        )
+        _seed_domain(conn)
+        _seed_paper(conn, markdown=md)
+        index_one(paper_name="paper_name_2024", conn=conn)
+
+        rows = conn.execute(
+            "SELECT section_title, section_level FROM sections "
+            "WHERE paper_name = ? ORDER BY rowid",
+            ("paper_name_2024",),
+        ).fetchall()
+        titles = {t for t, _ in rows}
+        # Children present.
+        assert "6.1 Layout" in titles
+        assert "6.2 Tables" in titles
+        # Parent with no own body MUST NOT be present.
+        assert "6. Results" not in titles
+        # Title chunk is also empty (no preamble before first header)
+        # and gets pruned.
+        assert "Title" not in titles
+
     def test_reindex_same_paper_replaces_rather_than_appends(self, conn):
         md = "# A\n\ntext\n\n# B\n\nmore\n"
         _seed_domain(conn)

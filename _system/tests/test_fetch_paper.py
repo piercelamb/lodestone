@@ -216,31 +216,72 @@ def test_html_source_fallback_arxiv_404_ar5iv_200(conn, fast_sleep):
     assert pm.html_source == "ar5iv"
 
 
-def test_both_html_sources_fail_persists_failed_html_stub(conn, fast_sleep):
+def test_ar5iv_redirect_to_abs_treated_as_no_rendering(conn, fast_sleep):
+    """ar5iv 302s to arxiv.org/abs/{id} when no rendering exists; the listing
+    page must NOT be accepted as paper HTML — it would otherwise feed the
+    arxiv site chrome to the LaTeXML parser."""
+    arxiv_id = "2604.23644"
+    meta = _make_meta()
+
+    def handler(req):
+        host = req.url.host
+        path = req.url.path
+        if host == "arxiv.org" and path.startswith("/html"):
+            return httpx.Response(404)
+        if host == "ar5iv.labs.arxiv.org" and path.startswith("/html"):
+            return httpx.Response(
+                302, headers={"location": f"https://arxiv.org/abs/{arxiv_id}"}
+            )
+        if host == "arxiv.org" and path.startswith("/abs"):
+            return httpx.Response(
+                200,
+                content=b"<html><body>arxiv listing page chrome</body></html>",
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        return httpx.Response(404)
+
+    from _system.scripts.fetch_paper import IngestExtractionFailed
+
+    with _client_with(_Recorder(handler).handler) as client:
+        with pytest.raises(IngestExtractionFailed):
+            fetch(
+                conn=conn,
+                arxiv_id=arxiv_id,
+                client=client,
+                arxiv_lookup=lambda _id: meta,
+                latex_fallback=False,
+                pdf_fallback=False,
+            )
+
+    papers = conn.execute(
+        "SELECT COUNT(*) FROM papers WHERE arxiv_id = ?", (arxiv_id,)
+    ).fetchone()[0]
+    assert papers == 0
+
+
+def test_all_extraction_paths_fail_raises(conn, fast_sleep):
     arxiv_id = "2301.99999"
     meta = _make_meta()
 
     def handler(req):
-        url = str(req.url)
-        if "/html/" in url:
-            return httpx.Response(404)
         return httpx.Response(404)
 
+    from _system.scripts.fetch_paper import IngestExtractionFailed
+
     with _client_with(_Recorder(handler).handler) as client:
-        pm = fetch(
-            conn=conn,
-            arxiv_id=arxiv_id,
-            client=client,
-            arxiv_lookup=lambda _id: meta,
-        )
-    assert pm.status == "failed_html"
-    assert pm.raw_html is None
-    assert pm.html_source is None
+        with pytest.raises(IngestExtractionFailed):
+            fetch(
+                conn=conn,
+                arxiv_id=arxiv_id,
+                client=client,
+                arxiv_lookup=lambda _id: meta,
+            )
 
     figures = conn.execute("SELECT COUNT(*) FROM figures").fetchone()[0]
     papers = conn.execute("SELECT COUNT(*) FROM papers WHERE arxiv_id = ?", (arxiv_id,)).fetchone()[0]
     assert figures == 0
-    assert papers == 1
+    # No row is persisted on full extraction failure (replaces old failed_html stub).
+    assert papers == 0
 
 
 def test_raw_html_is_persisted_on_success(conn, fast_sleep):

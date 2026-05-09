@@ -1240,6 +1240,97 @@ class TestHttpTransport:
         assert code == 405
 
 
+def _http_post_sse(url: str, body: dict, timeout: float = 10.0) -> tuple[int, str, list[dict]]:
+    """POST one JSON-RPC message with ``Accept: text/event-stream``.
+
+    Returns (status_code, content_type, parsed-event-payloads).
+    Each SSE frame is decoded back to a dict.
+    """
+    import urllib.error
+    import urllib.request
+
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            code = resp.getcode()
+            ctype = resp.headers.get("Content-Type", "")
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.headers.get("Content-Type", ""), []
+
+    events: list[dict] = []
+    for chunk in raw.split("\n\n"):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        for line in chunk.splitlines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[len("data: "):]))
+    return code, ctype, events
+
+
+class TestHttpSse:
+    """``Accept: text/event-stream`` upgrades the response to SSE; in-flight
+    progress notifications and the final reply both arrive as ``data:``
+    frames on the same stream."""
+
+    def test_sse_upgrade_returns_event_stream_content_type(self, http_server):
+        # tools/list is a quick call; no progress notifications, but the
+        # final reply must arrive as an SSE frame, not application/json.
+        code, ctype, events = _http_post_sse(http_server, {
+            "jsonrpc": "2.0", "id": 1, "method": "tools/list",
+        })
+        assert code == 200
+        assert "text/event-stream" in ctype
+        assert len(events) == 1
+        assert events[0]["id"] == 1
+        assert "tools" in events[0]["result"]
+
+    def test_sse_search_call_returns_one_response_frame(self, http_server):
+        code, ctype, events = _http_post_sse(http_server, {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "search", "arguments": {"query": "tree"}},
+        })
+        assert code == 200
+        assert "text/event-stream" in ctype
+        # search emits no progress notifications, so we see exactly the response.
+        assert len(events) == 1
+        assert events[0]["id"] == 2
+        assert events[0]["result"].get("isError") in (False, None)
+
+    def test_plain_json_still_works_when_accept_unset(self, http_server):
+        # Existing plain-JSON behavior preserved when client doesn't ask
+        # for SSE — the test_tools_call_search_returns_text_block case
+        # already covers this; this assertion is the explicit sibling.
+        code, body = _http_post(http_server, {
+            "jsonrpc": "2.0", "id": 3, "method": "tools/list",
+        })
+        assert code == 200
+        assert body["id"] == 3
+        assert "tools" in body["result"]
+
+    def test_sse_dispatch_error_returns_error_frame(self, http_server):
+        # Unknown method surfaces as a JSON-RPC error inside the SSE frame
+        # rather than as a 5xx — the SSE channel must always wrap the
+        # protocol-level outcome in a frame.
+        code, ctype, events = _http_post_sse(http_server, {
+            "jsonrpc": "2.0", "id": 4, "method": "no/such/method",
+        })
+        assert code == 200
+        assert "text/event-stream" in ctype
+        assert len(events) == 1
+        assert events[0]["id"] == 4
+        assert "error" in events[0]
+
+
 # ===========================================================================
 # overview / collection MCP tools
 # ===========================================================================

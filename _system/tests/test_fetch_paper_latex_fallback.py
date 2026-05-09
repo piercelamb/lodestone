@@ -12,6 +12,7 @@ from _system.scripts import fetch_paper as fp
 from _system.scripts.fetch_paper import (
     LATEX_SENTINEL_PREFIX,
     USER_AGENT,
+    IngestExtractionFailed,
     _ArxivMetadata,
     fetch,
 )
@@ -102,8 +103,11 @@ def test_html_fail_then_eprint_succeeds(conn):
     assert rows[0][2] in {"image/jpeg", "image/png"}
 
 
-def test_eprint_pdf_only_falls_through_to_failed_html(conn):
+def test_eprint_pdf_only_falls_through_to_pdf_fallback(conn):
+    """When the e-print is a bare PDF (no .tex source), the PDF fallback
+    handles it. This used to fall through to failed_html."""
     arxiv_id = "2510.07999"
+    pdf_blob = (Path(__file__).parent / "fixtures" / "pdf" / "sample.pdf").read_bytes()
 
     def handler(req):
         url = str(req.url)
@@ -113,13 +117,20 @@ def test_eprint_pdf_only_falls_through_to_failed_html(conn):
             return httpx.Response(
                 200, content=b"%PDF-1.7", headers={"content-type": "application/pdf"}
             )
+        if "/pdf/" in url:
+            return httpx.Response(
+                200, content=pdf_blob,
+                headers={"content-type": "application/pdf"},
+            )
+        if "paperswithcode.com" in url:
+            return httpx.Response(404)
         return httpx.Response(404)
 
     with _client(handler) as c:
         pm = fetch(conn=conn, arxiv_id=arxiv_id, client=c, arxiv_lookup=lambda _: _meta())
 
-    assert pm.status == "failed_html"
-    assert pm.raw_html is None
+    assert pm.status == "fetched"
+    assert pm.html_source == "pdf_fallback"
 
 
 def test_latex_fallback_disabled_via_kwarg(conn):
@@ -130,20 +141,19 @@ def test_latex_fallback_disabled_via_kwarg(conn):
     def handler(req):
         url = str(req.url)
         captured_urls.append(url)
-        if "/html/" in url:
-            return httpx.Response(404)
         return httpx.Response(404)
 
     with _client(handler) as c:
-        pm = fetch(
-            conn=conn,
-            arxiv_id=arxiv_id,
-            client=c,
-            arxiv_lookup=lambda _: _meta(),
-            latex_fallback=False,
-        )
+        with pytest.raises(IngestExtractionFailed):
+            fetch(
+                conn=conn,
+                arxiv_id=arxiv_id,
+                client=c,
+                arxiv_lookup=lambda _: _meta(),
+                latex_fallback=False,
+                pdf_fallback=False,
+            )
 
-    assert pm.status == "failed_html"
     # When the fallback is disabled, no e-print URL should be hit.
     assert not any("/e-print/" in u for u in captured_urls)
 
@@ -151,19 +161,18 @@ def test_latex_fallback_disabled_via_kwarg(conn):
 def test_latex_fallback_disabled_via_env(monkeypatch, conn):
     arxiv_id = "2510.07001"
     monkeypatch.setenv("LODESTONE_LATEX_FALLBACK", "0")
+    monkeypatch.setenv("LODESTONE_PDF_FALLBACK", "0")
 
     captured: list[str] = []
 
     def handler(req):
         captured.append(str(req.url))
-        if "/html/" in str(req.url):
-            return httpx.Response(404)
         return httpx.Response(404)
 
     with _client(handler) as c:
-        pm = fetch(conn=conn, arxiv_id=arxiv_id, client=c, arxiv_lookup=lambda _: _meta())
+        with pytest.raises(IngestExtractionFailed):
+            fetch(conn=conn, arxiv_id=arxiv_id, client=c, arxiv_lookup=lambda _: _meta())
 
-    assert pm.status == "failed_html"
     assert not any("/e-print/" in u for u in captured)
 
 

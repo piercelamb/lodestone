@@ -32,7 +32,7 @@ from _system.utils.repo_url import RepoUrlParts, parse_repo_url, repo_slug_base
 
 _LOG = get_logger("scripts.resolve_repo")
 
-USER_AGENT = "Lodestone/1.0 (mailto:pierce.lamb@getwhys.io)"
+USER_AGENT = "Lodestone/1.0 (mailto:richard.pierce.lamb@gmail.com)"
 
 _GITHUB_API_REPO = "https://api.github.com/repos/{owner}/{name}"
 _GITHUB_TOKEN_ENV_VARS = ("GITHUB_TOKEN", "GH_TOKEN", "LODESTONE_GITHUB_TOKEN")
