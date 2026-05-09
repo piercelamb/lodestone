@@ -55,7 +55,7 @@ from _system.resolution.resolver import pending_fts_rebuilds
 from _system.schemas.paper_metadata import PaperStatus, can_run_from as paper_can_run_from
 from _system.schemas.post_metadata import PostStatus, can_run_from as post_can_run_from
 from _system.utils.logging import get_logger
-from _system.utils.sections import split_sections
+from _system.utils.sections import split_sections, strip_breadcrumb
 from _system.utils.source_resolution import (
     SlugNotFound,
     SourceKind,
@@ -239,11 +239,20 @@ def _insert_sections_for_paper(
     (``{breadcrumb}\\n\\n{raw_body}``), so we use it verbatim — prepending it
     again would duplicate the breadcrumb line and dilute BM25 scoring.
 
+    Empty-body chunks (parents whose paragraphs all live in their
+    children) are skipped: their breadcrumb-only row matches BM25
+    queries on the parent's title without offering any unique content.
+    Pruning here only affects the FTS5 ``sections`` table — the TOC
+    re-derives structure from ``papers.markdown`` at read time and is
+    unaffected, and ``find_hierarchical_section`` slices the source
+    markdown via ``start_offset`` rather than walking sections rows.
+
     Returns the number of section rows inserted.
     """
     rows = [
         (paper_id, domain, paper_name, chunk.title, str(chunk.level), chunk.body)
         for chunk in split_sections(markdown)
+        if strip_breadcrumb(chunk.body).strip()
     ]
     if rows:
         conn.executemany(
