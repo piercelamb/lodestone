@@ -31,10 +31,11 @@ import signal
 import sqlite3
 import sys
 import traceback
+from contextvars import ContextVar
 from enum import StrEnum
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
 
 from _system.db.connection import get_conn
 from _system.scripts.search import (
@@ -66,6 +67,7 @@ from _system.scripts.search import (
     mode_toc,
     mode_toc_many,
 )
+from _system.utils.http import reset_progress_hook, set_progress_hook
 from _system.utils.logging import get_logger
 
 _LOG = get_logger("scripts.mcp_server")
@@ -137,21 +139,20 @@ def _send(msg: dict) -> None:
     sys.stdout.flush()
 
 
-def _send_progress(token: Any, message: str, progress: int, total: int) -> None:
-    """Emit one ``notifications/progress`` message keyed off the client's token.
+# Per-request SSE frame writer. ``do_POST`` installs this for HTTP requests
+# whose ``Accept`` header includes ``text/event-stream``; cleared after the
+# request completes. While set, ``_send_progress`` emits frames into the
+# response stream instead of stdout.
+_SseWriter = Callable[[dict], None]
+_sse_writer: ContextVar[Optional[_SseWriter]] = ContextVar(
+    "lodestone_mcp_sse_writer", default=None,
+)
 
-    Stdio-only by construction — writes to the same stdout stream as the
-    response envelope. Callers under non-stdio transports must not invoke
-    this; ``_handle_tools_call`` substitutes a no-op callback in those
-    cases (see the Transport check there).
 
-    No-op when ``token`` is None — clients that don't request progress on
-    a tools/call simply receive nothing here, and the eventual result
-    envelope still arrives normally.
-    """
-    if token is None:
-        return
-    _send({
+def _build_progress_payload(
+    token: Any, message: str, progress: int, total: int,
+) -> dict:
+    return {
         "jsonrpc": "2.0",
         "method": "notifications/progress",
         "params": {
@@ -160,7 +161,35 @@ def _send_progress(token: Any, message: str, progress: int, total: int) -> None:
             "total": total,
             "message": message,
         },
-    })
+    }
+
+
+def _send_progress(token: Any, message: str, progress: int, total: int) -> None:
+    """Emit one ``notifications/progress`` message keyed off the client's token.
+
+    Routing:
+    - **stdio** transport: write to stdout alongside the response envelope.
+    - **http** transport with an SSE writer installed (``Accept: text/event-stream``):
+      emit as one SSE frame on the in-flight response.
+    - **http** transport without SSE (plain JSON client): no-op — there's no
+      out-of-band channel to deliver the notification, and the final response
+      will arrive normally.
+
+    No-op when ``token`` is None — clients that don't request progress on
+    a tools/call receive nothing here, and the eventual result envelope
+    still arrives normally.
+    """
+    if token is None:
+        return
+    payload = _build_progress_payload(token, message, progress, total)
+    sse = _sse_writer.get()
+    if sse is not None:
+        sse(payload)
+        return
+    # Falls through to stdout for stdio transport. HTTP-without-SSE has no
+    # writer installed and no stdout sink; the call lands here and is dropped,
+    # which matches the prior plain-JSON behavior.
+    _send(payload)
 
 
 def _log(level: str, s: str) -> None:
@@ -1575,15 +1604,31 @@ def _handle_tools_call(state: _ServerState, msg: dict) -> dict:
 
     try:
         if tool.get("accepts_progress"):
-            # Progress notifications are stdio-only: the HTTP transport has
-            # no out-of-band channel for them (would require SSE).
-            if state.transport is Transport.STDIO:
+            # Progress notifications need an out-of-band channel:
+            # - stdio transport always has one (stdout itself).
+            # - http transport has one only if the client opted into
+            #   ``Accept: text/event-stream`` and ``do_POST`` installed
+            #   an SSE writer in the contextvar.
+            # Plain-JSON HTTP clients get a no-op cb — there's nowhere
+            # to deliver progress until the final response.
+            has_progress_channel = (
+                state.transport is Transport.STDIO
+                or _sse_writer.get() is not None
+            )
+            if has_progress_channel:
                 def _progress_cb(message: str, p: int, total: int) -> None:
                     _send_progress(progress_token, message, p, total)
             else:
                 def _progress_cb(message: str, p: int, total: int) -> None:
                     return
-            payload = tool["dispatch"](state.conn, args, _progress_cb)
+            # Also surface HTTP retries (429 backoff, content-fetch
+            # transient blips) through the same channel via the
+            # contextvar hook in _system.utils.http. Cleared in finally.
+            hook_token = set_progress_hook(_progress_cb)
+            try:
+                payload = tool["dispatch"](state.conn, args, _progress_cb)
+            finally:
+                reset_progress_hook(hook_token)
         else:
             payload = tool["dispatch"](state.conn, args)
     except KeyError as exc:
@@ -1697,10 +1742,21 @@ def _run_stdio(state: _ServerState) -> int:
 
 
 def _run_http(state: _ServerState, host: str, port: int) -> int:
-    """Single-threaded HTTP transport. POST /mcp with one JSON-RPC message
-    per request; response carries the matching JSON-RPC reply (200) or 202
-    No Content for notifications. No SSE; progress notifications are
-    suppressed under this transport — see ``_send_progress``.
+    """Single-threaded HTTP transport.
+
+    ``POST /mcp`` carries one JSON-RPC message per request. The response
+    shape depends on the request's ``Accept`` header (per the MCP
+    Streamable HTTP spec):
+
+    - ``application/json`` (default): single 200 JSON response, or 202
+      No Content for JSON-RPC notifications. No progress notifications —
+      there's no channel to deliver them in plain-JSON mode.
+    - ``text/event-stream``: the response is an SSE stream. Each
+      ``notifications/progress`` emitted during dispatch becomes one
+      ``data: <json>\\n\\n`` frame; the final JSON-RPC reply is emitted
+      as the last frame, then the stream is closed. This is how
+      non-Claude-Code MCP clients (Cursor, Claude Desktop HTTP, etc.)
+      receive in-flight progress for long-running tools like ingest.
     """
 
     class Handler(BaseHTTPRequestHandler):
@@ -1719,6 +1775,11 @@ def _run_http(state: _ServerState, host: str, port: int) -> int:
                 self._json(400, _err(None, _ERR_INVALID_REQUEST,
                                      "request must be a JSON object"))
                 return
+
+            if self._client_accepts_sse():
+                self._handle_sse(msg)
+                return
+
             try:
                 resp = _dispatch(state, msg)
             except Exception as exc:  # noqa: BLE001
@@ -1737,11 +1798,19 @@ def _run_http(state: _ServerState, host: str, port: int) -> int:
             self._json(200, resp)
 
         def do_GET(self):  # noqa: N802 — stdlib API
-            # Spec-optional SSE channel; v1 has no use for it.
+            # Spec-optional SSE-on-GET channel for server-initiated
+            # streams; lodestone has no server-initiated traffic.
             self.send_error(405)
 
         def log_message(self, fmt: str, *args: Any) -> None:
             _log("debug", fmt % args)
+
+        def _client_accepts_sse(self) -> bool:
+            accept = self.headers.get("Accept", "") or ""
+            # Coarse but spec-compliant — clients that opt into SSE
+            # name the type explicitly; a bare ``*/*`` falls back to
+            # JSON to preserve backwards compat for older clients.
+            return "text/event-stream" in accept.lower()
 
         def _json(self, code: int, body: dict) -> None:
             data = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -1750,6 +1819,40 @@ def _run_http(state: _ServerState, host: str, port: int) -> int:
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+
+        def _handle_sse(self, msg: dict) -> None:
+            """Run dispatch, streaming progress notifications + the final
+            response as Server-Sent Events on the open response stream.
+            """
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+
+            def _write_frame(payload: dict) -> None:
+                try:
+                    data = json.dumps(payload, ensure_ascii=False)
+                    self.wfile.write(f"data: {data}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    # Client disconnected mid-stream. Nothing to do —
+                    # subsequent writes will also fail; we let the
+                    # dispatch finish (sqlite work is still useful).
+                    _log("info", "sse client disconnected mid-stream")
+
+            writer_token = _sse_writer.set(_write_frame)
+            try:
+                try:
+                    resp = _dispatch(state, msg)
+                except Exception as exc:  # noqa: BLE001
+                    _log("error", f"dispatch failed: {exc!r}")
+                    traceback.print_exc(file=sys.stderr)
+                    resp = _err(msg.get("id"), _ERR_INTERNAL, repr(exc))
+                if resp is not None:
+                    _write_frame(resp)
+            finally:
+                _sse_writer.reset(writer_token)
 
     srv = HTTPServer((host, port), Handler)
     _log("info", f"listening on http://{host}:{port}/mcp")

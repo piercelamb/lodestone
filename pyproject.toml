@@ -23,6 +23,7 @@ dependencies = [
     "pylatexenc",
     "trafilatura",
     "htmldate",
+    "pymupdf4llm>=0.0.17",
 ]
 
 [project.scripts]

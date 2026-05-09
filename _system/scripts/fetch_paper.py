@@ -9,13 +9,18 @@ On both HTML hosts failing (arxiv.org/html then ar5iv.labs.arxiv.org),
 persists a stub ``papers`` row with ``status=failed_html`` and returns
 without raising — ``search.py --needs-review`` surfaces the failure.
 
-All outbound HTTP carries the ``Lodestone/1.0`` User-Agent header. Retries
-are 3-attempt exponential backoff, triggered on 5xx / 429 / transport
-errors (per project policy: never swallow unexpected exceptions). 429 is
-included specifically because arxiv's Atom export throttles aggressively;
-a short backoff clears it. Note we hit ``export.arxiv.org`` directly
-rather than via the ``arxiv`` Python library — the library's hardcoded
-``arxiv.py/<v>`` UA shares a global throttle bucket and 429s constantly.
+All outbound HTTP carries the ``Lodestone/1.0`` User-Agent header. The
+arxiv metadata API (``export.arxiv.org/api/query``) is gated by a
+file-locked 3.1s throttle (``_system.utils.arxiv_throttle``) and uses a
+stricter retry policy (``retry_arxiv_api``): 3 attempts, 429-only,
+honors ``Retry-After``; transport errors are *not* retried because
+they indicate arxiv has escalated to silent IP-throttling. All other
+outbound HTTP (HTML hosts, PDF, e-print, figures) uses ``retry_http``:
+6 attempts with deterministic exponential backoff (3s, 6s, 12s, 24s,
+48s capped at 60s) on 5xx / 429 / transport errors. Note we hit
+``export.arxiv.org`` directly rather than via the ``arxiv`` Python
+library — the library's hardcoded ``arxiv.py/<v>`` UA shares a global
+throttle bucket and 429s constantly.
 """
 from __future__ import annotations
 
@@ -41,21 +46,37 @@ from _system.latex import LATEX_SENTINEL_PREFIX
 from _system.latex import assemble as latex_assemble
 from _system.latex import eprint as latex_eprint
 from _system.latex import figures as latex_figures
+from _system.pdf import PDF_SENTINEL_PREFIX
 from _system.schemas.paper_metadata import HtmlSource, PaperMetadata, PaperStatus
+from _system.utils.arxiv_throttle import wait_for_arxiv_slot
 from _system.utils.arxiv_urls import base_url_for_source, parse_arxiv_id
 from _system.utils.http import (
     USER_AGENT,
     is_transient as _is_transient,
     make_default_client as _make_default_client,
+    retry_arxiv_api as _retry_arxiv_api,
     retry_http as _retry_http,
 )
 from _system.utils.logging import get_logger
 from _system.utils.repo_url import extract_repo_candidates, normalize_repo_url
 from _system.utils.slug import existing_slugs, generate_paper_name
 
-__all__ = ["fetch", "LATEX_SENTINEL_PREFIX"]
+__all__ = [
+    "fetch",
+    "IngestExtractionFailed",
+    "LATEX_SENTINEL_PREFIX",
+    "PDF_SENTINEL_PREFIX",
+]
 
 _LOG = get_logger("scripts.fetch_paper")
+
+
+class IngestExtractionFailed(RuntimeError):
+    """Raised when HTML, LaTeX-source, AND PDF extraction all fail.
+
+    Surfaces out of ``fetch()`` -> ``ingest()`` -> MCP/CLI as a clear,
+    loud failure rather than the prior silent ``failed_html`` stub row.
+    """
 
 # Per-image decompression-bomb guard; well above 1920²×4 but low enough
 # that a malicious PNG cannot OOM the worker. Catch `DecompressionBombError`
@@ -109,18 +130,34 @@ _ATOM_NS = "http://www.w3.org/2005/Atom"
 _ARXIV_NS = "http://arxiv.org/schemas/atom"
 
 
-@_retry_http
+@_retry_arxiv_api
 def _arxiv_api_get(arxiv_id: str) -> str:
-    """GET arxiv's Atom export with our Lodestone UA.
+    """GET arxiv's Atom export with our Lodestone UA, gated by the global throttle.
 
     The official ``arxiv`` Python lib sends ``user-agent: arxiv.py/<v>``,
     which shares a global throttle bucket with every other user of that
     library and 429s constantly. Our project UA carries a contact email
-    (per fetch_paper module docstring) and lands in arxiv's normal-citizen
-    rate class. Retries (5xx + 429) are handled by ``_retry_http``.
+    and lands in arxiv's normal-citizen rate class.
+
+    Pre-call: ``wait_for_arxiv_slot()`` blocks until at least 3.1s have
+    elapsed since the most recent arxiv API call from this machine
+    (persisted across processes). This is the only mechanism that
+    actually prevents 429s in the user-driven CLI workflow — retries
+    can recover from a single slip but not a sustained pattern.
+
+    Retries: only HTTP 429 is retried (3 attempts, honoring Retry-After,
+    else 60s/120s waits). Transport errors / read timeouts are *not*
+    retried — those signal arxiv has escalated to silent IP-throttling
+    and further attempts deepen the offense; they're surfaced to the
+    caller so the user can back off.
+
+    Read timeout is 15s rather than the default 30s — arxiv responds in
+    well under a second when not throttling, and a long timeout just
+    extends the wait when the connection has been silently dropped.
     """
+    wait_for_arxiv_slot()
     url = _ARXIV_API_URL.format(arxiv_id=arxiv_id)
-    with httpx.Client(headers={"User-Agent": USER_AGENT}, timeout=30.0) as c:
+    with httpx.Client(headers={"User-Agent": USER_AGENT}, timeout=15.0) as c:
         resp = c.get(url)
         resp.raise_for_status()
         return resp.text
@@ -177,7 +214,12 @@ def _strip_version(arxiv_id: str) -> str:
 
 @_retry_http
 def _try_html(client: httpx.Client, url: str) -> str | None:
-    """GET `url`, return body if 2xx + text/html, else None on 404 / non-html.
+    """GET `url`, return body if 2xx + text/html on an `/html/` path, else None.
+
+    ar5iv 302-redirects to ``arxiv.org/abs/{id}`` when it has no rendering
+    available — a 200 body shaped like the arxiv listing page. We reject
+    any response whose final URL leaves the ``/html/`` path so the listing
+    page never reaches the LaTeXML parser as if it were paper content.
 
     Raises HTTPStatusError on 5xx so tenacity can retry.
     """
@@ -192,6 +234,12 @@ def _try_html(client: httpx.Client, url: str) -> str | None:
     content_type = resp.headers.get("content-type", "")
     if not content_type.lower().startswith("text/html"):
         _LOG.warning("html fetch %s returned %r, not text/html", url, content_type)
+        return None
+    if "/html/" not in resp.url.path:
+        _LOG.info(
+            "html fetch %s redirected off /html/ to %s; treating as no-rendering",
+            url, resp.url,
+        )
         return None
     return resp.text
 
@@ -553,12 +601,14 @@ class _LatexFetchResult:
     processed_figures: list[_ProcessedFigure]
 
 
-def _latex_fallback_enabled(explicit: bool | None) -> bool:
-    """Resolve the latex-fallback toggle from kwarg → env → default-on."""
+_FLAG_FALSY = frozenset({"0", "false", "no", "off", ""})
+
+
+def _flag_enabled(env_var: str, explicit: bool | None) -> bool:
+    """Resolve a default-on fallback toggle: kwarg > env > on."""
     if explicit is not None:
         return explicit
-    raw = os.environ.get("LODESTONE_LATEX_FALLBACK", "1").strip().lower()
-    return raw not in {"0", "false", "no", "off", ""}
+    return os.environ.get(env_var, "1").strip().lower() not in _FLAG_FALSY
 
 
 def _try_latex_fallback(
@@ -631,6 +681,47 @@ def _process_latex_figure(
     )
 
 
+@dataclass
+class _PdfFetchResult:
+    """Output of `_try_pdf_fallback`: extracted markdown + content hash."""
+
+    markdown: str
+    content_hash: str
+
+
+def _try_pdf_fallback(
+    client: httpx.Client, arxiv_id: str
+) -> _PdfFetchResult | None:
+    """Download the PDF and run it through pymupdf4llm.
+
+    Returns None if the PDF can't be fetched or pymupdf4llm produces no
+    usable markdown. Reuses the same `_download_pdf` helper as the HTML
+    path — the bytes also feed `content_hash` so paper identity stays
+    hash-anchored across all fallback tiers.
+    """
+    from _system.pdf.extract import extract_markdown
+
+    try:
+        pdf_bytes = _download_pdf(client, arxiv_id)
+    except httpx.HTTPStatusError as exc:
+        _LOG.warning(
+            "pdf fallback for %s: PDF download failed: %s", arxiv_id, exc,
+        )
+        return None
+
+    md = extract_markdown(pdf_bytes)
+    if md is None:
+        _LOG.warning(
+            "pdf fallback for %s: pymupdf4llm produced no usable markdown",
+            arxiv_id,
+        )
+        return None
+    return _PdfFetchResult(
+        markdown=md,
+        content_hash=hashlib.sha256(pdf_bytes).hexdigest(),
+    )
+
+
 def fetch(
     *,
     conn: sqlite3.Connection,
@@ -640,6 +731,7 @@ def fetch(
     client: httpx.Client | None = None,
     arxiv_lookup: Callable[[str], _ArxivMetadata] | None = None,
     latex_fallback: bool | None = None,
+    pdf_fallback: bool | None = None,
 ) -> PaperMetadata:
     """Two-phase fetch of an arxiv paper. See module docstring for details.
 
@@ -670,7 +762,7 @@ def fetch(
         html_body, html_source = _fetch_html_body(client, arxiv_id)
 
         if html_body is None:
-            if _latex_fallback_enabled(latex_fallback):
+            if _flag_enabled("LODESTONE_LATEX_FALLBACK", latex_fallback):
                 latex_result = _try_latex_fallback(client, arxiv_id)
                 if latex_result is not None:
                     return _persist_latex_fallback(
@@ -682,8 +774,22 @@ def fetch(
                         existing_row=existing_row,
                         client=client,
                     )
-            return _persist_failed_html(
-                conn, arxiv_id, meta, domain_override, existing_row
+            if _flag_enabled("LODESTONE_PDF_FALLBACK", pdf_fallback):
+                pdf_result = _try_pdf_fallback(client, arxiv_id)
+                if pdf_result is not None:
+                    return _persist_pdf_fallback(
+                        conn,
+                        arxiv_id=arxiv_id,
+                        meta=meta,
+                        pdf_result=pdf_result,
+                        domain_override=domain_override,
+                        existing_row=existing_row,
+                        client=client,
+                    )
+            raise IngestExtractionFailed(
+                f"All extraction paths failed for arxiv_id={arxiv_id!r}: "
+                "arxiv.org/html, ar5iv, e-print LaTeX, and PDF (pymupdf4llm) "
+                "each returned no usable content."
             )
 
         pdf_bytes = _download_pdf(client, arxiv_id)
@@ -728,6 +834,52 @@ def fetch(
             client.close()
 
 
+def _build_fallback_metadata(
+    conn: sqlite3.Connection,
+    *,
+    client: httpx.Client,
+    arxiv_id: str,
+    meta: _ArxivMetadata,
+    raw_html: str,
+    html_source: HtmlSource,
+    content_hash: str,
+    domain_override: str | None,
+    existing_row: PaperMetadata | None,
+) -> PaperMetadata:
+    """Common prelude for both fallback persisters: soft-dedup log, code-repo
+    discovery, slug resolution, then build the ``PaperMetadata`` row.
+
+    Code-repo discovery skips the HTML body parse and goes straight to the
+    arxiv comment + PwC. needs_review is left False; convert_paper raises
+    or sets it based on path-specific signals (latex walker skip counters,
+    pdf fallback's unconditional review flag).
+    """
+    _log_soft_dedup(conn, content_hash, arxiv_id)
+    code_repo = _discover_code_repo(client, arxiv_id, "", meta)
+    paper_name, ingested_at = _resolve_slug_and_timestamp(
+        conn, meta, arxiv_id, existing_row,
+    )
+    return PaperMetadata(
+        arxiv_id=arxiv_id,
+        paper_name=paper_name,
+        title=meta.title,
+        authors=json.dumps(meta.authors),
+        date=meta.published,
+        abstract=meta.abstract,
+        pdf_url=meta.pdf_url,
+        domain=domain_override or (existing_row.domain if existing_row else None),
+        collection=existing_row.collection if existing_row else None,
+        status=PaperStatus.FETCHED,
+        markdown=None,
+        raw_html=raw_html,
+        html_source=html_source,
+        content_hash=content_hash,
+        code_repo=code_repo,
+        needs_review=False,
+        ingested_at=ingested_at,
+    )
+
+
 def _persist_latex_fallback(
     conn: sqlite3.Connection,
     *,
@@ -742,72 +894,50 @@ def _persist_latex_fallback(
 
     The PDF is still downloaded for content-hash purposes (matches HTML
     path semantics — paper identity is hash-anchored, not source-anchored).
-    Code-repo discovery skips the HTML body parse and goes straight to the
-    arxiv comment + PwC.
     """
     pdf_bytes = _download_pdf(client, arxiv_id)
-    content_hash = hashlib.sha256(pdf_bytes).hexdigest()
-    _log_soft_dedup(conn, content_hash, arxiv_id)
-
-    code_repo = _discover_code_repo(client, arxiv_id, "", meta)
-
-    paper_name, ingested_at = _resolve_slug_and_timestamp(
-        conn, meta, arxiv_id, existing_row,
-    )
-
-    pm = PaperMetadata(
+    pm = _build_fallback_metadata(
+        conn,
+        client=client,
         arxiv_id=arxiv_id,
-        paper_name=paper_name,
-        title=meta.title,
-        authors=json.dumps(meta.authors),
-        date=meta.published,
-        abstract=meta.abstract,
-        pdf_url=meta.pdf_url,
-        domain=domain_override or (existing_row.domain if existing_row else None),
-        collection=existing_row.collection if existing_row else None,
-        status=PaperStatus.FETCHED,
-        markdown=None,
+        meta=meta,
         raw_html=LATEX_SENTINEL_PREFIX + latex_result.assembled_tex,
         html_source=HtmlSource.LATEX_LOCAL,
-        content_hash=content_hash,
-        code_repo=code_repo,
-        # convert_paper sets needs_review based on walker skip counters;
-        # at fetch we don't know yet whether the markdown will be partial.
-        needs_review=False,
-        ingested_at=ingested_at,
+        content_hash=hashlib.sha256(pdf_bytes).hexdigest(),
+        domain_override=domain_override,
+        existing_row=existing_row,
     )
     _persist(conn, pm, latex_result.processed_figures)
     return pm
 
 
-def _persist_failed_html(
+def _persist_pdf_fallback(
     conn: sqlite3.Connection,
+    *,
     arxiv_id: str,
     meta: _ArxivMetadata,
+    pdf_result: _PdfFetchResult,
     domain_override: str | None,
     existing_row: PaperMetadata | None,
+    client: httpx.Client,
 ) -> PaperMetadata:
-    paper_name, ingested_at = _resolve_slug_and_timestamp(
-        conn, meta, arxiv_id, existing_row,
-    )
-    pm = PaperMetadata(
+    """Persist a paper that succeeded via the PDF (pymupdf4llm) fallback.
+
+    The markdown is stashed verbatim in ``raw_html`` behind the PDF
+    sentinel — convert_paper strips the sentinel and uses the markdown
+    directly (no re-extraction at convert time). No figures (PDF path
+    skips figure extraction by design).
+    """
+    pm = _build_fallback_metadata(
+        conn,
+        client=client,
         arxiv_id=arxiv_id,
-        paper_name=paper_name,
-        title=meta.title,
-        authors=json.dumps(meta.authors),
-        date=meta.published,
-        abstract=meta.abstract,
-        pdf_url=meta.pdf_url,
-        domain=domain_override or (existing_row.domain if existing_row else None),
-        collection=existing_row.collection if existing_row else None,
-        status=PaperStatus.FAILED_HTML,
-        markdown=None,
-        raw_html=None,
-        html_source=None,
-        content_hash=None,
-        code_repo=None,
-        needs_review=False,
-        ingested_at=ingested_at,
+        meta=meta,
+        raw_html=PDF_SENTINEL_PREFIX + pdf_result.markdown,
+        html_source=HtmlSource.PDF_FALLBACK,
+        content_hash=pdf_result.content_hash,
+        domain_override=domain_override,
+        existing_row=existing_row,
     )
     _persist(conn, pm, figures=[])
     return pm

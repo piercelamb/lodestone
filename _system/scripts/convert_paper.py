@@ -13,6 +13,8 @@ from _system.html import latexml_parser
 from _system.latex import LATEX_SENTINEL_PREFIX
 from _system.latex import figures as latex_figures
 from _system.latex import walker as latex_walker
+from _system.pdf import PDF_SENTINEL_PREFIX
+from _system.pdf.normalize import normalize_pdf_headings
 from _system.schemas.paper_metadata import HtmlSource, PaperStatus, can_run_from
 from _system.utils.arxiv_urls import base_url_for_source
 from _system.utils.citation_resolution import resolve_arxiv_citations
@@ -112,6 +114,24 @@ def convert(
         markdown, references, figures_count, needs_review = _convert_latex(
             raw_html, db_numbers, paper_name,
         )
+    elif source is HtmlSource.PDF_FALLBACK:
+        if not raw_html.startswith(PDF_SENTINEL_PREFIX):
+            raise RawHtmlMissing(
+                f"paper_name={paper_name!r}: html_source=pdf_fallback but "
+                "raw_html does not start with the PDF sentinel; re-fetch with --force"
+            )
+        markdown = raw_html[len(PDF_SENTINEL_PREFIX):]
+        markdown = normalize_pdf_headings(markdown)
+        references = []
+        figures_count = 0
+        # pymupdf4llm output quality varies on academic PDFs — always
+        # surface in `search.py --needs-review` for human spot-check.
+        needs_review = True
+        if db_numbers:
+            raise FigureCountMismatch(
+                f"paper_name={paper_name!r}: PDF fallback produces no "
+                f"figures but DB has {len(db_numbers)} figure rows"
+            )
     else:
         base_url = base_url_for_source(source, arxiv_id)
         parsed = latexml_parser.parse(raw_html, base_url)

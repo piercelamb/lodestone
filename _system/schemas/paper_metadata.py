@@ -20,6 +20,7 @@ class HtmlSource(StrEnum):
     ARXIV = "arxiv"
     AR5IV = "ar5iv"
     LATEX_LOCAL = "latex_local"
+    PDF_FALLBACK = "pdf_fallback"
 
 
 # INDEXED is the terminal happy-path stage for the paper itself. The
