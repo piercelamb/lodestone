@@ -1446,7 +1446,16 @@ class _ServerState:
     def configure(self) -> None:
         """Resolve DB path and try to open. On failure, capture the error
         and let ``initialize`` proceed regardless (issue #35287 mitigation).
+
+        When ``LODESTONE_DB`` is explicitly set and the file is missing,
+        the parent dir is created and an empty schema is initialized so
+        a fresh install becomes usable on the first ``ingest_*`` call —
+        the README promises this. The walk-up fallback (no env var) keeps
+        its strict "must exist" semantics so devs running from inside the
+        repo don't accidentally seed a stray DB in an unrelated parent.
         """
+        from _system.db.migrations import init_db
+
         self.db_path = _resolve_db_path()
         if self.db_path is None:
             self.startup_error = (
@@ -1456,7 +1465,8 @@ class _ServerState:
             )
             _log("error", self.startup_error)
             return
-        if not self.db_path.is_file():
+        env_set = os.environ.get("LODESTONE_DB") is not None
+        if not self.db_path.is_file() and not env_set:
             self.startup_error = (
                 f"lodestone.db not found at {self.db_path}. Set "
                 f"LODESTONE_DB to the correct absolute path."
@@ -1464,10 +1474,18 @@ class _ServerState:
             _log("error", self.startup_error)
             return
         try:
+            if not self.db_path.is_file():
+                self.db_path.parent.mkdir(parents=True, exist_ok=True)
             self.conn = get_conn(self.db_path)
+            init_db(self.conn)
         except Exception as exc:  # noqa: BLE001
             self.startup_error = f"failed to open {self.db_path}: {exc!r}"
             _log("error", self.startup_error)
+            if self.conn is not None:
+                try:
+                    self.conn.close()
+                except sqlite3.Error:
+                    pass
             self.conn = None
 
     def close(self) -> None:

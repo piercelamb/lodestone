@@ -1019,9 +1019,44 @@ class TestProtocolHandshake:
         assert "structuredContent" not in result
         assert "isError" not in result
 
-    def test_bogus_db_completes_initialize_then_isError_on_tools_call(self, tmp_path):
-        # No DB at this path — initialize must still succeed (issue #35287).
-        bogus = tmp_path / "no_such.db"
+    def test_missing_db_at_env_path_is_auto_created(self, tmp_path):
+        # Fresh-install path: LODESTONE_DB points at a not-yet-existing file
+        # under a writable parent dir. The server must materialize an empty
+        # schema-initialized DB so subsequent ingest_* / read tools work
+        # without an out-of-band mkdir step. ``tables`` is the sentinel —
+        # an empty schema is still a schema, so the call succeeds and lists
+        # the canonical user tables.
+        fresh = tmp_path / "fresh.db"
+        responses = _drive_server(
+            [
+                _build_msg("initialize", {"protocolVersion": "2024-11-05"}, msg_id=1),
+                _build_msg("notifications/initialized", params={}, msg_id=None),
+                _build_msg("tools/call", {
+                    "name": "tables",
+                    "arguments": {},
+                }, msg_id=4),
+            ],
+            env_overrides={"LODESTONE_DB": str(fresh)},
+        )
+        init = next(r for r in responses if r.get("id") == 1)
+        assert "result" in init
+        assert fresh.is_file(), "DB file should be created on first run"
+        call = next(r for r in responses if r.get("id") == 4)
+        assert call["result"]["isError"] is False
+        # Empty schema still exposes the canonical tables.
+        text = next(b["text"] for b in call["result"]["content"] if b["type"] == "text")
+        payload = json.loads(text)
+        table_names = {t["name"] for t in payload.get("tables", [])}
+        assert "papers" in table_names
+        assert "domains" in table_names
+
+    def test_uncreatable_db_path_completes_initialize_then_isError(self, tmp_path):
+        # Parent path is a regular file, not a dir, so the DB cannot be
+        # created. Initialize must still succeed (issue #35287); the error
+        # surfaces on the first tools/call.
+        blocker = tmp_path / "not_a_dir"
+        blocker.write_text("")
+        bogus = blocker / "no_such.db"
         responses = _drive_server(
             [
                 _build_msg("initialize", {"protocolVersion": "2024-11-05"}, msg_id=1),
@@ -1034,7 +1069,7 @@ class TestProtocolHandshake:
             env_overrides={"LODESTONE_DB": str(bogus)},
         )
         init = next(r for r in responses if r.get("id") == 1)
-        assert "result" in init  # not error — handshake succeeded
+        assert "result" in init
         call = next(r for r in responses if r.get("id") == 4)
         assert call["result"]["isError"] is True
 
