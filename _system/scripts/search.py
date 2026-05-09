@@ -3791,6 +3791,106 @@ def format_collection_text(payload: dict[str, Any]) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _format_collections_block(payload: dict[str, Any]) -> list[str]:
+    """Render an ``ingest_*`` summary's collection memberships.
+
+    Reads the polymorphic list under ``collections`` (each row a
+    ``{collection, is_primary}`` dict), falling back to the scalar
+    ``collection`` field if the list is empty. Primary is always first
+    and tagged.
+    """
+    rows = payload.get("collections") or []
+    primary_scalar = payload.get("collection")
+    if not rows and primary_scalar:
+        rows = [{"collection": primary_scalar, "is_primary": True}]
+    if not rows:
+        return ["collections: (none)"]
+    lines = ["collections:"]
+    for r in rows:
+        name = r.get("collection") or "?"
+        tag = "   (primary)" if r.get("is_primary") else ""
+        lines.append(f"  - {name}{tag}")
+    return lines
+
+
+def _format_ingest_header(kind: str, title: str | None) -> str:
+    name = title or "(unknown)"
+    return f"# ingested {kind}: {name}"
+
+
+def format_ingest_paper(payload: dict[str, Any]) -> str:
+    """Render an ``ingest_paper`` summary as a compact text block.
+
+    Mirrors the dense, header-plus-fact-per-line style of
+    :func:`format_collection_text`. The full structured dict is still
+    available via ``structuredContent``; this is a screen-readable
+    digest.
+    """
+    lines: list[str] = [
+        _format_ingest_header("paper", payload.get("paper_name")),
+        f"arxiv_id : {payload.get('arxiv_id') or '?'}",
+        (
+            f"status   : {payload.get('status') or '?'}"
+            f"   needs_review: {bool(payload.get('needs_review'))}"
+        ),
+        f"domain   : {payload.get('domain') or '(unclassified)'}",
+    ]
+    lines.extend(_format_collections_block(payload))
+    counts = (
+        f"sections : {int(payload.get('section_count') or 0)}"
+        f"   entities: {int(payload.get('entity_count') or 0)}"
+        f"   topics: {int(payload.get('topic_count') or 0)}"
+        f"   figures: {int(payload.get('figure_count') or 0)}"
+    )
+    lines.append(counts)
+    repo = payload.get("repo")
+    if repo:
+        slug = repo.get("repo_slug") or "?"
+        rstatus = repo.get("status") or "?"
+        lines.append(f"repo     : {slug}   ({rstatus})")
+    return "\n".join(lines) + "\n"
+
+
+def format_ingest_repo(payload: dict[str, Any]) -> str:
+    """Render an ``ingest_repo`` summary as a compact text block."""
+    lines: list[str] = [
+        _format_ingest_header("repo", payload.get("repo_slug")),
+        f"url      : {payload.get('url') or '?'}",
+        (
+            f"status   : {payload.get('status') or '?'}"
+            f"   needs_review: {bool(payload.get('needs_review'))}"
+        ),
+        f"domain   : {payload.get('domain') or '(unclassified)'}",
+    ]
+    lines.extend(_format_collections_block(payload))
+    lines.append(
+        f"files    : {int(payload.get('file_count') or 0)}"
+        f"   has_readme: {bool(payload.get('has_readme'))}"
+        f"   topics: {int(payload.get('topic_count') or 0)}"
+    )
+    return "\n".join(lines) + "\n"
+
+
+def format_ingest_post(payload: dict[str, Any]) -> str:
+    """Render an ``ingest_post`` summary as a compact text block."""
+    lines: list[str] = [
+        _format_ingest_header("post", payload.get("post_name")),
+        f"canonical_url : {payload.get('canonical_url') or payload.get('url') or '?'}",
+        (
+            f"status   : {payload.get('status') or '?'}"
+            f"   needs_review: {bool(payload.get('needs_review'))}"
+        ),
+        f"domain   : {payload.get('domain') or '(unclassified)'}",
+    ]
+    lines.extend(_format_collections_block(payload))
+    lines.append(
+        f"sections : {int(payload.get('section_count') or 0)}"
+        f"   entities: {int(payload.get('entity_count') or 0)}"
+        f"   topics: {int(payload.get('topic_count') or 0)}"
+    )
+    return "\n".join(lines) + "\n"
+
+
 def _paging_footer(payload: dict[str, Any], *, page_size: int) -> str | None:
     """Render the "showing hits N-M of T" footer for paged results.
 
