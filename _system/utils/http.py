@@ -28,7 +28,13 @@ _LOG = get_logger("utils.http")
 
 USER_AGENT = "Lodestone/1.0 (mailto:richard.pierce.lamb@gmail.com)"
 
-_DEFAULT_TIMEOUT_S = 30.0
+# Granular per-phase timeouts. The MCP server is single-threaded over
+# STDIO, so a single wedged request blocks every subsequent tool call
+# until it unwinds. macOS sleep is the routine trigger: any HTTPS read
+# in flight at sleep time is suspended; on wake the local socket is
+# still ESTABLISHED for tens of seconds (until the peer FIN arrives)
+# and the read silently hangs. Bounding read at 30s caps that wedge.
+_DEFAULT_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
 
 # Optional out-of-band progress channel. The MCP server installs an
 # ``(message, done, total)`` callback here for the duration of an
@@ -91,10 +97,10 @@ def _log_retry(retry_state) -> None:
 
 
 def make_default_client() -> httpx.Client:
-    """Construct an httpx client with the project UA, 30s timeout, follow_redirects."""
+    """Construct an httpx client with the project UA, granular timeouts, follow_redirects."""
     return httpx.Client(
         headers={"User-Agent": USER_AGENT},
-        timeout=_DEFAULT_TIMEOUT_S,
+        timeout=_DEFAULT_TIMEOUT,
         follow_redirects=True,
     )
 
