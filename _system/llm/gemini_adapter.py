@@ -23,6 +23,10 @@ MODEL_CATALOG: list[tuple[str, str]] = [
 ]
 DEFAULT_MODEL = MODEL_CATALOG[0][0]
 
+# See openai_adapter._TIMEOUT_S for rationale. google-genai takes the
+# value in milliseconds via HttpOptions; everyone else takes seconds.
+_TIMEOUT_MS = 180_000
+
 
 def call(
     *,
@@ -34,9 +38,9 @@ def call(
 ) -> dict[str, Any]:
     from google import genai
     from google.genai import errors as genai_errors
-    from google.genai.types import GenerateContentConfig
+    from google.genai.types import GenerateContentConfig, HttpOptions
 
-    client = genai.Client()
+    client = genai.Client(http_options=HttpOptions(timeout=_TIMEOUT_MS))
     config = GenerateContentConfig(
         system_instruction=system,
         response_mime_type="application/json",

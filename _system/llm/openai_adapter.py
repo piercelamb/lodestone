@@ -23,6 +23,13 @@ MODEL_CATALOG: list[tuple[str, str]] = [
 ]
 DEFAULT_MODEL = MODEL_CATALOG[0][0]
 
+# Cap the per-call wall-clock at 180s. The OpenAI SDK's default is 600s,
+# which on the MCP server (single-threaded STDIO) means a single request
+# stranded by macOS sleep blocks every subsequent tool call for 10
+# minutes while the read on a dead socket waits for FIN. 180s is enough
+# for slow generations and tight enough to unwedge quickly post-sleep.
+_TIMEOUT_S = 180.0
+
 
 def call(
     *,
@@ -40,7 +47,7 @@ def call(
         RateLimitError,
     )
 
-    client = openai.OpenAI()
+    client = openai.OpenAI(timeout=_TIMEOUT_S)
     try:
         response = client.chat.completions.create(
             model=model,

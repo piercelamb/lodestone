@@ -57,7 +57,7 @@ def _install_anthropic(monkeypatch, *, create_impl):
             return create_impl(**kwargs)
 
     class _Client:
-        def __init__(self):
+        def __init__(self, **_kwargs):
             self.messages = _Messages()
 
     module = types.SimpleNamespace(
@@ -186,7 +186,7 @@ def _install_openai(monkeypatch, *, create_impl):
             self.completions = _Completions()
 
     class _Client:
-        def __init__(self):
+        def __init__(self, **_kwargs):
             self.chat = _Chat()
 
     module = types.SimpleNamespace(
@@ -297,18 +297,24 @@ class _GenerateContentConfig:
         self.kwargs = kwargs
 
 
+class _HttpOptions:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
 def _install_genai(monkeypatch, *, generate_impl):
     class _Models:
         def generate_content(self, *, model, contents, config):
             return generate_impl(model=model, contents=contents, config=config)
 
     class _Client:
-        def __init__(self):
+        def __init__(self, **_kwargs):
             self.models = _Models()
 
     errors_module = types.SimpleNamespace(APIError=_GenaiAPIError)
     types_module = types.SimpleNamespace(
-        GenerateContentConfig=_GenerateContentConfig
+        GenerateContentConfig=_GenerateContentConfig,
+        HttpOptions=_HttpOptions,
     )
     genai_module = types.SimpleNamespace(
         Client=_Client,

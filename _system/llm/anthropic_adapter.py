@@ -28,6 +28,9 @@ MODEL_CATALOG: list[tuple[str, str]] = [
 DEFAULT_MODEL = MODEL_CATALOG[0][0]
 _MAX_TOKENS = 4096
 
+# See openai_adapter._TIMEOUT_S for rationale — same wedge mechanic.
+_TIMEOUT_S = 180.0
+
 
 def call(
     *,
@@ -44,7 +47,7 @@ def call(
         APITimeoutError,
     )
 
-    client = anthropic.Anthropic()
+    client = anthropic.Anthropic(timeout=_TIMEOUT_S)
     tool = {
         "name": schema["name"],
         "description": schema["description"],
