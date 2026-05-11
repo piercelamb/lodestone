@@ -1,0 +1,454 @@
+{
+  "domains": [
+    {
+      "name": "Retrieval And RAG",
+      "description": "Research on retrieving relevant evidence from text, visual, tabular, graph, and web corpora and using it to ground language model generation, including the full pipeline from query handling through retrieval, reranking, and structured-evidence synthesis.",
+      "collections": [
+        {
+          "name": "Chunking Strategies",
+          "description": "Approaches for splitting documents into retrieval units, including semantic, late, vision-guided, and model-based chunkers."
+        },
+        {
+          "name": "Embedding Models",
+          "description": "Dense, multimodal, multilingual, and reasoning-augmented embedding models and their finetuning recipes."
+        },
+        {
+          "name": "Sparse And Hybrid Retrieval",
+          "description": "BM25, SPLADE-style learned sparse encoders, and hybrid dense plus sparse plus lexical retrieval designs, including adaptive RRF fusion."
+        },
+        {
+          "name": "Vector Storage And Serving",
+          "description": "Vector databases, ANN indexes for multi-vector embeddings, object-storage-backed stores, and embedding inference toolkits."
+        },
+        {
+          "name": "Query Understanding And Rewriting",
+          "description": "Query decomposition, expansion, refinement, classification, routing, and probing-question generation for retrieval pipelines."
+        },
+        {
+          "name": "Rerankers",
+          "description": "Second-stage scoring models including LLM-based, reasoning, small cross-encoder and late-interaction, multimodal, and rubric-prompted rerankers."
+        },
+        {
+          "name": "Visual And Multimodal Retrieval",
+          "description": "ColPali-style page-image retrieval, visual rerankers, multimodal embedders, and fused text-plus-image RAG."
+        },
+        {
+          "name": "Hierarchical And Tree-Structured Retrieval",
+          "description": "Section trees, taxonomies, RAPTOR/NodeRAG, and mindmap-based decompositions that retrieve across multiple granularities, including vectorless variants."
+        },
+        {
+          "name": "Graph RAG And Knowledge Graphs",
+          "description": "Knowledge-graph construction, entity/relation extraction, temporal evolution, subgraph selection, spreading activation, and hybrid graph-plus-vector retrieval."
+        },
+        {
+          "name": "Agentic And Iterative RAG",
+          "description": "Query decomposition agents, iterative retrieve-and-reason loops, and unified retriever-reranker-generator systems."
+        },
+        {
+          "name": "Answer Grounding And Attribution",
+          "description": "Visual answer localization, region-grounded responses, context-interleaved reasoning, and source attribution back to specific passages or page regions."
+        },
+        {
+          "name": "Question-Indexed And Pre-Generated Query Retrieval",
+          "description": "Indexing strategies that pre-generate questions or PreQs at ingestion time and match user queries against them."
+        },
+        {
+          "name": "Knowledge Structuring For Generation",
+          "description": "Imposing taxonomies, ontologies, schemas, and hierarchical clusters over corpora to support retrieval-and-structuring augmented generation."
+        },
+        {
+          "name": "Time-Aware And Web RAG",
+          "description": "Temporal fact extraction from evolving web content and RAG pipelines that respect when facts held true."
+        },
+        {
+          "name": "Query-Conditioned Dynamic RAG",
+          "description": "Query-time construction of document representations, schemas, or tables over otherwise unstructured extracted content, deferring all corpus structuring to the moment a query arrives."
+        },
+        {
+          "name": "Conversation Understanding And Retrieval",
+          "description": "Retrieval and semantic understanding over conversational data — meeting transcripts, dialogue, and ASR output — where the source is spoken interaction rather than written documents."
+        },
+        {
+          "name": "RAG Benchmarks And Evaluation",
+          "description": "Document QA, visual retrieval, and structured-RAG benchmarks, leaderboards, surveys, and debugging tooling."
+        }
+      ]
+    },
+    {
+      "name": "Document Understanding And OCR",
+      "description": "Research on converting documents, slides, tables, and other visual or semi-structured artifacts into structured text, layout, and field-level representations, plus the synthetic data and extractors that support these pipelines.",
+      "collections": [
+        {
+          "name": "VLM-Based OCR Models",
+          "description": "End-to-end vision-language models trained or finetuned for transcribing document pages into structured text and markdown."
+        },
+        {
+          "name": "Layout Detection And Reading Order",
+          "description": "Models and toolkits that detect document elements, region types, and reading order as a precursor or complement to OCR."
+        },
+        {
+          "name": "Document Parsing Pipelines",
+          "description": "Open-source pipelines, frameworks, and orchestration that combine layout detection, OCR, chunking, and post-processing for ingestion."
+        },
+        {
+          "name": "OCR Quality Fusion And Benchmarks",
+          "description": "Benchmarks, leaderboards, fidelity scoring, and multi-OCR fusion or rerank methods that improve extraction quality."
+        },
+        {
+          "name": "Schema-Based Field Extraction",
+          "description": "Approaches that ground answers to page regions or extract structured fields against a target schema rather than producing full transcripts."
+        },
+        {
+          "name": "Table Detection And Structure Recognition",
+          "description": "Models and pipelines that locate tables in document images and recover cell, row, column, and header structure."
+        },
+        {
+          "name": "Table Parsing And Format Conversion",
+          "description": "Approaches for converting detected or native tables into JSON, Markdown, HTML, OTSL, and other structured representations."
+        },
+        {
+          "name": "Table Reasoning And Foundation Models",
+          "description": "LLMs and tabular foundation models tuned for reasoning, classification, and numerical analysis over tables, including SQL-backed and chunk-linked table RAG."
+        },
+        {
+          "name": "Table Benchmarks And Datasets",
+          "description": "Evaluation benchmarks and datasets for table extraction, understanding, and downstream workflows."
+        },
+        {
+          "name": "Slide Generation And Editing",
+          "description": "Aesthetic slide synthesis, document-to-deck conversion, and template-driven slide updating using language and vision models."
+        },
+        {
+          "name": "Synthetic Document Data",
+          "description": "Generation of synthetic documents, layouts, tables, and annotations for training document-understanding models."
+        },
+        {
+          "name": "HTML And Web Extraction",
+          "description": "Models and systems that extract structured data from HTML and other semi-structured non-document sources."
+        },
+        {
+          "name": "Conversation Segmentation And Extraction",
+          "description": "Topic segmentation, structured extraction from dialogue, and dialogue simulation for training conversational understanding systems."
+        }
+      ]
+    },
+    {
+      "name": "Agents",
+      "description": "Research on autonomous and semi-autonomous LLM-based systems that plan, reason, use tools, and act in software, browser, and OS environments, including coding agents, computer-use agents, deep-research agents, and the context-engineering practices that support them.",
+      "collections": [
+        {
+          "name": "Agent Architectures And Harnesses",
+          "description": "Designs, control loops, harness engineering, multi-agent orchestration patterns, and reasoning-plus-tool-calling frameworks."
+        },
+        {
+          "name": "Agentic Memory",
+          "description": "Short-term, long-term, hierarchical, graph-based, and brain-inspired memory systems for retaining and retrieving agent experience."
+        },
+        {
+          "name": "Context Engineering For Agents",
+          "description": "Surveys, frameworks, and practitioner patterns for shaping, compressing, pruning, and persisting context across agent loops."
+        },
+        {
+          "name": "Tool Retrieval And Selection",
+          "description": "Methods that retrieve or rank a relevant subset of tools for an agent via embedding search over tool descriptions or query-to-toolcall traces."
+        },
+        {
+          "name": "Agent Training And Self-Evolution",
+          "description": "Trajectory-based learning, skill acquisition, and continuous self-improvement methods for agents, including specialized small models for agentic tasks."
+        },
+        {
+          "name": "Deep Research Agents",
+          "description": "Open-source and academic systems that perform long-horizon, web-augmented research workflows combining search, browsing, and synthesis."
+        },
+        {
+          "name": "Coding Agents",
+          "description": "Autonomous LLM agents that read, write, and execute code, including their internal architectures, skills, hooks, and AGENTS.md conventions."
+        },
+        {
+          "name": "Computer Use Models",
+          "description": "Vision-language and agentic models trained or specialized for operating GUIs, browsers, and desktops."
+        },
+        {
+          "name": "GUI Perception And Grounding",
+          "description": "Set-of-marks, visual prompting, and other techniques for identifying and grounding interactable elements in screenshots."
+        },
+        {
+          "name": "Automated Browsing And Capture",
+          "description": "Browser automation agents and URL-to-artifact capture APIs that fetch rendered HTML, screenshots, or extracted text for downstream consumption."
+        },
+        {
+          "name": "Sandboxes And Agent Filesystems",
+          "description": "MicroVMs, ephemeral VMs, container orchestration, and virtual filesystems that isolate and serve agent execution environments."
+        },
+        {
+          "name": "Parallel Orchestration And Observability",
+          "description": "Multi-agent fleets, scheduling, observability, and developer-facing tools for running and managing agents at scale."
+        },
+        {
+          "name": "Automated ML Research Agents",
+          "description": "Long-horizon ML research engineering agents and bilevel meta-optimization of the autoresearch loop itself."
+        },
+        {
+          "name": "Paper-To-Code And Idea Synthesis",
+          "description": "Pipelines that ingest scientific literature and convert it into runnable implementations or reconcile user ideas against synthesized prior work."
+        },
+        {
+          "name": "Agent Evaluation And Benchmarks",
+          "description": "Benchmarks, evaluators, judges, user simulation, and trust layers for testing agent behavior across coding, computer-use, and research tasks."
+        }
+      ]
+    },
+    {
+      "name": "Reasoning And Inference-Time Compute",
+      "description": "Research on improving, scaling, and controlling reasoning behavior in language and multimodal models, including test-time search, efficiency tradeoffs, and the foundational science of how these models generalize.",
+      "collections": [
+        {
+          "name": "Inference-Time Compute Scaling",
+          "description": "Test-time search, best-of-N, parallel sampling, and other strategies that scale reasoning quality at inference."
+        },
+        {
+          "name": "Reasoning Efficiency And Throughput",
+          "description": "Methods that reduce latency and token cost of thinking models while preserving accuracy, including small-model and no-think variants."
+        },
+        {
+          "name": "Context-Aware Reasoning",
+          "description": "Integrating, filtering, or interleaving input context into a model's reasoning trace."
+        },
+        {
+          "name": "Multimodal Chain-Of-Thought",
+          "description": "Reasoning methods for vision-language models, including tool-augmented manipulation of input images."
+        },
+        {
+          "name": "Structured Output Decoupling",
+          "description": "Splitting reasoning from structured-output formatting across separate models to recover performance."
+        },
+        {
+          "name": "Foundations Of Deep Learning",
+          "description": "Theoretical work on why deep networks learn and generalize, including overparameterization and formal accounts of network behavior."
+        },
+        {
+          "name": "LLM Behavior And Memory Studies",
+          "description": "Empirical studies of how prompting, constraints, and architectural memory shape LLM outputs and recall across interactions."
+        }
+      ]
+    },
+    {
+      "name": "Training And Adaptation",
+      "description": "Methods, recipes, and platforms for adapting pretrained language and retrieval models to specific domains, tasks, or behaviors via supervised, parameter-efficient, reinforcement, and synthetic-data training.",
+      "collections": [
+        {
+          "name": "Parameter-Efficient Adaptation",
+          "description": "LoRA-style adapters, hypernetwork-generated weights, and text-to-LoRA approaches that adapt models without full finetuning."
+        },
+        {
+          "name": "Domain-Specific Retriever And Embedding Finetuning",
+          "description": "Adapting retrievers and embedding models to technical, medical, and other specialized corpora."
+        },
+        {
+          "name": "RL Post-Training Algorithms",
+          "description": "Algorithmic refinements to RL post-training including importance-sampling corrections, complexity-aware modifications, and credit assignment over reasoning traces."
+        },
+        {
+          "name": "Reward Models And Process Supervision",
+          "description": "Reward signal design including process reward models, memory-aware reward benchmarks, and exploitation of execution feedback such as error outputs."
+        },
+        {
+          "name": "Rollout And Compute Budget Allocation",
+          "description": "Methods that allocate sampling, rollout, and compute budgets across training examples based on per-sample value or capability signals."
+        },
+        {
+          "name": "Agentic And Long-Horizon RL",
+          "description": "RL approaches that train agentic, tool-using, and exploratory behaviors over long-horizon tasks in sandboxes and computer environments."
+        },
+        {
+          "name": "Memory And Skill-Based Self-Improvement",
+          "description": "Self-improving RL schemes that build hierarchical skills or distill experience and errors into parametric memory for reuse."
+        },
+        {
+          "name": "Synthetic Data For Training",
+          "description": "Pipelines that synthesize documents, retrieval pairs, and curated data recipes from raw sources to train domain-specific models."
+        },
+        {
+          "name": "Finetuning Tooling And Platforms",
+          "description": "Frameworks, UIs, and managed platforms (Llama-Factory, Tinker, Transformer Lab, HF skills) that operationalize training and data curation."
+        }
+      ]
+    },
+    {
+      "name": "Inference Systems And Local Models",
+      "description": "Research on serving large models efficiently, compressing them via quantization, and releasing small open-weight models suitable for local, edge, and on-device deployment.",
+      "collections": [
+        {
+          "name": "LLM Serving Runtimes",
+          "description": "Inference engines, handbooks, and frameworks for deploying and serving large language models in production."
+        },
+        {
+          "name": "Memory Management And Offloading",
+          "description": "Techniques for extending effective GPU memory via VRAM-to-RAM spillover, paging, and offloading strategies."
+        },
+        {
+          "name": "Post-Training Quantization",
+          "description": "Algorithms that quantize pretrained model weights without retraining, including calibration, scaling, and outlier-handling schemes."
+        },
+        {
+          "name": "Low-Bit Weight Representations",
+          "description": "Aggressive bit-width reductions (1-bit, FP4) and the numerical formats, codebooks, and rounding strategies that make them viable, including QAT and lossless compression."
+        },
+        {
+          "name": "Small Text Language Models",
+          "description": "Compact open-weight text-only LLMs and model families (Granite, Gemma, Mistral, Nemotron, Phi, SmolLM, ERNIE) targeting general-purpose local inference."
+        },
+        {
+          "name": "Small Vision-Language Models",
+          "description": "Open multimodal models for image, document, and video understanding at small parameter scales, including OCR- and document-focused VLMs."
+        },
+        {
+          "name": "Reasoning And Agentic Small Models",
+          "description": "Small models specialized for chain-of-thought reasoning, tool calling, long-horizon agent tasks, and deep research workflows."
+        },
+        {
+          "name": "On-Device And CPU Deployment",
+          "description": "Models and techniques engineered for mobile, edge, and CPU-only inference, including ultra-tiny and recurrent architectures."
+        },
+        {
+          "name": "Encoder-Only And Discriminative Models",
+          "description": "BERT-family encoders, domain-specialized encoder backbones, NER and extraction models, and the runtimes that serve them."
+        }
+      ]
+    },
+    {
+      "name": "Evaluation",
+      "description": "Methods, methodologies, and tooling for assessing the quality, behavior, and reliability of language models, multimodal models, and LLM-powered applications.",
+      "collections": [
+        {
+          "name": "Eval Methodology And Practice",
+          "description": "Practitioner guidance on designing, running, and iterating on evals for LLM systems."
+        },
+        {
+          "name": "Benchmarks And Datasets",
+          "description": "Curated benchmark suites and evaluation datasets used to compare model and system performance, including spatial-intelligence and sports video benchmarks."
+        },
+        {
+          "name": "LLM-As-Judge And Automated Scoring",
+          "description": "Techniques that use models or programmatic graders to score outputs at scale."
+        },
+        {
+          "name": "Human Evaluation And Annotation",
+          "description": "Workflows for human review, preference labeling, and rater calibration."
+        },
+        {
+          "name": "Production Monitoring And Observability",
+          "description": "Continuous evaluation, regression testing, and observability for deployed LLM applications."
+        }
+      ]
+    },
+    {
+      "name": "Safety Hallucination And Security",
+      "description": "Research on detecting and mitigating ungrounded or harmful LLM behavior, enforcing policy through guardrails, and defending against or applying LLMs in adversarial security settings.",
+      "collections": [
+        {
+          "name": "Hallucination Detection",
+          "description": "Trained classifiers and tools that flag hallucinated or unsupported spans in generated text."
+        },
+        {
+          "name": "Multimodal Mirage And Modality Probes",
+          "description": "Methods for identifying when vision-language models answer without using visual input, plus modality-ablation and counterfactual evaluation techniques."
+        },
+        {
+          "name": "Consistency And Uncertainty Aggregation",
+          "description": "Cross-prompt consistency scoring and confidence-weighted aggregation that surface unreliable answers."
+        },
+        {
+          "name": "Benchmark Artifacts And Shortcut Learning",
+          "description": "Studies of how text priors and benchmark leakage let models score well without the intended grounding."
+        },
+        {
+          "name": "Lightweight Classifier Guardrails",
+          "description": "Small specialized classifier models used as fast, composable filters for LLM traffic."
+        },
+        {
+          "name": "PII And Sensitive Data Detection",
+          "description": "Models and techniques for identifying personally identifiable information and other sensitive content in prompts and responses."
+        },
+        {
+          "name": "Prompt Injection And Data Exfiltration Defense",
+          "description": "Detection and prevention of data leakage, hidden malicious prompts, and adversarial misuse of LLM interfaces."
+        },
+        {
+          "name": "Semantic Routing And Policy Enforcement",
+          "description": "Routing and gating of LLM requests based on semantic intent, content categories, and policy rules."
+        },
+        {
+          "name": "LLM Penetration Testing",
+          "description": "LLM agents that perform or assist with penetration testing and comparisons to human security professionals."
+        }
+      ]
+    },
+    {
+      "name": "Prompting Outputs And Classification",
+      "description": "Research on steering LLM behavior through prompt design and optimization, constraining outputs to schemas and grammars, and using LLMs efficiently for classification tasks.",
+      "collections": [
+        {
+          "name": "Automatic Prompt Optimization",
+          "description": "Frameworks and algorithms that programmatically search, refine, or rewrite prompts to maximize task performance."
+        },
+        {
+          "name": "Agentic Prompt Design",
+          "description": "Hand-crafted and agent-mediated prompting patterns that lift model capability on benchmarks and tool-use tasks."
+        },
+        {
+          "name": "LLM-In-The-Loop Prompt Refinement",
+          "description": "Closed-loop setups where one model evaluates outputs and another iteratively edits the prompt."
+        },
+        {
+          "name": "Structured Output Prompting",
+          "description": "Prompting techniques for coaxing models to emit structured artifacts such as diagrams or formal representations."
+        },
+        {
+          "name": "Constrained Decoding Libraries",
+          "description": "Open-source frameworks that enforce structured output across arbitrary LLMs via grammars, regex, or schema-guided decoding."
+        },
+        {
+          "name": "Specialized Models For Structured Output",
+          "description": "Small or fine-tuned models purpose-built to emit valid structured responses."
+        },
+        {
+          "name": "Quality And Reliability Of Structured Output",
+          "description": "Empirical and conceptual analyses of whether constraining outputs helps or hurts model performance."
+        },
+        {
+          "name": "LLM Routing And Cascades",
+          "description": "Calibrated routing and cascading surrogates that learn easy/hard boundaries and forward uncertain inputs to larger models."
+        },
+        {
+          "name": "Unsupervised Classification",
+          "description": "Approaches for assigning categories to data without labeled training examples."
+        },
+        {
+          "name": "Developer LLM Workflows",
+          "description": "Practitioner workflows, repository-to-Markdown ingestion, and process patterns for producing software with LLM code generation."
+        }
+      ]
+    }
+  ],
+  "merge_notes": [
+    "Collapsed all retrieval-flavored proposals (Document Retrieval, Chunking & Embeddings, Graph RAG, Web RAG, Queries, Rerankers, Grounding, RAS) into a single 'Retrieval And RAG' domain with 15 collections; this is the largest domain and the most tempting to split, but every sub-area shares the same retrieve-then-ground research vocabulary so a single domain matches user mental model.",
+    "Merged 'Document Retrieval > Document Parsing And Chunking' partly into Document Understanding (parsing/layout) and partly into Retrieval (chunking strategies); kept chunking under Retrieval because the source proposals consistently treat chunking as a retrieval-pipeline concern.",
+    "Combined 'Conversation Understanding' under Document Understanding rather than its own domain since two of its three collections are extraction/segmentation tasks that share methodology with document parsing; dialogue simulation lives there too for cohesion.",
+    "Folded 'Sports' (commentary generation + spatial intelligence benchmarks) into the broader Evaluation domain as benchmark datasets rather than a standalone domain, since neither paper warrants a top-level home.",
+    "Unified Coding Agents, Computer Use, Automated Browsing, Autoresearch, and the agent-execution-environment collection from 'Academically interesting' under a single Agents domain; this is intentionally broad because all share architectures, sandboxes, and evaluation concerns.",
+    "Merged 'Reducing context / context engineering' into Agents (context engineering is mostly an agent-loop problem here) rather than into Reasoning, matching where the source proposals located it.",
+    "Pulled 'Foundations Of Deep Learning' and 'LLM Behavior And Memory Studies' from Academically interesting into the Reasoning domain since both concern how/why models compute the way they do; an alternative home would have been a standalone 'Foundations' domain but two collections is too thin.",
+    "Quantization sits under 'Inference Systems And Local Models' rather than under 'Training And Adaptation' because the source proposals (Quantization.md, Local LLMs.md) frame it as a deployment/compression concern; QAT is acknowledged in the Low-Bit collection.",
+    "Synthetic Data Generation: training-time pipelines went into 'Training And Adaptation > Synthetic Data For Training', while document-specific synthesis lives in 'Document Understanding > Synthetic Document Data'. The Synthetic Data Generation.md file's single entry maps to the latter.",
+    "Reinforcement Learning collapsed entirely into 'Training And Adaptation' as five collections; no standalone RL domain because all entries are RL-as-post-training rather than RL theory.",
+    "Hallucinations + Guardrails + Security all merged into 'Safety Hallucination And Security' (9 collections) since they share the goal of constraining unsafe or unfaithful behavior; could plausibly be split into two domains but the boundary is fuzzy and the merged domain is well-balanced in size.",
+    "Classification.md (LLM Routing/Cascades + Unsupervised Classification) merged into 'Prompting Outputs And Classification' alongside Prompt Engineering and Structured Outputs; routing is methodologically closer to prompt/output engineering than to retrieval routing.",
+    "'Dev efficiency' was small (2 entries); placed both as a single 'Developer LLM Workflows' collection in Prompting/Outputs/Classification rather than its own domain.",
+    "Non-document extractors and Non-generative models were absorbed: HTML-to-JSON extractor went into Document Understanding > HTML And Web Extraction; encoder/discriminative models went into 'Inference Systems And Local Models > Encoder-Only And Discriminative Models'.",
+    "'Question-Indexed And Pre-Generated Query Retrieval' was originally proposed under Graph RAG but kept as a top-level Retrieval collection since the technique is independent of graph backends.",
+    "Ambiguous call: 'Tool Retrieval And Selection' could live under Retrieval (it is retrieval over tool descriptions) but was placed under Agents since the only relevant proposal framed it as an agent-context-engineering subproblem.",
+    "Ambiguous call: 'Agent Evaluation And Benchmarks' is duplicated in spirit with the general Evaluation domain; kept it under Agents because all source proposals scope it to agent-specific harness/trajectory testing rather than generic LLM evals.",
+    "Academically interesting.md was radically reshaped: its four micro-domains were dispersed across Reasoning (foundations, LLM behavior), Agents (paper-to-code, idea synthesis, agent execution environments) rather than kept as a coherent cluster, since it was explicitly a grab-bag."
+  ]
+}

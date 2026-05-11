@@ -785,11 +785,11 @@ def ingest_post(
 ) -> dict:
     """Run the blog-post ingest pipeline. Returns the summary dict.
 
-    Mirrors :func:`ingest`. If the post links a github repo, the discovered
-    URL is forwarded to the standalone-repo path
-    (:func:`ingest_repo_only`) AFTER the post pipeline finishes. In v1 we
-    don't link the repo back to the post (no ``repos.post_id``); the repo
-    stands on its own.
+    Mirrors :func:`ingest`, but does NOT auto-ingest any github links
+    discovered in the post body. Posts frequently mention unrelated repos
+    in passing, so we don't treat a stray github URL as a "linked repo"
+    here — that signal is only reliable for arxiv papers. If the user
+    wants a repo ingested, they can invoke ``ingest_repo`` directly.
     """
     def _tick(msg: str, done: int, total: int) -> None:
         if progress is not None:
@@ -840,8 +840,6 @@ def ingest_post(
         _tick("already complete", 0, 0)
         return _summary_post(conn, url)
 
-    discovered_repo_url: str | None = None
-
     if Stage.FETCH_POST in stages_to_run:
         _tick(f"starting {Stage.FETCH_POST.value}", done, total)
         pm = fetch_post_stage(
@@ -858,7 +856,6 @@ def ingest_post(
             done += 1
             _tick("complete", done, total)
             return _summary_post(conn, url)
-        discovered_repo_url = pm.code_repo
         done += 1
 
     if post_name is None:
@@ -897,23 +894,6 @@ def ingest_post(
         done += 1
 
     _tick("complete", done, total)
-
-    # v1: discovered repos go through the standalone path. Failures must
-    # not abort the post ingest — log loud and move on.
-    if discovered_repo_url:
-        try:
-            ingest_repo_only(
-                conn=conn,
-                repo_url=discovered_repo_url,
-                force=False,
-                domain=domain,
-            )
-        except Exception as exc:  # noqa: BLE001
-            _LOG.warning(
-                "post-linked repo ingest failed for %s url=%s: %s; "
-                "post ingest is otherwise complete",
-                url, discovered_repo_url, exc,
-            )
 
     return _summary_post(conn, url)
 
