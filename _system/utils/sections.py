@@ -15,7 +15,33 @@ _FENCE_RE = re.compile(r"^\s*(```|~~~)")
 _BREADCRUMB_LEAD_RE = re.compile(r"^#{1,3}\s+\S")
 _WHITESPACE_TOKEN_RE = re.compile(r"\S+")
 
+_BOLD_WRAP_RE = re.compile(r"^\*\*(.+)\*\*$", re.DOTALL)
+_ITALIC_WRAP_RE = re.compile(r"^\*(.+)\*$", re.DOTALL)
+_NUMBER_PREFIX_RE = re.compile(r"^\d+(?:\.\d+)*\.?\s+")
+_INTERNAL_WS_RE = re.compile(r"\s+")
+
 _SECTION_QUERY_MAX_LEN = 500
+
+
+def _normalize_breadcrumb_token(token: str) -> str:
+    """Normalize a single breadcrumb segment for matcher comparison.
+
+    Strips wrapping bold/italic markdown, leading dotted-number prefixes
+    (``4.``, ``4.1.2``), trailing colon, lowercases, and collapses whitespace.
+    Idempotent on already-clean input.
+    """
+    t = token.strip()
+    m = _BOLD_WRAP_RE.match(t)
+    if m:
+        t = m.group(1).strip()
+    m = _ITALIC_WRAP_RE.match(t)
+    if m:
+        t = m.group(1).strip()
+    t = _NUMBER_PREFIX_RE.sub("", t)
+    if t.endswith(":"):
+        t = t[:-1].rstrip()
+    t = _INTERNAL_WS_RE.sub(" ", t)
+    return t.lower()
 
 
 class SectionQueryError(ValueError):
@@ -231,7 +257,7 @@ def _validate_section_query(section_query: str) -> tuple[str, ...]:
                 f"empty segment in breadcrumb {section_query!r}. "
                 f"Use 'Parent > Child' with non-empty segments separated by ' > '."
             )
-        parts.append(stripped.lower())
+        parts.append(_normalize_breadcrumb_token(stripped))
     return tuple(parts)
 
 
@@ -257,7 +283,7 @@ def find_hierarchical_section(markdown: str, section_query: str) -> Optional[str
     for idx, chunk in enumerate(chunks):
         if len(chunk.title_path) < q_len:
             continue
-        if tuple(t.lower() for t in chunk.title_path[-q_len:]) != query_parts:
+        if tuple(_normalize_breadcrumb_token(t) for t in chunk.title_path[-q_len:]) != query_parts:
             continue
 
         end_offset = len(markdown)

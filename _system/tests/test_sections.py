@@ -9,6 +9,7 @@ import pytest
 from _system.utils.sections import (
     SectionChunk,
     SectionQueryError,
+    _normalize_breadcrumb_token,
     find_hierarchical_section,
     split_sections,
     strip_breadcrumb,
@@ -434,6 +435,64 @@ def test_strip_breadcrumb_on_split_output_removes_ancestry(sample_chunks: list[S
         if " > " in c.breadcrumb:
             first_line = stripped.split("\n", 1)[0]
             assert " > " not in first_line
+
+
+# --- breadcrumb normalization ---
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("**Architecture**", "architecture"),
+        ("*Method*", "method"),
+        ("4. Architecture", "architecture"),
+        ("4.1 Document Quality Classifier", "document quality classifier"),
+        ("4.1.2 Sub Step", "sub step"),
+        ("4.1.", "4.1."),  # bare prefix with no title — left alone
+        ("Method:", "method"),
+        ("**4. Architecture**", "architecture"),
+        ("**4.1 Document Quality Classifier**", "document quality classifier"),
+        ("Plain Title", "plain title"),
+        ("plain title", "plain title"),  # idempotent
+        ("  Spaced   Out  ", "spaced out"),
+    ],
+)
+def test_normalize_breadcrumb_token(raw: str, expected: str) -> None:
+    assert _normalize_breadcrumb_token(raw) == expected
+
+
+def test_find_hierarchical_section_strips_bold_wrappers() -> None:
+    """A plain query matches a section whose stored title is wrapped in **bold**."""
+    md = "# **Architecture**\n\nbody text\n"
+    slice_ = find_hierarchical_section(md, "Architecture")
+    assert slice_ is not None
+    assert "body text" in slice_
+
+
+def test_find_hierarchical_section_strips_numbering() -> None:
+    """A plain query matches a section whose stored title carries dotted numbering."""
+    md = "# **4. Architecture**\n\nintro\n\n## **4.1 Document Quality Classifier**\n\ndqc body\n"
+    slice_ = find_hierarchical_section(
+        md, "Architecture > Document Quality Classifier"
+    )
+    assert slice_ is not None
+    assert "dqc body" in slice_
+
+
+def test_find_hierarchical_section_strips_trailing_colon() -> None:
+    """Stored title ending in ':' is matched by a colonless query."""
+    md = "## 4.1 Name:\n\nname body\n"
+    slice_ = find_hierarchical_section(md, "Name")
+    assert slice_ is not None
+    assert "name body" in slice_
+
+
+def test_find_hierarchical_section_verbatim_query_still_matches() -> None:
+    """A verbatim query (already-normalized form on both sides) still resolves."""
+    md = "# **4. Architecture**\n\nbody\n"
+    slice_ = find_hierarchical_section(md, "**4. Architecture**")
+    assert slice_ is not None
+    assert "body" in slice_
 
 
 def test_module_does_not_pull_heavy_deps() -> None:

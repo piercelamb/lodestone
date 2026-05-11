@@ -544,15 +544,15 @@ class TestDbInodePinGuard:
 
 
 class TestToolsList:
-    def test_tools_list_returns_twenty_tools(self):
+    def test_tools_list_returns_twenty_one_tools(self):
         out = mcp_server._handle_tools_list({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         tools = out["result"]["tools"]
-        assert len(tools) == 20
+        assert len(tools) == 21
         names = {t["name"] for t in tools}
         assert names == {
             "search", "bm25", "lookup", "browse", "overview", "collection",
-            "toc", "toc_many", "read", "figure", "repo_tree", "read_code",
-            "repo", "citations", "tables", "schema", "query",
+            "coverage", "toc", "toc_many", "read", "figure", "repo_tree",
+            "read_code", "repo", "citations", "tables", "schema", "query",
             "ingest_paper", "ingest_repo", "ingest_post",
         }
         for t in tools:
@@ -1054,7 +1054,7 @@ class TestProtocolHandshake:
         list_reply = responses[1]
         assert list_reply["id"] == 2
         tools = list_reply["result"]["tools"]
-        assert len(tools) == 20
+        assert len(tools) == 21
         for t in tools:
             assert t["name"].replace("_", "").isalnum()
 
@@ -1287,7 +1287,7 @@ class TestHttpTransport:
         })
         assert code == 200
         tools = body["result"]["tools"]
-        assert len(tools) == 20
+        assert len(tools) == 21
         names = {t["name"] for t in tools}
         assert names == set(mcp_server._TOOL_INDEX.keys())
 
@@ -1552,6 +1552,68 @@ def test_collection_tool_no_image_blocks(overview_db):
     assert not _has_image(resp)
     blocks = _content(resp)
     assert all(b.get("type") == "text" for b in blocks)
+
+
+def _seed_second_collection(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO collection_definitions (domain, name, description) "
+        "VALUES ('rag', 'hybrid', NULL)"
+    )
+    conn.execute(
+        "INSERT INTO papers (arxiv_id, paper_name, title, authors, date, "
+        "abstract, pdf_url, html_source, ingested_at, status, domain, "
+        "collection, needs_review) VALUES "
+        "(?, 'hybrid_paper', 't', '[]', '2024-02-01', 'a', "
+        "'https://x', 'arxiv', '2024-02-01T00:00:00+00:00', 'classified', "
+        "'rag', 'hybrid', 0)",
+        ("2402.99003",),
+    )
+
+
+def test_collection_single_default_includes_abstracts(overview_db):
+    """A single-collection call without `include_abstracts` keeps the
+    legacy default of True."""
+    state = _make_state(overview_db)
+    resp = _call(state, "collection", {"collection": "hier_indexing"})
+    structured = resp["result"]["structuredContent"]
+    assert structured.get("include_abstracts") is True
+    assert structured.get("auto_trimmed") is False
+    papers = structured["collections"][0]["papers"]
+    assert all("abstract" in p for p in papers)
+
+
+def test_collection_multi_default_drops_abstracts(overview_db):
+    """A multi-collection call without `include_abstracts` auto-trims to
+    keep the response slim."""
+    _seed_second_collection(overview_db)
+    state = _make_state(overview_db)
+    resp = _call(state, "collection", {
+        "collection": ["hier_indexing", "hybrid"],
+    })
+    structured = resp["result"]["structuredContent"]
+    assert structured.get("include_abstracts") is False
+    assert structured.get("auto_trimmed") is True
+    for entry in structured["collections"]:
+        for p in entry["papers"]:
+            assert "abstract" not in p
+
+
+def test_collection_multi_explicit_true_keeps_abstracts(overview_db):
+    """Caller can opt into abstracts on a multi call by passing the flag."""
+    _seed_second_collection(overview_db)
+    state = _make_state(overview_db)
+    resp = _call(state, "collection", {
+        "collection": ["hier_indexing", "hybrid"],
+        "include_abstracts": True,
+    })
+    structured = resp["result"]["structuredContent"]
+    assert structured.get("include_abstracts") is True
+    assert structured.get("auto_trimmed") is False
+    abstracts_seen = []
+    for entry in structured["collections"]:
+        for p in entry["papers"]:
+            abstracts_seen.append("abstract" in p)
+    assert abstracts_seen and all(abstracts_seen)
 
 
 def test_collection_tool_missing_required_collection(overview_db):
