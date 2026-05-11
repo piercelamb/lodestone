@@ -52,6 +52,7 @@ from _system.scripts.search import (
     mode_browse,
     mode_citations,
     mode_collection,
+    mode_coverage,
     mode_figure,
     mode_overview,
     mode_query,
@@ -474,6 +475,24 @@ def _figure_only_result(payload: dict, conn: sqlite3.Connection) -> dict:
 # ---------------------------------------------------------------------------
 
 
+_DEFAULT_RECENCY_BOOST = 0.2
+
+
+def _recency_args(args: dict) -> tuple[float, str | None]:
+    """Read ``recency_boost`` / ``since`` from a tool-call payload.
+
+    Single-sources the default so the tool schema's documented default
+    (0.2) and the dispatch fallback can't drift.
+    """
+    recency_boost = (
+        float(args["recency_boost"])
+        if "recency_boost" in args
+        else _DEFAULT_RECENCY_BOOST
+    )
+    since = args.get("since") or None
+    return recency_boost, since
+
+
 def _bm25_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
     query = args["query"]
     scope_val = args.get("scope") or Scope.SECTIONS.value
@@ -482,6 +501,7 @@ def _bm25_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
         filters["domain"] = args["domain"]
     if args.get("collection"):
         filters["collection"] = args["collection"]
+    recency_boost, since = _recency_args(args)
     return mode_bm25(
         conn,
         query=query,
@@ -489,6 +509,8 @@ def _bm25_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
         limit=int(args.get("limit", 15)),
         offset=int(args.get("offset", 0)),
         scope=Scope(scope_val),
+        recency_boost=recency_boost,
+        since=since,
     )
 
 
@@ -498,14 +520,22 @@ def _search_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
     filters: dict[str, Any] = (
         {"domain": args["domain"]} if args.get("domain") else {}
     )
+    union = bool(args.get("union", False))
+    recency_boost, since = _recency_args(args)
     if isinstance(query, list):
         return mode_search_multi(
             conn,
             queries=[str(q) for q in query],
             filters=filters,
             limit=limit,
+            union=union,
+            recency_boost=recency_boost,
+            since=since,
         )
-    return mode_search(conn, query=query, filters=filters, limit=limit)
+    return mode_search(
+        conn, query=query, filters=filters, limit=limit,
+        recency_boost=recency_boost, since=since,
+    )
 
 
 def _lookup_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
@@ -537,13 +567,31 @@ def _overview_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
 def _collection_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
     raw = args["collection"]
     names = [raw] if isinstance(raw, str) else [str(x) for x in raw]
+
+    include_abstracts_raw = args.get("include_abstracts")
+    if include_abstracts_raw is None:
+        include_abstracts = len(names) <= 1
+        auto_trimmed = not include_abstracts
+    else:
+        include_abstracts = bool(include_abstracts_raw)
+        auto_trimmed = False
+
     return mode_collection(
         conn,
         collection_names=names,
         filters={"domain": args.get("domain")},
-        include_abstracts=bool(args.get("include_abstracts", True)),
+        include_abstracts=include_abstracts,
         include_topics=bool(args.get("include_topics", True)),
         limit=int(args.get("limit") or 20),
+        auto_trimmed=auto_trimmed,
+    )
+
+
+def _coverage_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
+    return mode_coverage(
+        conn,
+        topic=args["topic"],
+        domain=args.get("domain") or None,
     )
 
 
@@ -765,6 +813,44 @@ TOOLS: list[dict[str, Any]] = [
                     "maximum": 20,
                     "description": "Max rows per bucket (default 5).",
                 },
+                "union": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "Only meaningful when 'query' is an array. Fuses "
+                        "per-query section/readme buckets into a single "
+                        "ranked list via Reciprocal Rank Fusion (k=60); "
+                        "each hit is tagged with 'matched_queries' (the "
+                        "indices of queries that matched it). Use when you "
+                        "want 'any doc matching any of these N concepts' "
+                        "without merging by hand."
+                    ),
+                },
+                "recency_boost": {
+                    "type": "number",
+                    "default": 0.2,
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "description": (
+                        "Soft tilt toward recent papers. Multiplies BM25 "
+                        "rank by (1 + boost * exp(-age_days/730)) on the "
+                        "sections surface, so a paper from today gets "
+                        "(1+boost) and a 2-year-old paper gets ~(1 + "
+                        "boost/e). Default 0.2 tilts lexical ties toward "
+                        "recent without overwhelming strong-old hits. Pass "
+                        "0.0 to disable. Has no effect on README hits."
+                    ),
+                },
+                "since": {
+                    "type": "string",
+                    "description": (
+                        "Hard floor on publication date. Use for explicit "
+                        "slices like 'only papers from 2025-10 onward'. "
+                        "Accepts YYYY (normalized to YYYY-01-01) or "
+                        "YYYY-MM-DD. Filters readme hits via paper-link "
+                        "only — standalone repos pass through."
+                    ),
+                },
             },
             "required": ["query"],
         },
@@ -831,6 +917,31 @@ TOOLS: list[dict[str, Any]] = [
                         "offset=10, limit=10 returns hits 11-20. The "
                         "response carries `total_hits` and `has_more` "
                         "so you know whether another page exists."
+                    ),
+                },
+                "recency_boost": {
+                    "type": "number",
+                    "default": 0.2,
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "description": (
+                        "Soft tilt toward recent papers. Multiplies BM25 "
+                        "rank by (1 + boost * exp(-age_days/730)) on the "
+                        "sections surface, so a paper from today gets "
+                        "(1+boost) and a 2-year-old paper gets ~(1 + "
+                        "boost/e). Default 0.2 tilts lexical ties toward "
+                        "recent without overwhelming strong-old hits. Pass "
+                        "0.0 to disable. Has no effect on README hits."
+                    ),
+                },
+                "since": {
+                    "type": "string",
+                    "description": (
+                        "Hard floor on publication date. Use for explicit "
+                        "slices like 'only papers from 2025-10 onward'. "
+                        "Accepts YYYY (normalized to YYYY-01-01) or "
+                        "YYYY-MM-DD. Filters readme hits via paper-link "
+                        "only — standalone repos pass through."
                     ),
                 },
             },
@@ -972,14 +1083,17 @@ TOOLS: list[dict[str, Any]] = [
         "name": "collection",
         "description": (
             "Drill into one or more collections (typically picked from "
-            "'overview') and return their papers as a light tree. Default "
-            "response includes paper abstracts and per-paper topics — set "
-            "include_abstracts=false to slim to names+metadata, "
-            "include_topics=false to drop topics. Pass 'collection' as a "
-            "string or array of up to 16 names; missing names land in "
-            "'missing' rather than raising. If a collection name exists "
-            "under multiple domains and 'domain' is not set, all matches "
-            "are returned."
+            "'overview') and return their papers as a light tree. "
+            "include_abstracts defaults to True for a single collection "
+            "and False for multiple, so a fan-out call stays slim; pass "
+            "include_abstracts=true explicitly to force abstracts on a "
+            "multi-collection call. The response carries 'include_abstracts' "
+            "(effective value) and 'auto_trimmed' (whether the slim default "
+            "was applied). Set include_topics=false to drop topics. Pass "
+            "'collection' as a string or array of up to 16 names; missing "
+            "names land in 'missing' rather than raising. If a collection "
+            "name exists under multiple domains and 'domain' is not set, "
+            "all matches are returned."
         ),
         "inputSchema": {
             "type": "object",
@@ -1000,7 +1114,13 @@ TOOLS: list[dict[str, Any]] = [
                     ),
                 },
                 "domain": {"type": "string"},
-                "include_abstracts": {"type": "boolean", "default": True},
+                "include_abstracts": {
+                    "type": "boolean",
+                    "description": (
+                        "Default: True for a single collection, False for "
+                        "multiple. Pass explicitly to override."
+                    ),
+                },
                 "include_topics": {"type": "boolean", "default": True},
                 "limit": {
                     "type": "integer",
@@ -1015,6 +1135,35 @@ TOOLS: list[dict[str, Any]] = [
         "dispatch": _collection_dispatch,
         "attach": AttachMode.NONE,
         "text_format": format_collection_text,
+    },
+    {
+        "name": "coverage",
+        "description": (
+            "Defensible 'does lodestone cover X?' probe. Combines lexical "
+            "hits (FTS over sections + readmes), exact taxonomy matches, "
+            "and fuzzy nearest-neighbors (rapidfuzz >= 70) across "
+            "collections, canonical entities/topics, and aliases. Returns "
+            "structured counts + similarity scores — no heuristic "
+            "high/medium/low synthesis. Use when you need to back a "
+            "negative claim ('lodestone has no first-class coverage of X') "
+            "with a single citable lookup."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "topic": {
+                    "type": "string",
+                    "description": "The concept name to probe.",
+                },
+                "domain": {
+                    "type": "string",
+                    "description": "Optional: restrict the probe to one domain.",
+                },
+            },
+            "required": ["topic"],
+        },
+        "dispatch": _coverage_dispatch,
+        "attach": AttachMode.NONE,
     },
     {
         "name": "toc",

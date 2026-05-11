@@ -69,6 +69,74 @@ _LOG = get_logger("scripts.search")
 # JSON payload size even on queries that return many hits.
 _ENTITY_PREVIEW_LIMIT = 5
 
+# Recency soft-tilt e-fold (days). Used as the divisor inside the exp()
+# decay so the multiplier drops to (1 + boost/e) at this age. 730 ≈ 2y.
+RECENCY_DECAY_DAYS = 730
+
+
+def _probe_sqlite_has_exp() -> bool:
+    """Probe whether SQLite was built with the math extension (``exp()``).
+
+    SQLite 3.35+ ships math by default; older bundles (rare on modern
+    Pythons) return ``no such function``. We probe once at import so the
+    recency-boost query builder can fall back to a piecewise CASE form.
+    """
+    try:
+        with sqlite3.connect(":memory:") as c:
+            c.execute("SELECT exp(0.0)").fetchone()
+        return True
+    except sqlite3.OperationalError:
+        return False
+
+
+_SQLITE_HAS_EXP = _probe_sqlite_has_exp()
+
+
+_SINCE_YEAR_RE = re.compile(r"^\d{4}$")
+_SINCE_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class InvalidSinceError(ValueError):
+    """Raised when ``since=`` is neither ``YYYY`` nor ``YYYY-MM-DD``."""
+
+
+def _normalize_since(since: str) -> str:
+    """Return ``since`` as an ISO ``YYYY-MM-DD`` string.
+
+    Accepts bare year (``"2026"`` → ``"2026-01-01"``) or full ISO date
+    (``"2026-03-15"`` unchanged). Anything else raises
+    :class:`InvalidSinceError`.
+    """
+    s = since.strip()
+    if _SINCE_YEAR_RE.match(s):
+        return f"{s}-01-01"
+    if _SINCE_DATE_RE.match(s):
+        return s
+    raise InvalidSinceError(
+        f"since={since!r} not in YYYY or YYYY-MM-DD form"
+    )
+
+
+def _recency_order_sql() -> str:
+    """SQL snippet (excluding leading 'ORDER BY ') for recency-tilted rank.
+
+    Two bind parameters expected when ``_SQLITE_HAS_EXP``:
+    ``recency_boost`` then ``RECENCY_DECAY_DAYS``. The fallback path takes
+    only ``recency_boost``.
+    """
+    if _SQLITE_HAS_EXP:
+        return (
+            "rank * (1.0 + ? * COALESCE("
+            "exp((julianday(p.date) - julianday('now')) / ?), 0))"
+        )
+    return (
+        "rank * (1.0 + ? * (CASE "
+        "WHEN p.date IS NULL THEN 0 "
+        "WHEN julianday('now') - julianday(p.date) < 365 THEN 1.0 "
+        "WHEN julianday('now') - julianday(p.date) < 1095 THEN 0.5 "
+        "ELSE 0.1 END))"
+    )
+
 
 def _read_source_markdown(
     conn: sqlite3.Connection, slug: str,
@@ -192,6 +260,7 @@ class ParsedQuery:
 
     fts_expression: str
     qualifiers: dict[str, str] = field(default_factory=dict)
+    or_fallback_expression: str | None = None
 
 
 def _read_quoted(query: str, i: int) -> tuple[str, int]:
@@ -415,13 +484,28 @@ def _parse_github_query(query: str) -> ParsedQuery:
     _validate_operator_placement(tokens, raw=query)
 
     fts_expression = _join_tokens_for_fts5(tokens)
+
+    # OR fallback is only safe when the user typed *bare* tokens with no
+    # explicit AND/OR/NOT. If they wrote operators, we respect their intent.
+    has_explicit_op = any(t in _OPERATORS for t in tokens)
+    operand_count = sum(
+        1 for t in tokens if t not in _OPERATORS and t not in ("(", ")")
+    )
+    if not has_explicit_op and operand_count >= 2:
+        or_fallback_expression: str | None = _join_tokens_for_fts5(
+            tokens, connector="OR",
+        )
+    else:
+        or_fallback_expression = None
+
     return ParsedQuery(
         fts_expression=fts_expression,
         qualifiers=qualifiers,
+        or_fallback_expression=or_fallback_expression,
     )
 
 
-def _join_tokens_for_fts5(tokens: list[str]) -> str:
+def _join_tokens_for_fts5(tokens: list[str], *, connector: str = "AND") -> str:
     """Reassemble parsed tokens into a valid FTS5 MATCH expression.
 
     FTS5 accepts juxtaposition as implicit AND for *most* token sequences,
@@ -429,10 +513,10 @@ def _join_tokens_for_fts5(tokens: list[str]) -> str:
     a phrase or prefix marker — ``( "a" ) "b"*`` raises ``fts5: syntax
     error near ""b""`` even though the same expression with explicit
     ``AND`` works. To stay compatible across operator/group/prefix
-    combinations we emit ``AND`` between every pair of adjacent operands
-    (an "operand" being either a phrase token or a closing paren). This
-    is functionally identical to implicit AND for FTS5 but parses cleanly
-    in every case.
+    combinations we emit ``connector`` (default ``AND``) between every
+    pair of adjacent operands (an "operand" being either a phrase token
+    or a closing paren). Pass ``connector="OR"`` for the bare-token
+    zero-hit fallback.
     """
     out: list[str] = []
     for tok in tokens:
@@ -441,7 +525,7 @@ def _join_tokens_for_fts5(tokens: list[str]) -> str:
             prev_ends_operand = prev not in _OPERATORS and prev != "("
             next_starts_operand = tok not in _OPERATORS and tok != ")"
             if prev_ends_operand and next_starts_operand:
-                out.append("AND")
+                out.append(connector)
         out.append(tok)
     return " ".join(out)
 
@@ -550,6 +634,8 @@ def mode_bm25(
     offset: int = 0,
     scope: Scope = Scope.SECTIONS,
     snippet_tokens: int = 256,
+    recency_boost: float = 0.0,
+    since: str | None = None,
 ) -> dict[str, Any]:
     """BM25 text search across ``sections`` and/or ``readmes_fts``.
 
@@ -645,24 +731,44 @@ def mode_bm25(
             error="query held only qualifiers, no FTS body",
         )
 
-    if scope is Scope.SECTIONS:
-        result = _bm25_sections(
-            conn, fts_expression=parsed.fts_expression,
+    try:
+        since_iso = _normalize_since(since) if since is not None else None
+    except InvalidSinceError as e:
+        return _malformed_query_payload(
+            mode="sections", query=query, error=str(e),
+        )
+
+    def _run(expr: str) -> dict[str, Any]:
+        if scope is Scope.SECTIONS:
+            return _bm25_sections(
+                conn, fts_expression=expr,
+                domain=domain, collection=collection, paper_name=paper_name,
+                limit=limit, offset=offset, snippet_tokens=snippet_tokens,
+                recency_boost=recency_boost, since_iso=since_iso,
+            )
+        if scope is Scope.READMES:
+            return _bm25_readmes(
+                conn, fts_expression=expr,
+                domain=domain, collection=collection, paper_name=paper_name,
+                limit=limit, offset=offset, snippet_tokens=snippet_tokens,
+                since_iso=since_iso,
+            )
+        return _bm25_both(
+            conn, fts_expression=expr,
             domain=domain, collection=collection, paper_name=paper_name,
             limit=limit, offset=offset, snippet_tokens=snippet_tokens,
+            recency_boost=recency_boost, since_iso=since_iso,
         )
-    elif scope is Scope.READMES:
-        result = _bm25_readmes(
-            conn, fts_expression=parsed.fts_expression,
-            domain=domain, collection=collection, paper_name=paper_name,
-            limit=limit, offset=offset, snippet_tokens=snippet_tokens,
-        )
-    else:
-        result = _bm25_both(
-            conn, fts_expression=parsed.fts_expression,
-            domain=domain, collection=collection, paper_name=paper_name,
-            limit=limit, offset=offset, snippet_tokens=snippet_tokens,
-        )
+
+    result = _run(parsed.fts_expression)
+    if (
+        parsed.or_fallback_expression
+        and not result.get("results")
+        and not result.get("repo_results")
+    ):
+        result = _run(parsed.or_fallback_expression)
+        if result.get("results") or result.get("repo_results"):
+            result["fallback"] = "OR"
     result["query"] = query
     return result
 
@@ -678,6 +784,8 @@ def _bm25_sections(
     offset: int = 0,
     snippet_tokens: int = 10,
     enrich: bool = True,
+    recency_boost: float = 0.0,
+    since_iso: str | None = None,
 ) -> dict[str, Any]:
     # sections columns: (paper_id, domain, paper_name, section_title, section_level, body)
     # snippet() against 'body' = column index 5.
@@ -688,6 +796,12 @@ def _bm25_sections(
     join_sql = ""
     wheres = ["sections MATCH ?"]
     where_params: list[Any] = [fts_expression]
+    needs_paper_join = recency_boost > 0 or since_iso is not None
+    if needs_paper_join:
+        join_sql += " JOIN papers p ON p.id = s.paper_id"
+    if since_iso is not None:
+        wheres.append("p.date >= ?")
+        where_params.append(since_iso)
     if domain:
         wheres.append("s.domain = ?")
         where_params.append(domain)
@@ -717,6 +831,15 @@ def _bm25_sections(
         where_params.append(collection)
     where_clause = " WHERE " + " AND ".join(wheres)
 
+    if recency_boost > 0:
+        order_sql = _recency_order_sql()
+        order_params: list[Any] = [recency_boost]
+        if _SQLITE_HAS_EXP:
+            order_params.append(RECENCY_DECAY_DAYS)
+    else:
+        order_sql = "rank"
+        order_params = []
+
     sql = (
         "SELECT s.paper_id, s.domain, s.paper_name, s.section_title, "
         "       s.section_level, "
@@ -725,9 +848,11 @@ def _bm25_sections(
         "  FROM sections s"
         + join_sql
         + where_clause
-        + " ORDER BY rank LIMIT ? OFFSET ?"
+        + f" ORDER BY {order_sql} LIMIT ? OFFSET ?"
     )
-    rows = conn.execute(sql, [*where_params, limit, offset]).fetchall()
+    rows = conn.execute(
+        sql, [*where_params, *order_params, limit, offset]
+    ).fetchall()
     total_hits = _bm25_total_hits(
         conn,
         count_sql=(
@@ -790,22 +915,40 @@ def _bm25_readmes(
     offset: int = 0,
     snippet_tokens: int = 10,
     enrich: bool = True,
+    since_iso: str | None = None,
 ) -> dict[str, Any]:
     """BM25 against ``readmes_fts``. Each result is keyed by ``repo_slug``
     (the repo is the searchable unit). When the repo is paper-linked the
     envelope also carries ``paper_name`` + paper title so callers can
-    pivot back to the prose surfaces."""
+    pivot back to the prose surfaces.
+
+    ``recency_boost`` is intentionally unsupported here — repos carry no
+    research-recency date (``repos.fetched_at`` is an operational
+    timestamp). ``since_iso`` filters paper-linked repos through
+    ``papers.date``; standalone (non-paper-linked) repos pass through
+    unaffected. ``since_iso`` must already be in ``YYYY-MM-DD`` form.
+    """
     join_sql = " JOIN repos rr ON rr.id = r.repo_id"
     wheres = ["readmes_fts MATCH ?"]
     where_params: list[Any] = [fts_expression]
-    if domain:
-        wheres.append("r.domain = ?")
-        where_params.append(domain)
+    paper_join_for_paper_name = False
     if paper_name:
         # Restrict to a paper-linked repo for this paper.
         join_sql += " JOIN papers pp ON pp.id = rr.paper_id"
         wheres.append("pp.paper_name = ?")
         where_params.append(paper_name)
+        paper_join_for_paper_name = True
+    if since_iso is not None:
+        if paper_join_for_paper_name:
+            wheres.append("pp.date >= ?")
+            where_params.append(since_iso)
+        else:
+            join_sql += " LEFT JOIN papers pp ON pp.id = rr.paper_id"
+            wheres.append("(pp.date IS NULL OR pp.date >= ?)")
+            where_params.append(since_iso)
+    if domain:
+        wheres.append("r.domain = ?")
+        where_params.append(domain)
     if collection:
         wheres.append("rr.collection = ?")
         where_params.append(collection)
@@ -937,6 +1080,8 @@ def _bm25_both(
     offset: int = 0,
     snippet_tokens: int = 10,
     enrich: bool = True,
+    recency_boost: float = 0.0,
+    since_iso: str | None = None,
 ) -> dict[str, Any]:
     """Union of sections + READMES hits.
 
@@ -952,12 +1097,14 @@ def _bm25_both(
         domain=domain, collection=collection, paper_name=paper_name,
         limit=limit, offset=offset,
         snippet_tokens=snippet_tokens, enrich=enrich,
+        recency_boost=recency_boost, since_iso=since_iso,
     )
     rdm = _bm25_readmes(
         conn, fts_expression=fts_expression,
         domain=domain, collection=collection, paper_name=paper_name,
         limit=limit, offset=offset,
         snippet_tokens=snippet_tokens, enrich=enrich,
+        since_iso=since_iso,
     )
 
     total_hits = int(sec.get("total_hits", 0)) + int(rdm.get("total_hits", 0))
@@ -1466,6 +1613,8 @@ def mode_search(
     query: str,
     filters: dict[str, Any],
     limit: int = 5,
+    recency_boost: float = 0.0,
+    since: str | None = None,
 ) -> dict[str, Any]:
     """First-pass exploratory search across the corpus.
 
@@ -1544,75 +1693,106 @@ def mode_search(
             error="query held only qualifiers, no FTS body",
         )
 
-    # Unqueried buckets are OMITTED from the payload (vs emitted as []) so
-    # the agent reads "skipped" rather than "searched and found nothing."
-    taxonomy: list[dict[str, Any]] | None = None
-    if want_taxonomy:
-        taxonomy = _search_taxonomy(
-            conn,
-            fts_expression=parsed.fts_expression,
-            domain=domain,
-            kind=kind_filter,
-            limit=limit,
+    try:
+        since_iso = _normalize_since(since) if since is not None else None
+    except InvalidSinceError as e:
+        return _malformed_query_payload(
+            mode="search", query=query, error=str(e),
         )
 
-    sections_slim: list[dict[str, Any]] | None = None
-    if want_sections:
-        sections_payload = _bm25_sections(
-            conn,
-            fts_expression=parsed.fts_expression,
-            domain=domain,
-            collection=collection,
-            paper_name=paper_name,
-            limit=limit,
-            snippet_tokens=64,
-            enrich=False,
-        )
-        sections_slim = [
-            {
-                "paper_name": g["paper_name"],
-                "hit_count": g.get("hit_count", 0),
-                "hits": [
-                    {
-                        "section_title": s.get("section_title", ""),
-                        "breadcrumb": s.get("breadcrumb", ""),
-                        "snippet": s.get("snippet", ""),
-                    }
-                    for s in g.get("sections", [])
-                    if s.get("section_title")
-                ],
-            }
-            for g in sections_payload.get("results", [])
-        ]
+    def _run(expr: str) -> tuple[
+        list[dict[str, Any]] | None,
+        list[dict[str, Any]] | None,
+        list[dict[str, Any]] | None,
+    ]:
+        # Unqueried buckets are OMITTED from the payload (vs emitted as []) so
+        # the agent reads "skipped" rather than "searched and found nothing."
+        tax: list[dict[str, Any]] | None = None
+        if want_taxonomy:
+            tax = _search_taxonomy(
+                conn,
+                fts_expression=expr,
+                domain=domain,
+                kind=kind_filter,
+                limit=limit,
+            )
 
-    readmes_slim: list[dict[str, Any]] | None = None
-    if want_readmes:
-        readmes_slim = []
-        readmes_payload = _bm25_readmes(
-            conn,
-            fts_expression=parsed.fts_expression,
-            domain=domain,
-            collection=collection,
-            paper_name=paper_name,
-            limit=limit,
-            snippet_tokens=64,
-            enrich=False,
-        )
-        for g in readmes_payload.get("results", []):
-            rh = g.get("readme_hit") or {}
-            readmes_slim.append({
-                "repo_slug": g["repo_slug"],
-                "paper_name": g.get("paper_name"),
-                "hit_count": g.get("hit_count", 0),
-                "path": rh.get("path"),
-                "snippet": rh.get("snippet"),
-            })
+        sec_slim: list[dict[str, Any]] | None = None
+        if want_sections:
+            sec_payload = _bm25_sections(
+                conn,
+                fts_expression=expr,
+                domain=domain,
+                collection=collection,
+                paper_name=paper_name,
+                limit=limit,
+                snippet_tokens=64,
+                enrich=False,
+                recency_boost=recency_boost,
+                since_iso=since_iso,
+            )
+            sec_slim = [
+                {
+                    "paper_name": g["paper_name"],
+                    "hit_count": g.get("hit_count", 0),
+                    "hits": [
+                        {
+                            "section_title": s.get("section_title", ""),
+                            "breadcrumb": s.get("breadcrumb", ""),
+                            "snippet": s.get("snippet", ""),
+                        }
+                        for s in g.get("sections", [])
+                        if s.get("section_title")
+                    ],
+                }
+                for g in sec_payload.get("results", [])
+            ]
+
+        rdm_slim: list[dict[str, Any]] | None = None
+        if want_readmes:
+            rdm_slim = []
+            rdm_payload = _bm25_readmes(
+                conn,
+                fts_expression=expr,
+                domain=domain,
+                collection=collection,
+                paper_name=paper_name,
+                limit=limit,
+                snippet_tokens=64,
+                enrich=False,
+                since_iso=since_iso,
+            )
+            for g in rdm_payload.get("results", []):
+                rh = g.get("readme_hit") or {}
+                rdm_slim.append({
+                    "repo_slug": g["repo_slug"],
+                    "paper_name": g.get("paper_name"),
+                    "hit_count": g.get("hit_count", 0),
+                    "path": rh.get("path"),
+                    "snippet": rh.get("snippet"),
+                })
+        return tax, sec_slim, rdm_slim
+
+    taxonomy, sections_slim, readmes_slim = _run(parsed.fts_expression)
+    fallback_used: str | None = None
+    if (
+        parsed.or_fallback_expression
+        and not taxonomy
+        and not sections_slim
+        and not readmes_slim
+    ):
+        tax2, sec2, rdm2 = _run(parsed.or_fallback_expression)
+        if tax2 or sec2 or rdm2:
+            taxonomy, sections_slim, readmes_slim = tax2, sec2, rdm2
+            fallback_used = "OR"
 
     payload: dict[str, Any] = {
         "mode": "search",
         "query": query,
         "domain": domain or None,
     }
+    if fallback_used:
+        payload["fallback"] = fallback_used
     if taxonomy is not None:
         payload["taxonomy"] = taxonomy
     if sections_slim is not None:
@@ -1625,12 +1805,90 @@ def mode_search(
 _MAX_SEARCH_MULTI_QUERIES = 8
 
 
+_RRF_K = 60
+_UNION_MAX_RESULTS = 50
+
+
+def _rrf_merge(
+    per_query_payloads: list[dict[str, Any]],
+    *,
+    cap: int,
+) -> list[dict[str, Any]]:
+    """Reciprocal Rank Fusion across per-query ``mode_search`` payloads.
+
+    Each payload's ``sections`` and ``readmes`` buckets are flattened into a
+    ranked sequence and fused with score ``sum(1 / (k + rank))`` over the
+    queries where each doc appears. Dedup keys:
+
+    - ``("section", paper_name, section_title)``
+    - ``("readme", repo_slug)``
+
+    Returns a single ranked list capped at ``cap`` rows. Each row carries
+    its ``score`` and ``matched_queries`` (the indices of queries where it
+    appeared, in ascending order).
+    """
+    accum: dict[tuple[str, str, str | None], dict[str, Any]] = {}
+
+    for q_idx, payload in enumerate(per_query_payloads):
+        rank = 0
+        for paper_group in payload.get("sections") or []:
+            paper_name = paper_group.get("paper_name") or ""
+            for hit in paper_group.get("hits") or []:
+                section_title = hit.get("section_title") or ""
+                rank += 1
+                key = ("section", paper_name, section_title)
+                doc = accum.get(key)
+                if doc is None:
+                    doc = {
+                        "surface": "section",
+                        "paper_name": paper_name,
+                        "section_title": section_title,
+                        "breadcrumb": hit.get("breadcrumb", ""),
+                        "snippet": hit.get("snippet", ""),
+                        "score": 0.0,
+                        "matched_queries": [],
+                    }
+                    accum[key] = doc
+                doc["score"] += 1.0 / (_RRF_K + rank)
+                # q_idx is monotonically increasing across the outer loop, so
+                # checking only the tail suffices to dedupe.
+                if not doc["matched_queries"] or doc["matched_queries"][-1] != q_idx:
+                    doc["matched_queries"].append(q_idx)
+
+        rank = 0
+        for repo in payload.get("readmes") or []:
+            repo_slug = repo.get("repo_slug") or ""
+            rank += 1
+            key = ("readme", repo_slug, None)
+            doc = accum.get(key)
+            if doc is None:
+                doc = {
+                    "surface": "readme",
+                    "repo_slug": repo_slug,
+                    "paper_name": repo.get("paper_name"),
+                    "path": repo.get("path"),
+                    "snippet": repo.get("snippet"),
+                    "score": 0.0,
+                    "matched_queries": [],
+                }
+                accum[key] = doc
+            doc["score"] += 1.0 / (_RRF_K + rank)
+            if not doc["matched_queries"] or doc["matched_queries"][-1] != q_idx:
+                doc["matched_queries"].append(q_idx)
+
+    merged = sorted(accum.values(), key=lambda d: d["score"], reverse=True)
+    return merged[:cap]
+
+
 def mode_search_multi(
     conn: sqlite3.Connection,
     *,
     queries: list[str],
     filters: dict[str, Any],
     limit: int = 5,
+    union: bool = False,
+    recency_boost: float = 0.0,
+    since: str | None = None,
 ) -> dict[str, Any]:
     """Run multiple ``mode_search`` queries independently and concatenate
     their per-query payloads into one envelope.
@@ -1640,6 +1898,11 @@ def mode_search_multi(
     operators, and soft-failure statuses (``empty_query`` /
     ``malformed_query``) are preserved on each sub-result. Filters
     supplied as kwargs apply uniformly to every query.
+
+    When ``union=True``, the per-query section/readme buckets are fused
+    into a single ranked list via Reciprocal Rank Fusion (k=60), with
+    each hit tagged with the indices of queries that matched it. Default
+    ``union=False`` preserves the per-query block shape.
 
     The envelope shape is::
 
@@ -1670,16 +1933,25 @@ def mode_search_multi(
             ),
         )
     results = [
-        mode_search(conn, query=q, filters=filters, limit=limit)
+        mode_search(
+            conn, query=q, filters=filters, limit=limit,
+            recency_boost=recency_boost, since=since,
+        )
         for q in queries
     ]
-    return {
+    envelope: dict[str, Any] = {
         "mode": "search",
         "multi": True,
         "queries": list(queries),
         "domain": filters.get("domain") or None,
-        "results": results,
     }
+    if union:
+        cap = min(limit * len(queries), _UNION_MAX_RESULTS)
+        envelope["union"] = True
+        envelope["results"] = _rrf_merge(results, cap=cap)
+    else:
+        envelope["results"] = results
+    return envelope
 
 
 def _search_taxonomy(
@@ -2086,6 +2358,7 @@ def mode_collection(
     include_abstracts: bool = True,
     include_topics: bool = True,
     limit: int = 20,
+    auto_trimmed: bool = False,
 ) -> dict[str, Any]:
     """Drill into one or more collections; return their papers (with
     abstracts/topics by default).
@@ -2280,6 +2553,201 @@ def mode_collection(
         "domain": domain_filter,
         "collections": entries,
         "missing": missing,
+        "include_abstracts": include_abstracts,
+        "auto_trimmed": auto_trimmed,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Mode — Coverage
+# ---------------------------------------------------------------------------
+
+
+_COVERAGE_FUZZY_THRESHOLD = 70
+_COVERAGE_TOP_K = 5
+
+
+def mode_coverage(
+    conn: sqlite3.Connection,
+    *,
+    topic: str,
+    domain: str | None = None,
+) -> dict[str, Any]:
+    """Multi-source coverage probe for ``topic``.
+
+    Combines lexical FTS hits, exact taxonomy matches, and fuzzy
+    nearest-neighbor matches so a caller can defensibly answer "does
+    lodestone have first-class coverage of X?" in a single call.
+
+    The structured counts + similarity scores are the citation-grade
+    signal — no heuristic high/medium/low synthesis here.
+    """
+    from rapidfuzz import fuzz
+
+    topic_clean = (topic or "").strip()
+    if not topic_clean:
+        raise ValueError("coverage(topic) requires a non-empty string")
+    topic_lower = topic_clean.lower()
+
+    # FTS hits: parse the topic through the same query parser so
+    # punctuation is defanged consistently with the other search surfaces.
+    try:
+        parsed = _parse_github_query(topic_clean)
+        fts_expr = parsed.fts_expression
+    except GitHubQueryError:
+        fts_expr = ""
+
+    papers_matched = 0
+    papers_top: list[dict[str, Any]] = []
+    repos_matched = 0
+    repos_top: list[dict[str, Any]] = []
+
+    if fts_expr:
+        section_sql = (
+            "SELECT s.paper_name, s.section_title "
+            "  FROM sections s "
+            " WHERE sections MATCH ?"
+        )
+        params: list[Any] = [fts_expr]
+        if domain:
+            section_sql += " AND s.domain = ?"
+            params.append(domain)
+        section_sql += f" ORDER BY rank LIMIT {_COVERAGE_TOP_K}"
+        papers_top = [
+            {"paper_name": pn, "section_title": st}
+            for pn, st in conn.execute(section_sql, params).fetchall()
+        ]
+        count_sql = "SELECT COUNT(DISTINCT s.paper_id) FROM sections s WHERE sections MATCH ?"
+        count_params: list[Any] = [fts_expr]
+        if domain:
+            count_sql += " AND s.domain = ?"
+            count_params.append(domain)
+        row = conn.execute(count_sql, count_params).fetchone()
+        papers_matched = int(row[0] or 0) if row else 0
+
+        readme_sql = (
+            "SELECT r.repo_slug, r.path "
+            "  FROM readmes_fts r"
+            "  JOIN repos rr ON rr.id = r.repo_id"
+            " WHERE readmes_fts MATCH ?"
+        )
+        params = [fts_expr]
+        if domain:
+            readme_sql += " AND r.domain = ?"
+            params.append(domain)
+        readme_sql += f" ORDER BY rank LIMIT {_COVERAGE_TOP_K}"
+        repos_top = [
+            {"repo_slug": rs, "path": pp}
+            for rs, pp in conn.execute(readme_sql, params).fetchall()
+        ]
+        count_sql = (
+            "SELECT COUNT(DISTINCT r.repo_id) FROM readmes_fts r"
+            " WHERE readmes_fts MATCH ?"
+        )
+        count_params = [fts_expr]
+        if domain:
+            count_sql += " AND r.domain = ?"
+            count_params.append(domain)
+        row = conn.execute(count_sql, count_params).fetchone()
+        repos_matched = int(row[0] or 0) if row else 0
+
+    # Exact collection match (case-insensitive on name).
+    coll_sql = (
+        "SELECT name, domain FROM collection_definitions "
+        " WHERE LOWER(name) = LOWER(?)"
+    )
+    coll_params: list[Any] = [topic_clean]
+    if domain:
+        coll_sql += " AND domain = ?"
+        coll_params.append(domain)
+    collections_exact = [
+        {"name": n, "domain": d}
+        for n, d in conn.execute(coll_sql, coll_params).fetchall()
+    ]
+
+    # Fuzzy collection match.
+    coll_all_sql = "SELECT name, domain FROM collection_definitions"
+    coll_all_params: list[Any] = []
+    if domain:
+        coll_all_sql += " WHERE domain = ?"
+        coll_all_params.append(domain)
+    fuzzy_collections: list[dict[str, Any]] = []
+    for name, dom in conn.execute(coll_all_sql, coll_all_params).fetchall():
+        ratio = int(fuzz.ratio(topic_lower, str(name).lower()))
+        if ratio >= _COVERAGE_FUZZY_THRESHOLD:
+            fuzzy_collections.append(
+                {"name": name, "domain": dom, "similarity": ratio}
+            )
+    fuzzy_collections.sort(key=lambda r: r["similarity"], reverse=True)
+    fuzzy_collections = fuzzy_collections[:_COVERAGE_TOP_K]
+
+    # Fuzzy canonical-term match, bucketed by term_type.
+    term_sql = "SELECT canonical_name, term_type, domain FROM canonical_terms"
+    term_params: list[Any] = []
+    if domain:
+        term_sql += " WHERE domain = ?"
+        term_params.append(domain)
+    by_bucket: dict[str, list[dict[str, Any]]] = {
+        "entity": [], "topic": [], "collection": [],
+    }
+    for canonical, term_type, dom in conn.execute(term_sql, term_params).fetchall():
+        ratio = int(fuzz.ratio(topic_lower, str(canonical).lower()))
+        if ratio < _COVERAGE_FUZZY_THRESHOLD:
+            continue
+        bucket = by_bucket.get(term_type)
+        if bucket is None:
+            continue
+        bucket.append({
+            "canonical_name": canonical,
+            "term_type": term_type,
+            "domain": dom,
+            "similarity": ratio,
+        })
+    for bucket in by_bucket.values():
+        bucket.sort(key=lambda r: r["similarity"], reverse=True)
+
+    # Fuzzy alias match.
+    alias_sql = (
+        "SELECT ta.alias, ct.canonical_name, ct.term_type, ta.source_paper, "
+        "       ct.domain "
+        "  FROM term_aliases ta "
+        "  JOIN canonical_terms ct ON ct.id = ta.term_id"
+    )
+    alias_params: list[Any] = []
+    if domain:
+        alias_sql += " WHERE ct.domain = ?"
+        alias_params.append(domain)
+    fuzzy_aliases: list[dict[str, Any]] = []
+    for alias, canonical, term_type, source_paper, dom in conn.execute(
+        alias_sql, alias_params
+    ).fetchall():
+        ratio = int(fuzz.ratio(topic_lower, str(alias).lower()))
+        if ratio < _COVERAGE_FUZZY_THRESHOLD:
+            continue
+        fuzzy_aliases.append({
+            "alias": alias,
+            "canonical_name": canonical,
+            "term_type": term_type,
+            "source_paper": source_paper,
+            "domain": dom,
+            "similarity": ratio,
+        })
+    fuzzy_aliases.sort(key=lambda r: r["similarity"], reverse=True)
+    fuzzy_aliases = fuzzy_aliases[:_COVERAGE_TOP_K]
+
+    return {
+        "mode": "coverage",
+        "topic": topic_clean,
+        "domain": domain,
+        "papers_matched": papers_matched,
+        "papers_top": papers_top,
+        "repos_matched": repos_matched,
+        "repos_top": repos_top,
+        "collections_exact": collections_exact,
+        "collections_nearest": fuzzy_collections,
+        "entities_nearest": by_bucket["entity"][:_COVERAGE_TOP_K],
+        "topics_nearest": by_bucket["topic"][:_COVERAGE_TOP_K],
+        "aliases_nearest": fuzzy_aliases,
     }
 
 
@@ -3638,6 +4106,42 @@ def _format_search_multi_markdown(payload: dict[str, Any]) -> str:
     if domain:
         header += f"  [domain={domain}]"
     parts: list[str] = [header, ""]
+
+    if payload.get("union"):
+        parts.append(f"_union mode — RRF-fused across {n} queries_")
+        parts.append("")
+        for i, q in enumerate(queries):
+            parts.append(f"- q{i}: {q!r}")
+        parts.append("")
+        merged = payload.get("results") or []
+        parts.append(f"## merged results ({len(merged)})")
+        if not merged:
+            parts.append("(none)")
+        for row in merged:
+            mq = ",".join(f"q{j}" for j in row.get("matched_queries", []))
+            score = row.get("score", 0.0)
+            if row.get("surface") == "section":
+                heading = (
+                    _clean_breadcrumb_for_display(row.get("breadcrumb", ""))
+                    or row.get("section_title", "?")
+                )
+                snip = " ".join((row.get("snippet") or "").strip().split())
+                parts.append(
+                    f"- [{mq}] **{row.get('paper_name', '?')}** — {heading} "
+                    f"(score={score:.4f})"
+                )
+                if snip:
+                    parts.append(f"  {snip}")
+            else:
+                ident = row.get("repo_slug") or row.get("paper_name") or "?"
+                path = row.get("path") or ""
+                snip = " ".join((row.get("snippet") or "").strip().split())
+                parts.append(
+                    f"- [{mq}] readme: {ident}: {path} (score={score:.4f})"
+                )
+                if snip:
+                    parts.append(f"  {snip}")
+        return "\n".join(parts).rstrip() + "\n"
 
     for i, sub in enumerate(payload.get("results") or [], start=1):
         q = sub.get("query", "")

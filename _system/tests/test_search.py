@@ -825,6 +825,185 @@ def _seed_paginated_sections(
     )
 
 
+class TestModeBM25OrFallback:
+    """AND→OR fallback on zero hits for queries that contained only bare
+    tokens. User-typed AND/OR/NOT operators are always respected."""
+
+    def test_multi_token_miss_rescued_by_or(self, seeded_db):
+        # "BookRAG" matches paper 1; "supercalifragilistic" matches nothing.
+        # Default AND join → zero hits. OR fallback → BookRAG rescues.
+        r = search_mod.mode_bm25(
+            seeded_db,
+            query="BookRAG supercalifragilistic",
+            filters={},
+            limit=10,
+        )
+        assert r.get("fallback") == "OR"
+        assert any(h["paper_name"] == "bookrag_2024" for h in r["results"])
+
+    def test_single_token_miss_no_fallback(self, seeded_db):
+        # Single token can't be OR'd with anything — no fallback flag.
+        r = search_mod.mode_bm25(
+            seeded_db,
+            query="supercalifragilistic",
+            filters={},
+            limit=10,
+        )
+        assert "fallback" not in r
+        assert r["results"] == []
+
+    def test_explicit_and_miss_respects_user(self, seeded_db):
+        # User explicitly typed AND — we do not OR-rescue.
+        r = search_mod.mode_bm25(
+            seeded_db,
+            query="BookRAG AND supercalifragilistic",
+            filters={},
+            limit=10,
+        )
+        assert "fallback" not in r
+        assert r["results"] == []
+
+    def test_explicit_or_no_double_retry(self, seeded_db):
+        # User explicitly typed OR — first pass already runs OR, no fallback flag.
+        r = search_mod.mode_bm25(
+            seeded_db,
+            query="BookRAG OR supercalifragilistic",
+            filters={},
+            limit=10,
+        )
+        assert "fallback" not in r
+        assert any(h["paper_name"] == "bookrag_2024" for h in r["results"])
+
+    def test_multi_token_hit_no_fallback(self, seeded_db):
+        # AND-join already produces hits — no fallback flag.
+        r = search_mod.mode_bm25(
+            seeded_db,
+            query="BookRAG hierarchical",
+            filters={},
+            limit=10,
+        )
+        assert "fallback" not in r
+        assert r["results"]
+
+
+class TestModeBM25Recency:
+    """Recency soft-tilt + ``since=`` hard floor.
+
+    Defaults preserve byte-for-byte behavior; the JOIN papers is only
+    emitted when at least one knob is active.
+    """
+
+    def _seed_two_papers(self, seeded_db) -> tuple[int, int]:
+        """Seed two papers: one new (today-ish), one old. Both mention
+        'recencyterm' once. Returns (new_id, old_id)."""
+        from datetime import date, timedelta
+
+        today = date.today().isoformat()
+        old = (date.today() - timedelta(days=1500)).isoformat()  # ~4 years
+        cur = seeded_db.execute(
+            "INSERT INTO papers (arxiv_id, paper_name, title, authors, date, "
+            "abstract, pdf_url, html_source, ingested_at, status, markdown, "
+            "domain, collection, needs_review, section_count) VALUES "
+            "(?, 'recent_paper', 'R', '[]', ?, 'r', 'http', 'arxiv', ?, "
+            "'indexed', NULL, 'rag', 'hierarchical indexing', 0, 0)",
+            ("2099.00001", today, f"{today}T00:00:00+00:00"),
+        )
+        new_id = cur.lastrowid
+        cur = seeded_db.execute(
+            "INSERT INTO papers (arxiv_id, paper_name, title, authors, date, "
+            "abstract, pdf_url, html_source, ingested_at, status, markdown, "
+            "domain, collection, needs_review, section_count) VALUES "
+            "(?, 'older_paper', 'O', '[]', ?, 'o', 'http', 'arxiv', ?, "
+            "'indexed', NULL, 'rag', 'hierarchical indexing', 0, 0)",
+            ("2001.00001", old, f"{old}T00:00:00+00:00"),
+        )
+        old_id = cur.lastrowid
+        for pid, name in ((new_id, "recent_paper"), (old_id, "older_paper")):
+            seeded_db.execute(
+                "INSERT INTO sections (paper_id, domain, paper_name, "
+                "section_title, section_level, body) VALUES "
+                "(?, 'rag', ?, 'Body', '1', 'recencyterm mention here.')",
+                (pid, name),
+            )
+        return new_id, old_id
+
+    def test_defaults_preserve_ordering(self, seeded_db):
+        # With both knobs at their lib-level defaults (0 / None), the SQL is
+        # byte-identical to today — the JOIN papers is not emitted.
+        self._seed_two_papers(seeded_db)
+        r = search_mod.mode_bm25(
+            seeded_db, query="recencyterm", filters={}, limit=10,
+        )
+        names = [g["paper_name"] for g in r["results"]]
+        assert set(names) == {"recent_paper", "older_paper"}
+
+    def test_recency_boost_promotes_recent(self, seeded_db):
+        # With a strong-ish boost, ties (same lexical strength) break
+        # toward the more recent paper.
+        self._seed_two_papers(seeded_db)
+        r = search_mod.mode_bm25(
+            seeded_db, query="recencyterm", filters={}, limit=10,
+            recency_boost=0.5,
+        )
+        names = [g["paper_name"] for g in r["results"]]
+        assert names.index("recent_paper") < names.index("older_paper")
+
+    def test_since_yyyy_normalizes_and_filters(self, seeded_db):
+        # since="YYYY" filters via YYYY-01-01. Pick a year between the two
+        # seeded dates so the old paper is excluded and the new kept.
+        from datetime import date
+
+        self._seed_two_papers(seeded_db)
+        year_floor = str(date.today().year)
+        r = search_mod.mode_bm25(
+            seeded_db, query="recencyterm", filters={}, limit=10,
+            since=year_floor,
+        )
+        names = [g["paper_name"] for g in r["results"]]
+        assert names == ["recent_paper"]
+
+    def test_since_yyyy_mm_dd_accepted(self, seeded_db):
+        from datetime import date
+
+        self._seed_two_papers(seeded_db)
+        cutoff = date.today().isoformat()
+        r = search_mod.mode_bm25(
+            seeded_db, query="recencyterm", filters={}, limit=10,
+            since=cutoff,
+        )
+        names = [g["paper_name"] for g in r["results"]]
+        assert names == ["recent_paper"]
+
+    def test_invalid_since_soft_fails(self, seeded_db):
+        r = search_mod.mode_bm25(
+            seeded_db, query="recencyterm", filters={}, limit=10,
+            since="last-week",
+        )
+        assert r.get("status") == "malformed_query"
+
+    def test_normalize_since_helpers(self):
+        assert search_mod._normalize_since("2026") == "2026-01-01"
+        assert search_mod._normalize_since("2026-03-15") == "2026-03-15"
+        with pytest.raises(search_mod.InvalidSinceError):
+            search_mod._normalize_since("2026-3")
+        with pytest.raises(search_mod.InvalidSinceError):
+            search_mod._normalize_since("not-a-date")
+
+    def test_readme_hits_unaffected_by_recency_boost(self, seeded_db):
+        # README BM25 deliberately ignores recency_boost (repos have no
+        # research-recency date). Compare the readme results with and
+        # without the boost — they should match.
+        r0 = search_mod.mode_bm25(
+            seeded_db, query="recencyterm", filters={}, limit=10,
+            scope=search_mod.Scope.READMES, recency_boost=0.0,
+        )
+        r1 = search_mod.mode_bm25(
+            seeded_db, query="recencyterm", filters={}, limit=10,
+            scope=search_mod.Scope.READMES, recency_boost=0.9,
+        )
+        assert r0["results"] == r1["results"]
+
+
 class TestModeBM25Pagination:
     """Pagination contract for ``mode_bm25``: offset slicing,
     total_hits / has_more echo, soft-fail on negative offset, and the
@@ -1942,6 +2121,88 @@ class TestModeSearchMulti:
         assert '## query 2 (malformed query): \'"unclosed\'' in md
         # And the inline error/hint surface in the body.
         assert "unclosed quote" in md
+
+
+class TestModeSearchMultiUnion:
+    """Union mode: RRF-fused section+readme hits across multiple queries."""
+
+    def test_envelope_shape_when_union(self, seeded_db):
+        r = search_mod.mode_search_multi(
+            seeded_db,
+            queries=["BookRAG", "RAPTOR"],
+            filters={"domain": "rag"},
+            limit=5,
+            union=True,
+        )
+        assert r["mode"] == "search"
+        assert r["multi"] is True
+        assert r.get("union") is True
+        # `results` is a flat ranked list, not per-query payloads.
+        assert isinstance(r["results"], list)
+        for row in r["results"]:
+            assert "surface" in row
+            assert "score" in row
+            assert "matched_queries" in row
+
+    def test_overlapping_queries_dedupe_with_matched_queries(self, seeded_db):
+        # "BookRAG" and "indexing" both hit paper bookrag_2024 / Abstract.
+        # The Abstract row should appear once with matched_queries pointing
+        # at both query indices.
+        r = search_mod.mode_search_multi(
+            seeded_db,
+            queries=["BookRAG", "indexing"],
+            filters={"domain": "rag"},
+            limit=5,
+            union=True,
+        )
+        section_rows = [r_ for r_ in r["results"] if r_["surface"] == "section"]
+        abstract_rows = [
+            r_ for r_ in section_rows
+            if r_["paper_name"] == "bookrag_2024"
+            and r_["section_title"] == "Abstract"
+        ]
+        assert len(abstract_rows) == 1, abstract_rows
+        # Both queries should be tagged on the same dedup key.
+        assert set(abstract_rows[0]["matched_queries"]) == {0, 1}
+
+    def test_disjoint_queries_each_appear_once(self, seeded_db):
+        r = search_mod.mode_search_multi(
+            seeded_db,
+            queries=["BookRAG", "RAPTOR"],
+            filters={"domain": "rag"},
+            limit=5,
+            union=True,
+        )
+        # Each row has a single matched_queries entry — they came from
+        # disjoint surface text.
+        for row in r["results"]:
+            assert len(row["matched_queries"]) >= 1
+
+    def test_default_union_false_keeps_legacy_shape(self, seeded_db):
+        r = search_mod.mode_search_multi(
+            seeded_db,
+            queries=["BookRAG", "RAPTOR"],
+            filters={"domain": "rag"},
+            limit=5,
+        )
+        assert "union" not in r
+        assert isinstance(r["results"], list)
+        # Legacy shape: each row is a full mode_search envelope.
+        for sub in r["results"]:
+            assert sub.get("mode") == "search"
+
+    def test_union_markdown_renders(self, seeded_db):
+        r = search_mod.mode_search_multi(
+            seeded_db,
+            queries=["BookRAG", "RAPTOR"],
+            filters={"domain": "rag"},
+            limit=5,
+            union=True,
+        )
+        md = search_mod.format_search_markdown(r)
+        assert md.startswith("# search (multi: 2 queries)")
+        assert "union mode" in md
+        assert "## merged results" in md
 
 
 def _system_search_soft_failures() -> frozenset[str]:
@@ -3807,3 +4068,65 @@ class TestModeCitations:
                 slug="citing_2024",
                 direction="sideways",
             )
+
+
+class TestModeCoverage:
+    """Coverage probe: lexical hits + exact + fuzzy taxonomy matches."""
+
+    def test_covered_topic_has_lexical_and_collection_hits(self, seeded_db):
+        # "hierarchical indexing" is the seeded collection name and a
+        # section body — should produce nonzero papers_matched plus a
+        # high-similarity collection.
+        r = search_mod.mode_coverage(
+            seeded_db, topic="hierarchical indexing"
+        )
+        assert r["mode"] == "coverage"
+        assert r["topic"] == "hierarchical indexing"
+        assert r["papers_matched"] >= 1
+        names = {c["name"] for c in r["collections_exact"]}
+        assert "hierarchical indexing" in names
+
+    def test_uncovered_topic_returns_zeros(self, seeded_db):
+        r = search_mod.mode_coverage(
+            seeded_db, topic="quaternion field theory propulsion"
+        )
+        assert r["papers_matched"] == 0
+        assert r["repos_matched"] == 0
+        assert r["collections_exact"] == []
+        # And the fuzzy buckets have no near-matches (or very low sim).
+        for row in r["collections_nearest"]:
+            assert row["similarity"] >= 70  # threshold enforced
+        # Bucket may be empty — that's the negative-evidence signal.
+
+    def test_domain_filter_narrows_collection_results(self, seeded_db):
+        # The hier-indexing collection lives in 'rag'. A domain filter that
+        # doesn't match should drop the exact-collection match.
+        r = search_mod.mode_coverage(
+            seeded_db, topic="hierarchical indexing", domain="other",
+        )
+        assert r["collections_exact"] == []
+
+    def test_fuzzy_threshold_keeps_near_matches(self, seeded_db):
+        # Misspelled collection name: should still surface in collections_nearest
+        # at >= 70 similarity.
+        r = search_mod.mode_coverage(
+            seeded_db, topic="hierarchcal indexing",
+        )
+        names = {c["name"] for c in r["collections_nearest"]}
+        assert "hierarchical indexing" in names
+
+    def test_canonical_entity_fuzzy_match_in_bucket(self, seeded_db):
+        # Misspelled canonical entity name: surface in entities_nearest.
+        r = search_mod.mode_coverage(seeded_db, topic="BookRG")
+        names = {c["canonical_name"] for c in r["entities_nearest"]}
+        assert "BookRAG" in names
+
+    def test_alias_fuzzy_match(self, seeded_db):
+        # "book rag" was seeded as an alias of BookRAG — exact alias hit.
+        r = search_mod.mode_coverage(seeded_db, topic="book rag")
+        aliases = {a["alias"] for a in r["aliases_nearest"]}
+        assert "book rag" in aliases
+
+    def test_empty_topic_raises(self, seeded_db):
+        with pytest.raises(ValueError):
+            search_mod.mode_coverage(seeded_db, topic="   ")
