@@ -32,6 +32,13 @@ Tiers, cheapest first, each falling through on miss:
    via ``SAVEPOINT``; on ``IntegrityError`` (UNIQUE race) fall back to tier 1
    and return the sibling row.
 
+``allow_fuzzy=False`` (passed by classify when the LLM had the full
+collection list in front of it — no overflow truncation) runs tier 1 → tier
+5 only. Tiers 2/3/4 second-guess an LLM that already had the comparison
+set; we only run them when the prompt truncated and the LLM was genuinely
+blind to part of the taxonomy. Defaults to True for entity extraction and
+topic resolution, where the caller does not see the existing set.
+
 Note on ``entity_type`` / ``entity_type_score``: the column pair is metadata on
 the canonical, NOT part of its identity or lookup scope. GLiNER2's label output
 for the same string is noisy across mentions — scoping lookups by entity_type
@@ -132,6 +139,7 @@ def resolve(
     entity_type_score: float = 0.0,
     source_paper: str,
     embedder: Embedder | None = None,
+    allow_fuzzy: bool = True,
 ) -> ResolvedTerm:
     """5-tier canonicalization of ``raw`` in scope ``(domain, term_type)``.
 
@@ -147,6 +155,13 @@ def resolve(
     and flips both enqueue a deferred ``terms_fts`` rebuild. All writes
     happen on the caller-provided ``conn`` without calling ``commit()`` —
     the orchestrator owns transaction boundaries.
+
+    ``allow_fuzzy=False`` runs tier 1 → tier 5 only, skipping tiers 2/3/4.
+    Used by classify when the LLM had the full collection list in front of
+    it (no overflow): the LLM already had the chance to internally dedup,
+    so the fuzzy ladder would only second-guess an informed decision.
+    Defaults to True for backward compatibility with entity extraction and
+    topic resolution, where the caller doesn't see the existing set.
     """
     entity_type = entity_type or ""
 
@@ -162,55 +177,56 @@ def resolve(
             raw=raw,
         )
 
-    norm_query = normalize_term(raw)
+    if allow_fuzzy:
+        norm_query = normalize_term(raw)
 
-    hit2 = _tier2(
-        conn,
-        norm_query=norm_query,
-        domain=domain,
-        term_type=term_type,
-    )
-    if hit2 is not None:
-        return _hit(
-            conn, hit2, raw=raw, source_paper=source_paper,
-            tier=MatchTier.TIER2,
-            domain=domain,
-            new_entity_type=entity_type,
-            new_entity_type_score=entity_type_score,
-        )
-
-    hit3 = _tier3(
-        conn,
-        raw,
-        norm_query=norm_query,
-        domain=domain,
-        term_type=term_type,
-    )
-    if hit3 is not None:
-        return _hit(
-            conn, hit3, raw=raw, source_paper=source_paper,
-            tier=MatchTier.TIER3,
-            domain=domain,
-            new_entity_type=entity_type,
-            new_entity_type_score=entity_type_score,
-        )
-
-    if embedder is not None:
-        hit4 = _tier4(
+        hit2 = _tier2(
             conn,
-            raw,
+            norm_query=norm_query,
             domain=domain,
             term_type=term_type,
-            embedder=embedder,
         )
-        if hit4 is not None:
+        if hit2 is not None:
             return _hit(
-                conn, hit4, raw=raw, source_paper=source_paper,
-                tier=MatchTier.TIER4,
+                conn, hit2, raw=raw, source_paper=source_paper,
+                tier=MatchTier.TIER2,
                 domain=domain,
                 new_entity_type=entity_type,
                 new_entity_type_score=entity_type_score,
             )
+
+        hit3 = _tier3(
+            conn,
+            raw,
+            norm_query=norm_query,
+            domain=domain,
+            term_type=term_type,
+        )
+        if hit3 is not None:
+            return _hit(
+                conn, hit3, raw=raw, source_paper=source_paper,
+                tier=MatchTier.TIER3,
+                domain=domain,
+                new_entity_type=entity_type,
+                new_entity_type_score=entity_type_score,
+            )
+
+        if embedder is not None:
+            hit4 = _tier4(
+                conn,
+                raw,
+                domain=domain,
+                term_type=term_type,
+                embedder=embedder,
+            )
+            if hit4 is not None:
+                return _hit(
+                    conn, hit4, raw=raw, source_paper=source_paper,
+                    tier=MatchTier.TIER4,
+                    domain=domain,
+                    new_entity_type=entity_type,
+                    new_entity_type_score=entity_type_score,
+                )
 
     return _tier5(
         conn,

@@ -26,13 +26,20 @@ within the same domain (max 4 total). Topics remain free strings —
 they're unbounded so the 5-tier term resolver still canonicalizes them.
 
 On success we resolve every collection and every ``topic`` through the
-shared 5-tier term resolver (Section 4) and write the canonical names.
-The denormalized ``papers.collection`` (or ``posts.collection``) scalar
-always points at the primary collection; the full set lives in the
-polymorphic ``collections`` junction keyed by ``(target_kind, target_id)``.
-On a proposed new domain we sanitize the name and auto-insert it with
-``needs_review=1``; ``needs_review`` is also set when any picked
-collection is new.
+shared term resolver (Section 4) and write the canonical names. Topics
+flow through the full 5-tier ladder because the LLM never sees the
+existing topic set — they're free strings. Collections are gated on
+overflow: when the chosen domain's collection list was truncated in the
+prompt (``DomainNode.overflow > 0``) the resolver runs the full ladder so
+it can catch picks that collide with canonicals the LLM didn't see;
+otherwise the LLM had the comparison set in front of it and we run tier
+1 → tier 5 only, trusting the LLM's verbatim choice without letting the
+fuzzy ladder second-guess it. The denormalized ``papers.collection`` (or
+``posts.collection``) scalar always points at the primary collection;
+the full set lives in the polymorphic ``collections`` junction keyed by
+``(target_kind, target_id)``. On a proposed new domain we sanitize the
+name and auto-insert it with ``needs_review=1``; ``needs_review`` is
+also set when any picked collection is new.
 """
 from __future__ import annotations
 
@@ -254,6 +261,19 @@ def classify(
         existing_domains=existing_domain_names,
     )
 
+    # Overflow gate for collection resolution: only run the fuzzy ladder
+    # (tiers 2/3/4) when the LLM was rendered a truncated collection list
+    # for the chosen domain. With the full list visible the LLM has
+    # already had the chance to dedup itself; fuzzy matching can only
+    # second-guess that informed decision. A brand-new domain has no
+    # existing collections at all → no overflow possible.
+    chosen_domain_node = next(
+        (d for d in existing_domains if d.name == decision.name), None
+    )
+    allow_fuzzy_collection = (
+        chosen_domain_node is not None and chosen_domain_node.overflow > 0
+    )
+
     with transaction(conn):
         if decision.insert_new:
             # LLM description applies only when the LLM actually proposed
@@ -306,6 +326,7 @@ def classify(
                 term_type="collection",
                 source_paper=paper_name,
                 embedder=embedder,
+                allow_fuzzy=allow_fuzzy_collection,
             )
             touched_term_ids.add(coll_hit.term_id)
 

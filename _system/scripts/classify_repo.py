@@ -245,6 +245,16 @@ def classify(
     # the "source" the alias was first observed in.
     source_token = repo_slug
 
+    # Overflow gate for collection resolution: only run the fuzzy ladder
+    # (tiers 2/3/4) when the LLM was rendered a truncated collection list
+    # for the chosen domain. See classify_paper.py for the rationale.
+    chosen_domain_node = next(
+        (d for d in existing_domains if d.name == decision.name), None
+    )
+    allow_fuzzy_collection = (
+        chosen_domain_node is not None and chosen_domain_node.overflow > 0
+    )
+
     with transaction(conn):
         if decision.insert_new:
             new_description = (
@@ -283,6 +293,7 @@ def classify(
                 term_type="collection",
                 source_paper=source_token,
                 embedder=embedder,
+                allow_fuzzy=allow_fuzzy_collection,
             )
             touched_term_ids.add(coll_hit.term_id)
 
