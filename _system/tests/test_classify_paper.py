@@ -1077,6 +1077,108 @@ def test_needs_review_is_one_on_new_collection_only(tmp_db_with_domain):
 
 
 # ===========================================================================
+# Overflow gate on collection resolution
+# ===========================================================================
+
+
+def test_no_overflow_proposed_new_mints_even_when_tier2_would_match(tmp_db_with_domain):
+    """The LLM sees the full collection list (no overflow). It proposes a
+    new collection whose normalized form would tier-2 match an existing
+    canonical. With allow_fuzzy gated off, the proposal should mint a
+    fresh canonical rather than be silently merged — we trust the LLM's
+    informed decision over the fuzzy ladder.
+    """
+    # Seed an existing canonical whose normalized form is "hybrid search".
+    tmp_db_with_domain.execute(
+        """
+        INSERT INTO canonical_terms (domain, term_type, entity_type, canonical_name, first_seen_in)
+        VALUES ('rag', 'collection', '', 'hybrid search', 'seed')
+        """
+    )
+    _seed_paper(tmp_db_with_domain)
+    # "Hybrid-Search" normalizes to "hybrid search" — tier 2 would merge.
+    runner = _runner_from_dict(_payload(
+        collections=[{"index": -1, "new_name": "Hybrid-Search", "new_desc": "Variant."}],
+        topics=["t"],
+    ))
+
+    classify(
+        paper_name="paper_name_2024",
+        conn=tmp_db_with_domain,
+        call_llm=runner,
+    )
+
+    names = {
+        r[0] for r in tmp_db_with_domain.execute(
+            "SELECT canonical_name FROM canonical_terms "
+            " WHERE domain = 'rag' AND term_type = 'collection'"
+        )
+    }
+    assert names == {"hybrid search", "Hybrid-Search"}
+
+
+def test_overflow_proposed_new_merges_via_tier2(tmp_db_with_domain):
+    """With more collections than the per-domain prompt cap, the LLM was
+    blind to part of the taxonomy. The full fuzzy ladder runs, so a
+    proposal that tier-2 matches an existing (potentially hidden)
+    canonical is merged back rather than minted as a duplicate.
+    """
+    # Seed _COLLECTIONS_PER_DOMAIN_LIMIT + 1 canonicals so overflow > 0.
+    # Bind each to a distinct paper so the popularity-ordered render keeps
+    # them all visible to count toward the cap; the actual one we want to
+    # tier-2 hit ("hybrid search") doesn't need to be hidden — overflow is
+    # a property of the domain, not a per-canonical visibility flag.
+    for i in range(_COLLECTIONS_PER_DOMAIN_LIMIT + 1):
+        tmp_db_with_domain.execute(
+            """
+            INSERT INTO canonical_terms (domain, term_type, entity_type, canonical_name, first_seen_in)
+            VALUES ('rag', 'collection', '', ?, 'seed')
+            """,
+            (f"existing collection {i}" if i > 0 else "hybrid search",),
+        )
+        tmp_db_with_domain.execute(
+            """
+            INSERT INTO collection_definitions (domain, name, description)
+            VALUES ('rag', ?, NULL)
+            """,
+            (f"existing collection {i}" if i > 0 else "hybrid search",),
+        )
+        # Bind to a stub paper so popularity > 0 (otherwise alpha sort
+        # ordering is fine but we want a deterministic shape).
+        pid = _seed_paper(
+            tmp_db_with_domain,
+            paper_name=f"stub_{i}",
+            arxiv_id=f"2400.{i:05d}",
+            status=PaperStatus.CLASSIFIED.value,
+            domain="rag",
+            collection=f"existing collection {i}" if i > 0 else "hybrid search",
+        )
+        del pid
+
+    _seed_paper(tmp_db_with_domain)
+    runner = _runner_from_dict(_payload(
+        collections=[{"index": -1, "new_name": "Hybrid-Search", "new_desc": "Variant."}],
+        topics=["t"],
+    ))
+
+    classify(
+        paper_name="paper_name_2024",
+        conn=tmp_db_with_domain,
+        call_llm=runner,
+    )
+
+    # Tier 2 merged "Hybrid-Search" back into "hybrid search" — no new row.
+    names = {
+        r[0] for r in tmp_db_with_domain.execute(
+            "SELECT canonical_name FROM canonical_terms "
+            " WHERE domain = 'rag' AND term_type = 'collection' "
+            "   AND canonical_name LIKE 'hybrid%'"
+        )
+    }
+    assert names == {"hybrid search"}
+
+
+# ===========================================================================
 # CLI
 # ===========================================================================
 
