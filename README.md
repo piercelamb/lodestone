@@ -1,3 +1,5 @@
+![lodestone hero](assets/hero.jpeg)
+
 # Lodestone: Research Retrieval for Claude Code
 
 ![Version](https://img.shields.io/badge/version-0.1.0-blue)
