@@ -8,7 +8,7 @@
   },
   "repository": "https://github.com/piercelamb/lodestone",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "research", "arxiv", "rag", "search", "knowledge-base"],
+  "keywords": ["mcp", "arxiv", "rag", "research", "knowledge-base"],
   "mcpServers": {
     "lodestone": {
       "type": "stdio",
