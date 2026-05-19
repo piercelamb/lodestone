@@ -22,6 +22,8 @@ Where the Deep Trilogy is built for *writing* software, lodestone is built for *
 ```
 Restart Claude Code. Hand [`/deep-sota`](https://github.com/piercelamb/deep-sota) an arXiv / GitHub / blog URL to ingest, or a research question to investigate — it picks the right tools (search, read, figures, citations, code repos) and surfaces coverage gaps honestly instead of hallucinating.
 
+**Optional — pre-seed the taxonomy** (domains and collections) before your first ingest. Either use [my taxonomy](./taxonomy.json) or write your own in the same shape, then point Claude at [`seed_taxonomy.py`](./_system/scripts/seed_taxonomy.py). Skip seeding entirely and the classify step grows the taxonomy from scratch as you ingest — both paths are fully supported. See [Seeding the Taxonomy](#seeding-the-taxonomy).
+
 Prefer to drive the tools yourself? Call `mcp__lodestone__ingest_paper` with an arXiv URL to seed your corpus, and `mcp__lodestone__search` / `read` / `figure` to query it directly.
 
 ## Table of Contents
