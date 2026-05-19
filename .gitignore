@@ -19,7 +19,9 @@ lodestone.db-*
 .claude/settings.local.json
 .claude/scheduled_tasks.lock
 
-# Project-local MCP server config (user-specific absolute paths).
-# Use .mcp.json.example as the shared template; copy to .mcp.json
+# Project-local MCP server config for dev work (user-specific absolute paths).
+# Use .mcp.dev.json.example as the shared template; copy to .mcp.dev.json
 # locally and edit. NOT shipped via the plugin marketplace install.
-.mcp.json
+# (The tracked .mcp.json at the repo root is the plugin's MCP entrypoint —
+# it lives under the plugin's CLAUDE_PLUGIN_ROOT, not in the dev workflow.)
+.mcp.dev.json

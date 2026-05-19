@@ -47,6 +47,10 @@ _EXCLUDES = (
     "lodestone.db-wal",
     "lodestone.db-shm",
     "node_modules/",
+    # Dev-only project MCP config (gitignored, carries absolute repo
+    # paths). The install dir uses the tracked .mcp.json at the plugin
+    # root, which points at CLAUDE_PLUGIN_ROOT.
+    ".mcp.dev.json",
 )
 
 

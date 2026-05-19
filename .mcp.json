@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "lodestone": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/lodestone-mcp-plugin.sh"
+    }
+  }
+}
