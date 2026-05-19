@@ -1,0 +1,14 @@
+{
+  "_comment": "Project-local MCP server for lodestone dev work. Copy to .mcp.dev.json and replace <REPO_ROOT> with this clone's absolute path. The server is named 'lodestone-dev' (tools surface as mcp__lodestone-dev__*) so it never collides with the marketplace plugin's 'lodestone' server (which writes to $HOME/.lodestone/lodestone.db). Disable the lodestone marketplace plugin while working in this repo so the prod DB never gets touched by dev runs. .mcp.dev.json is not auto-loaded by Claude Code; launch the dev workspace with `claude --mcp-config .mcp.dev.json --strict-mcp-config` so the tracked plugin .mcp.json at the repo root is suppressed and only lodestone-dev registers.",
+  "mcpServers": {
+    "lodestone-dev": {
+      "command": "<REPO_ROOT>/.venv/bin/lodestone-mcp",
+      "args": [],
+      "env": {
+        "LODESTONE_DB": "<REPO_ROOT>/lodestone.db",
+        "MCP_TIMEOUT": "30000",
+        "MCP_TOOL_TIMEOUT": "1800000"
+      }
+    }
+  }
+}

@@ -8,15 +8,5 @@
   },
   "repository": "https://github.com/piercelamb/lodestone",
   "license": "Apache-2.0",
-  "keywords": ["mcp", "arxiv", "rag", "research", "knowledge-base"],
-  "mcpServers": {
-    "lodestone": {
-      "type": "stdio",
-      "command": "${CLAUDE_PLUGIN_ROOT}/bin/lodestone-mcp-plugin.sh",
-      "env": {
-        "MCP_TIMEOUT": "30000",
-        "MCP_TOOL_TIMEOUT": "1800000"
-      }
-    }
-  }
+  "keywords": ["mcp", "arxiv", "rag", "research", "knowledge-base"]
 }

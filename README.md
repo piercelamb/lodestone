@@ -299,7 +299,7 @@ Long ingests stream progress to the client. HTTP transport supports SSE for non-
 
 ### Prerequisites
 
-- [Claude Code](https://claude.ai/code) installed (or any MCP-speaking client — see [Manual Setup](#manual-setup-other-mcp-clients) below)
+- [Claude Code](https://claude.ai/code) **≥ 2.1.144** (older versions hit `.mcp.json` regressions that block plugin-managed MCP tools from registering — see [Known Issues](#known-issues)). Or any MCP-speaking client — see [Manual Setup](#manual-setup-other-mcp-clients) below.
 - [uv](https://docs.astral.sh/uv/) on `PATH`
 - Python 3.11+
 - (Optional) LLM API keys for classification — `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GEMINI_API_KEY`. Lodestone picks whichever is configured.
@@ -328,7 +328,9 @@ Then scroll to "Installed", find `lodestone` and `deep-sota`, and click "Enable"
 
 > **Already installed `/deep-project`, `/deep-plan`, or `/deep-implement`?** All five plugins share the `piercelamb-plugins` marketplace. Skip the `marketplace add` step and run `/plugin install lodestone` / `/plugin install deep-sota` directly.
 
-Restart Claude Code after install. The first invocation runs `uv sync` (~30s–2 min once). Embedding weights download lazily on the first `ingest_*` call.
+Restart Claude Code after install. The first session runs a one-time dependency install in a `SessionStart` prewarm hook (~30–90s); you'll see a `[lodestone] First-time dependency install…` line in the session and a `[lodestone] Dependency install complete.` line when it's done. Subsequent sessions skip this entirely (hash-gated against `pyproject.toml` + `uv.lock`). Embedding weights download lazily on the first `ingest_*` call.
+
+If `mcp__lodestone__*` tools don't appear after the prewarm message, run **`/lodestone:doctor`** — it checks Claude Code version, `uv` presence, venv state, MCP registration, and DB writability in one shot.
 
 ### Standalone MCP Server (non-Claude-Code clients)
 
@@ -732,10 +734,19 @@ The arxiv metadata API is gated behind a file-locked 3.1 s process-wide throttle
 **Issue**: A pre-cap LLM adapter or httpx call was wedged across the suspend.
 **Solution**: Already fixed — LLM adapter and httpx timeouts are capped server-side. If you see this on an older install, `/plugin update lodestone` and restart Claude Code.
 
-### `mcp__lodestone__*` tools missing on Claude Code 2.1.116+
+### `mcp__lodestone__*` tools don't appear after install
 
-**Issue**: User-configured stdio MCP servers silently drop their tools — [#51736](https://github.com/anthropics/claude-code/issues/51736).
-**Solution**: Use the plugin install (`/plugin install lodestone`) — plugin-managed stdio servers are unaffected. Or run with HTTP transport instead.
+**Issue**: The plugin shows as installed but `mcp__lodestone__*` tools never reach the session.
+
+**Solution**: Run **`/lodestone:doctor`** — it checks the common causes and prints a fix line per failure. Most common causes:
+- Claude Code < 2.1.144 — upgrade with `npm i -g @anthropic-ai/claude-code` and restart.
+- Prewarm still running on the first session — wait 60–90s for the `[lodestone] Dependency install complete.` line, then `/reload-plugins`.
+- `uv` missing from `PATH` — install from [astral.sh/uv](https://astral.sh/uv) and restart Claude Code.
+
+### `mcp__lodestone__*` tools missing on Claude Code 2.1.116+ (user-scoped stdio only)
+
+**Issue**: User-configured stdio MCP servers silently drop their tools — [#51736](https://github.com/anthropics/claude-code/issues/51736). This affects only `claude mcp add`-style **user-scoped** registrations; the plugin install uses plugin-managed registration and is unaffected.
+**Solution**: If you're hand-configuring lodestone as a user-scoped stdio MCP server, switch to the plugin install (`/plugin install lodestone`) or run with HTTP transport instead.
 
 ### "PDF fallback triggered" on every paper
 
@@ -749,7 +760,9 @@ The arxiv metadata API is gated behind a file-locked 3.1 s process-wide throttle
 
 ## Known Issues
 
-- **Claude Code 2.1.116+ silently drops stdio MCP tools** — [#51736](https://github.com/anthropics/claude-code/issues/51736). The server connects, the JSON-RPC handshake succeeds, `tools/list` returns the full registry, but tools never reach the assistant's deferred-tool registry. The plugin install sidesteps this; for manual setups, use the HTTP transport on affected versions.
+- **Claude Code 2.1.116+ silently drops user-scoped stdio MCP tools** — [#51736](https://github.com/anthropics/claude-code/issues/51736). The server connects, the JSON-RPC handshake succeeds, `tools/list` returns the full registry, but tools never reach the assistant's deferred-tool registry. This affects only `claude mcp add`-style user-scoped registrations — the plugin install uses plugin-managed registration via the plugin's root `.mcp.json` and is unaffected. For manual setups on affected versions, use the HTTP transport.
+- **Plugin manifest `mcpServers` field silently dropped** — [#16143](https://github.com/anthropics/claude-code/issues/16143) (open through v2.1.45). Lodestone declares its MCP server in the plugin's root `.mcp.json` (not inline in `plugin.json`) to sidestep this. No user action required.
+- **Older Claude Code MCP regressions** — `.mcp.json`/plugin servers disappearing after `/clear` (fixed in 2.1.136), malformed entries dropping siblings (2.1.141), paginated `tools/list` dropping pages (2.1.144). The 2.1.144 minimum in [Prerequisites](#prerequisites) clears all of these.
 
 ## Developing on lodestone
 
@@ -766,10 +779,11 @@ If you're hacking on this repo (not just using the installed plugin), keep your 
 **Setup for dev work:**
 
 1. Clone the repo and `uv sync`.
-2. `cp .mcp.json.example .mcp.json` and replace `<REPO_ROOT>` with the absolute path to your clone. (`.mcp.json` is gitignored — it carries absolute paths and shouldn't be shared.)
-3. In Claude Code, open this workspace and **disable the `lodestone` marketplace plugin for it** (`/plugin` → disable). Otherwise both servers register at once: every tool call could land in either DB depending on routing, and you'll get inconsistent state.
-4. Use `mcp__lodestone-dev__*` tools or `uv run python -m _system.scripts.ingest` for everything in the dev workspace. They both write to `./lodestone.db` only.
-5. Open a *different* terminal/workspace (e.g. `cd ~ && claude`) when you want to query the prod DB; that workspace has the plugin enabled but no `.mcp.json`, so `mcp__lodestone__*` is the only lodestone surface and it always points at `~/.lodestone/lodestone.db`.
+2. `cp .mcp.dev.json.example .mcp.dev.json` and replace `<REPO_ROOT>` with the absolute path to your clone. (`.mcp.dev.json` is gitignored — it carries absolute paths and shouldn't be shared.)
+3. Launch Claude Code in the dev workspace with `claude --mcp-config .mcp.dev.json --strict-mcp-config`. `--strict-mcp-config` suppresses the tracked `.mcp.json` at the repo root (which is the plugin's entrypoint and would otherwise also try to register a `lodestone` server in the workspace). With `--mcp-config .mcp.dev.json`, only `lodestone-dev` registers.
+4. Also **disable the `lodestone` marketplace plugin for this workspace** (`/plugin` → disable). Otherwise the plugin's prewarm + MCP server still run for this workspace, and you can get `lodestone` and `lodestone-dev` both registered at once.
+5. Use `mcp__lodestone-dev__*` tools or `uv run python -m _system.scripts.ingest` for everything in the dev workspace. They both write to `./lodestone.db` only.
+6. Open a *different* terminal/workspace (e.g. `cd ~ && claude`) when you want to query the prod DB; that workspace has the plugin enabled and no `.mcp.dev.json`, so `mcp__lodestone__*` is the only lodestone surface and it always points at `~/.lodestone/lodestone.db`.
 
 ## Testing
 
@@ -788,7 +802,8 @@ lodestone/
 │   ├── plugin.json              # Plugin metadata
 │   └── marketplace.json         # piercelamb-plugins marketplace listing
 ├── bin/
-│   └── lodestone-mcp-plugin.sh  # Plugin entrypoint (uv sync + exec)
+│   ├── lodestone-mcp-plugin.sh  # Plugin MCP entrypoint (exec only — fast startup)
+│   └── lodestone-prewarm.sh     # SessionStart hook: hash-gated `uv sync`
 ├── _system/
 │   ├── config/                  # Pipeline config
 │   ├── db/                      # Schema, migrations, cascade, orphan GC
@@ -819,7 +834,12 @@ lodestone/
 ├── taxonomy.json                # Seed taxonomy
 ├── taxonomy_tree.md             # Rendered taxonomy reference
 ├── pyproject.toml               # Python dependencies
-├── .mcp.json.example            # Dev MCP config template
+├── .mcp.json                    # Plugin MCP entrypoint (uses ${CLAUDE_PLUGIN_ROOT})
+├── .mcp.dev.json.example        # Dev MCP config template (copy → .mcp.dev.json)
+├── hooks/
+│   └── hooks.json               # SessionStart prewarm hook
+├── commands/
+│   └── doctor.md                # /lodestone:doctor diagnostic
 ├── LICENSE                      # Apache-2.0
 ├── CHANGELOG.md
 └── README.md                    # This file
