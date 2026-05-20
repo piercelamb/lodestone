@@ -861,8 +861,10 @@ lodestone/
 ├── .mcp.dev.json.example        # Dev MCP config template (copy → .mcp.dev.json)
 ├── hooks/
 │   └── hooks.json               # SessionStart prewarm hook
-├── commands/
-│   └── doctor.md                # /lodestone:doctor diagnostic
+├── skills/
+│   └── doctor/
+│       ├── SKILL.md             # /lodestone:doctor diagnostic
+│       └── scripts/             # bundled venv/install-hash checks
 ├── LICENSE                      # Apache-2.0
 ├── CHANGELOG.md
 └── README.md                    # This file
