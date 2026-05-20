@@ -16,13 +16,14 @@ Where the Deep Trilogy is built for *writing* software, lodestone is built for *
 
 ## TL;DR
 
-Requires Claude Code **≥ 2.1.144** and [`uv`](https://docs.astral.sh/uv/) on `PATH`.
+Requires [`uv`](https://docs.astral.sh/uv/) on `PATH`.
 
 ```
 /plugin marketplace add piercelamb/lodestone
 /plugin install lodestone
 /plugin install deep-sota
 /reload-plugins
+/mcp -> find lodestone -> enable
 /lodestone:doctor
 ```
 Then **fully quit and relaunch Claude Code** (not `/reload-plugins`) — once. Done.
@@ -57,7 +58,6 @@ Prefer to drive the tools yourself? Call `mcp__lodestone__ingest_paper` with an 
 - [Best Practices](#best-practices)
 - [Security & Privacy](#security--privacy)
 - [Troubleshooting](#troubleshooting)
-- [Known Issues](#known-issues)
 - [Developing on lodestone](#developing-on-lodestone)
 - [Testing](#testing)
 - [Project Structure](#project-structure)
@@ -316,7 +316,7 @@ Long ingests stream progress to the client. HTTP transport supports SSE for non-
 
 ### Prerequisites
 
-- [Claude Code](https://claude.ai/code) **≥ 2.1.144** (older versions hit `.mcp.json` regressions that block plugin-managed MCP tools from registering — see [Known Issues](#known-issues)). Or any MCP-speaking client — see [Manual Setup](#manual-setup-other-mcp-clients) below.
+- [Claude Code](https://claude.ai/code), or any MCP-speaking client — see [Manual Setup](#manual-setup-other-mcp-clients) below.
 - [uv](https://docs.astral.sh/uv/) on `PATH`
 - Python 3.11+
 - (Optional) LLM API keys for classification — `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GEMINI_API_KEY`. Lodestone picks whichever is configured.
@@ -349,7 +349,7 @@ What each step does:
 
 Embedding weights (~400 MB total) download lazily on the first `ingest_*` call with live progress.
 
-If `mcp__lodestone__*` tools don't appear after this sequence, re-run `/lodestone:doctor` — it diagnoses Claude Code version, `uv` presence, venv state, MCP registration, and DB writability in one shot.
+If `mcp__lodestone__*` tools don't appear after this sequence, re-run `/lodestone:doctor` — it diagnoses `uv` presence, venv state, MCP registration, and DB writability in one shot.
 
 > **Already installed `/deep-project`, `/deep-plan`, or `/deep-implement`?** All five plugins share the `piercelamb-plugins` marketplace. Skip the `marketplace add` step.
 
@@ -430,7 +430,7 @@ uv run python -m _system.scripts.search --search "tree of thoughts"
 
 `lodestone-mcp` supports two transports. Both expose the same 21 tools.
 
-**Stdio (default)** — the client spawns the server as a subprocess and talks JSON-RPC over its stdin/stdout. This is the standard MCP transport and works on every spec-compliant client. The one exception: Claude Code 2.1.116+ silently drops tools from user-configured stdio MCP servers ([#51736](https://github.com/anthropics/claude-code/issues/51736)). The plugin install sidesteps that regression; other clients are fine on stdio.
+**Stdio (default)** — the client spawns the server as a subprocess and talks JSON-RPC over its stdin/stdout. This is the standard MCP transport and works on every spec-compliant client.
 
 **HTTP (opt-in)** — `lodestone-mcp --http` runs a long-lived HTTP server. The client connects via a URL. Useful as a workaround when stdio isn't an option, or when you want one server process shared by multiple clients. Supports SSE (`Accept: text/event-stream`) so long-running ingest tools can stream `notifications/progress` to clients that handle it.
 
@@ -457,7 +457,7 @@ Most MCP clients use a JSON config that maps a server name to a launch command. 
 Notes:
 - Use an **absolute path** for `command` — clients launch with an unpredictable working directory and PATH.
 - `LODESTONE_DB` must be absolute; the file is auto-created if missing.
-- `MCP_TIMEOUT` (server startup, ms) and `MCP_TOOL_TIMEOUT` (per-tool-call, ms) are read by some MCP clients; the exact default isn't formally documented for Claude Code. Long ingests stream `notifications/progress` to keep the call alive (per the MCP spec, clients should treat progress as activity). If your client still kills mid-ingest, set its equivalent timeout key generously — the example block above uses 30 minutes for `ingest_paper`.
+- `MCP_TIMEOUT` (server startup, ms) and `MCP_TOOL_TIMEOUT` (per-tool-call, ms) are read by some MCP clients. Long ingests stream `notifications/progress` to keep the call alive (per the MCP spec, clients should treat progress as activity). If your client still kills mid-ingest, set its equivalent timeout key generously — the example block above uses 30 minutes for `ingest_paper`.
 - If your LLM provider key for classification isn't already in the launching shell, add it to `env`.
 
 **Client-specific config paths** (verify against current docs — these change):
@@ -686,7 +686,7 @@ Model catalogs (with descriptions and the default at index 0) live in `_system/l
 | `GEMINI_API_KEY` | Provider key for Gemini classification. |
 | `XDG_CONFIG_HOME` | Overrides the config directory root (default `~/.config`). |
 | `MCP_TIMEOUT` | MCP server startup timeout (default 30 s). |
-| `MCP_TOOL_TIMEOUT` | Per-tool-call timeout (ms). Read by some MCP clients; default isn't formally documented for Claude Code. Ingest streams `notifications/progress` to signal activity — set generously (e.g. 1800000 = 30 min) if your client kills long calls. |
+| `MCP_TOOL_TIMEOUT` | Per-tool-call timeout (ms). Read by some MCP clients. Ingest streams `notifications/progress` to signal activity — set generously (e.g. 1800000 = 30 min) if your client kills long calls. |
 
 Provider selection itself is **not** driven by env-var precedence — it's driven by `~/.config/lodestone/config.toml`. Set whatever provider keys you want; the first CLI ingest (or `/deep-sota` `validate-env.sh`) picks one and persists the choice. See [LLM provider and model](#llm-provider-and-model) above for the full resolution order.
 
@@ -762,14 +762,8 @@ The arxiv metadata API is gated behind a file-locked 3.1 s process-wide throttle
 **Issue**: The plugin shows as installed but `mcp__lodestone__*` tools never reach the session.
 
 **Solution**: Run **`/lodestone:doctor`** — it checks the common causes and prints a fix line per failure. Most common causes:
-- Claude Code < 2.1.144 — upgrade with `npm i -g @anthropic-ai/claude-code` and restart.
 - Prewarm still running on the first session — wait 60–90s for the `[lodestone] Dependency install complete.` line, then `/reload-plugins`.
 - `uv` missing from `PATH` — install from [astral.sh/uv](https://astral.sh/uv) and restart Claude Code.
-
-### `mcp__lodestone__*` tools missing on Claude Code 2.1.116+ (user-scoped stdio only)
-
-**Issue**: User-configured stdio MCP servers silently drop their tools — [#51736](https://github.com/anthropics/claude-code/issues/51736). This affects only `claude mcp add`-style **user-scoped** registrations; the plugin install uses plugin-managed registration and is unaffected.
-**Solution**: If you're hand-configuring lodestone as a user-scoped stdio MCP server, switch to the plugin install (`/plugin install lodestone`) or run with HTTP transport instead.
 
 ### "PDF fallback triggered" on every paper
 
@@ -780,12 +774,6 @@ The arxiv metadata API is gated behind a file-locked 3.1 s process-wide throttle
 
 **Issue**: Your bare-token query produced no AND hits, so the parser auto-retried with OR-joining.
 **Solution**: This is informational, not an error. The hits are still relevant — the flag tells you the query was loosened.
-
-## Known Issues
-
-- **Claude Code 2.1.116+ silently drops user-scoped stdio MCP tools** — [#51736](https://github.com/anthropics/claude-code/issues/51736). The server connects, the JSON-RPC handshake succeeds, `tools/list` returns the full registry, but tools never reach the assistant's deferred-tool registry. This affects only `claude mcp add`-style user-scoped registrations — the plugin install uses plugin-managed registration via the plugin's root `.mcp.json` and is unaffected. For manual setups on affected versions, use the HTTP transport.
-- **Plugin manifest `mcpServers` field silently dropped** — [#16143](https://github.com/anthropics/claude-code/issues/16143) (open through v2.1.45). Lodestone declares its MCP server in the plugin's root `.mcp.json` (not inline in `plugin.json`) to sidestep this. No user action required.
-- **Older Claude Code MCP regressions** — `.mcp.json`/plugin servers disappearing after `/clear` (fixed in 2.1.136), malformed entries dropping siblings (2.1.141), paginated `tools/list` dropping pages (2.1.144). The 2.1.144 minimum in [Prerequisites](#prerequisites) clears all of these.
 
 ## Developing on lodestone
 
