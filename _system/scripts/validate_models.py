@@ -340,9 +340,36 @@ def ensure_models_cached() -> None:
     _check_model(ModelId.GLINER2)
 
 
+def _is_cached_offline(model_id: ModelId) -> bool:
+    """Return True iff every file HF needs is already on disk.
+
+    Uses ``snapshot_download(local_files_only=True)`` — same call path
+    the loader libraries use, just with the network door closed. A
+    partial cache (interrupted download, missing variant file the
+    current revision now expects) raises here, so ``test -d`` false
+    positives become FAILs that doctor can remediate. Returns in
+    ~1 second on a complete warm cache.
+    """
+    from huggingface_hub import snapshot_download
+
+    try:
+        snapshot_download(str(model_id), local_files_only=True)
+        return True
+    except Exception:  # noqa: BLE001 — any failure means "not fully cached"
+        return False
+
+
 def main() -> None:
-    models_only = "--models-only" in sys.argv[1:]
-    if models_only:
+    args = sys.argv[1:]
+    if "--check-only" in args:
+        for model_id, label in (
+            (ModelId.BGE, "bge"),
+            (ModelId.GLINER2, "gliner"),
+        ):
+            print(f"{label} {'cached' if _is_cached_offline(model_id) else 'NOT cached'}")
+        return
+
+    if "--models-only" in args:
         ensure_models_cached()
         print(f"{ModelId.BGE}: present")
         print(f"{ModelId.GLINER2}: present")
