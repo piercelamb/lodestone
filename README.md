@@ -8,6 +8,9 @@
 ![Claude Code](https://img.shields.io/badge/Claude%20Code-Plugin-purple)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 
+> **Blog post:**
+> - [Lodestone: A SQLite-backed arXiv research paper retrieval system for Claude Code](https://medium.com/@pierce-lamb/lodestone-a-sqlite-backed-arxiv-research-paper-retrieval-system-for-claude-code-b77de201f0c8)
+
 `lodestone` is a single-file SQLite database and MCP server that ingests and retrieves over arXiv research papers, code repos, and blog posts. It's intended to be utilized by the agentic search mechanisms of coding agents like Claude Code and others to ground plans and implementations in the latest state-of-the-art research. It is best used when paired with a Claude Code plugin called [`/deep-sota`](https://github.com/piercelamb/deep-sota) (*deep state of the art*) — a sibling plugin to the [Deep Trilogy](https://github.com/piercelamb/deep-plan).
 
 Where the Deep Trilogy is built for *writing* software, lodestone is built for *grounding* it: the assistant can cite a section, view an inline figure, or peek at the original training code instead of hallucinating.
