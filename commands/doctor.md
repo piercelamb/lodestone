@@ -25,13 +25,13 @@ Required for the prewarm hook and venv. If missing, fix line is: `install uv fro
 
 ### Plugin venv
 
-!`_lpr() { if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then echo "$CLAUDE_PLUGIN_ROOT"; return; fi; grep -A2 '"lodestone@piercelamb-plugins"' "$HOME/.claude/plugins/installed_plugins.json" 2>/dev/null | grep '"installPath"' | tail -1 | sed -E 's/.*"installPath"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/'; }; PR="$(_lpr)"; if [ -z "$PR" ]; then echo "could not resolve plugin root (no CLAUDE_PLUGIN_ROOT, no installed_plugins.json entry)"; else ls -la "$PR/.venv/bin/lodestone-mcp" 2>&1 || echo "venv binary missing at $PR/.venv/bin/lodestone-mcp"; fi`
+!`_lpr() { if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then echo "$CLAUDE_PLUGIN_ROOT"; return; fi; local f="$HOME/.claude/plugins/installed_plugins.json"; [ -f "$f" ] || return; if command -v jq >/dev/null 2>&1; then jq -r '.plugins["lodestone@piercelamb-plugins"][-1].installPath // empty' "$f"; else grep -A10 '"lodestone@piercelamb-plugins"' "$f" | grep '"installPath"' | tail -1 | sed -E 's/.*"installPath"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/'; fi; }; PR="$(_lpr)"; if [ -z "$PR" ]; then echo "could not resolve plugin root (no CLAUDE_PLUGIN_ROOT, no installed_plugins.json entry)"; else ls -la "$PR/.venv/bin/lodestone-mcp" 2>&1 || echo "venv binary missing at $PR/.venv/bin/lodestone-mcp"; fi`
 
 If missing, the prewarm hook hasn't completed. Most common cause: `/plugin install lodestone` was run mid-session and `/reload-plugins` doesn't fire SessionStart hooks. Fix line: `Claude will run the prewarm hook now — see Remediation below; after it completes run '/reload-plugins'`.
 
 ### Install hash
 
-!`_lpd() { if [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then echo "$CLAUDE_PLUGIN_DATA"; return; fi; for d in "$HOME/.claude/plugins/data/lodestone-piercelamb-plugins" "$HOME/.claude/plugins/data/piercelamb-plugins/lodestone"; do [ -d "$d" ] && { echo "$d"; return; }; done; }; PD="$(_lpd)"; if [ -z "$PD" ]; then echo "no plugin data dir located"; else cat "$PD/install.hash" 2>/dev/null || echo "no install hash yet — prewarm has not completed a successful sync"; fi`
+!`_lpd() { if [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then echo "$CLAUDE_PLUGIN_DATA"; return; fi; for d in "$HOME/.claude/plugins/data/lodestone@piercelamb-plugins" "$HOME/.claude/plugins/data/lodestone-piercelamb-plugins" "$HOME/.claude/plugins/data/piercelamb-plugins/lodestone"; do [ -d "$d" ] && { echo "$d"; return; }; done; }; PD="$(_lpd)"; if [ -z "$PD" ]; then echo "no plugin data dir located"; else cat "$PD/install.hash" 2>/dev/null || echo "no install hash yet — prewarm has not completed a successful sync"; fi`
 
 Informational. Presence of a hash means a `uv sync` has succeeded for the current pyproject/lock.
 
@@ -58,17 +58,25 @@ Informational — NOT a FAIL. The two CPU-only HuggingFace models (`BAAI/bge-sma
 
 **Skip this section unless the Plugin venv check above FAILed.** Otherwise no action is needed.
 
-Claude — to fix a missing venv, invoke the **Bash tool** (not the `!` injection mechanism, which doesn't get `$CLAUDE_PLUGIN_ROOT`) with the following command. It derives the plugin root the same way the diagnostics do, then runs the prewarm script:
+Claude — to fix a missing venv, invoke the **Bash tool** (not the `!` injection mechanism) with the following command. It resolves the plugin root the same way the diagnostics do (`jq` if available, else a `grep -A10`-then-`sed` fallback), then runs the prewarm script — which self-discovers the rest of its context, so no manual env-var setup is needed:
 
 ```sh
-PR="${CLAUDE_PLUGIN_ROOT:-$(grep -A2 '"lodestone@piercelamb-plugins"' "$HOME/.claude/plugins/installed_plugins.json" 2>/dev/null | grep '"installPath"' | tail -1 | sed -E 's/.*"installPath"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')}"
+PR="${CLAUDE_PLUGIN_ROOT:-}"
+if [ -z "$PR" ]; then
+  F="$HOME/.claude/plugins/installed_plugins.json"
+  if command -v jq >/dev/null 2>&1; then
+    PR=$(jq -r '.plugins["lodestone@piercelamb-plugins"][-1].installPath // empty' "$F" 2>/dev/null)
+  else
+    PR=$(grep -A10 '"lodestone@piercelamb-plugins"' "$F" 2>/dev/null | grep '"installPath"' | tail -1 | sed -E 's/.*"installPath"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+  fi
+fi
 if [ -z "$PR" ] || [ ! -x "$PR/bin/lodestone-prewarm.sh" ]; then
   echo "could not locate prewarm script (PR='$PR')"; exit 1
 fi
 bash "$PR/bin/lodestone-prewarm.sh"
 ```
 
-After the prewarm finishes (look for `[lodestone] Dependency install complete.`), tell the user to run `/reload-plugins` to pick up the freshly-installed venv. If prewarm exits non-zero, surface the error and stop — likely `uv` is not on PATH or `pyproject.toml`/`uv.lock` is missing.
+After the prewarm finishes (look for `[lodestone] Dependency install complete.`), tell the user to fully quit and relaunch Claude Code (not `/reload-plugins`) so the MCP server registers against the populated venv. If prewarm exits non-zero, surface the error and stop — likely `uv` is not on PATH or `pyproject.toml`/`uv.lock` is missing.
 
 ## Verdict
 
