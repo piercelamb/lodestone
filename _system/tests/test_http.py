@@ -5,7 +5,12 @@ import httpx
 import pytest
 
 from _system.utils import http as http_utils
-from _system.utils.http import is_429, is_transient, retry_arxiv_api
+from _system.utils.http import (
+    is_429,
+    is_arxiv_retryable,
+    is_transient,
+    retry_arxiv_api,
+)
 
 
 def _http_status_error(status_code: int, headers: dict | None = None) -> httpx.HTTPStatusError:
@@ -28,10 +33,23 @@ def test_is_429_false_for_5xx(sc: int) -> None:
 
 
 def test_is_429_false_for_transport_error() -> None:
-    """is_429 must NOT match transport errors — those signal arxiv IP-throttling
-    escalation; retrying makes it worse."""
+    """is_429 is narrow — transport errors fall to is_arxiv_retryable."""
     assert not is_429(httpx.ReadTimeout("read timeout"))
     assert not is_429(httpx.ConnectError("connect failed"))
+
+
+def test_is_arxiv_retryable_matches_429_503_and_transport() -> None:
+    """Predicate-level coverage for the new broader retry policy."""
+    assert is_arxiv_retryable(_http_status_error(429))
+    assert is_arxiv_retryable(_http_status_error(503))
+    assert is_arxiv_retryable(httpx.ReadTimeout("read timeout"))
+    assert is_arxiv_retryable(httpx.ConnectError("connect failed"))
+
+
+@pytest.mark.parametrize("sc", [400, 401, 403, 404, 500, 502, 504])
+def test_is_arxiv_retryable_excludes_4xx_502_504(sc: int) -> None:
+    """4xx (except 429) and other 5xx (except 503) surface immediately."""
+    assert not is_arxiv_retryable(_http_status_error(sc))
 
 
 def test_is_transient_still_matches_5xx_429_and_transport() -> None:
@@ -96,8 +114,9 @@ def test_wait_handles_garbage_retry_after() -> None:
 # ---- retry_arxiv_api integration ----------------------------------------
 
 
-def test_retry_arxiv_api_does_not_retry_transport_errors() -> None:
-    """ReadTimeout MUST NOT be retried — it indicates IP-level throttling."""
+def test_retry_arxiv_api_retries_transport_errors_within_budget(monkeypatch) -> None:
+    """Persistent ReadTimeout → 3 attempts (initial + 2 retries) then re-raise."""
+    _install_fake_clock(monkeypatch)
     calls: list[int] = []
 
     @retry_arxiv_api
@@ -107,7 +126,27 @@ def test_retry_arxiv_api_does_not_retry_transport_errors() -> None:
 
     with pytest.raises(httpx.ReadTimeout):
         f()
-    assert len(calls) == 1
+    assert len(calls) == 3
+
+
+def test_retry_arxiv_api_retries_transport_then_succeeds(monkeypatch) -> None:
+    """A single ReadTimeout followed by success → 2 attempts, 1 sleep of 60s."""
+    clock = _install_fake_clock(monkeypatch)
+
+    state = {"calls": 0}
+
+    @retry_arxiv_api
+    def f() -> str:
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise httpx.ReadTimeout("stalled")
+        return "ok"
+
+    assert f() == "ok"
+    assert state["calls"] == 2
+    # Transport errors don't carry Retry-After, so the wait class falls
+    # back to its exponential 60s/120s schedule starting at attempt 1.
+    assert clock.sleeps == [60.0]
 
 
 def test_retry_arxiv_api_retries_429_then_succeeds(monkeypatch) -> None:
@@ -148,9 +187,44 @@ def test_retry_arxiv_api_caps_at_three_attempts(monkeypatch) -> None:
     assert state["calls"] == 3
 
 
-def test_retry_arxiv_api_does_not_retry_5xx(monkeypatch) -> None:
-    """Only 429 retries on the arxiv API path; 503 surfaces immediately."""
+@pytest.mark.parametrize("sc", [500, 502, 504])
+def test_retry_arxiv_api_does_not_retry_other_5xx(monkeypatch, sc: int) -> None:
+    """500/502/504 still surface immediately on the arxiv API path."""
     monkeypatch.setattr(http_utils.time, "sleep", lambda s: None)
+
+    state = {"calls": 0}
+
+    @retry_arxiv_api
+    def f() -> str:
+        state["calls"] += 1
+        raise _http_status_error(sc)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        f()
+    assert state["calls"] == 1
+
+
+def test_retry_arxiv_api_retries_503_honoring_retry_after(monkeypatch) -> None:
+    """A 503 with Retry-After: 1 followed by 200 → second attempt succeeds, 1s sleep."""
+    clock = _install_fake_clock(monkeypatch)
+
+    state = {"calls": 0}
+
+    @retry_arxiv_api
+    def f() -> str:
+        state["calls"] += 1
+        if state["calls"] == 1:
+            raise _http_status_error(503, headers={"Retry-After": "1"})
+        return "ok"
+
+    assert f() == "ok"
+    assert state["calls"] == 2
+    assert clock.sleeps == [1.0]
+
+
+def test_retry_arxiv_api_retries_503_falls_back_to_60_120(monkeypatch) -> None:
+    """Persistent 503 without Retry-After → 3 attempts, sleeps [60s, 120s]."""
+    clock = _install_fake_clock(monkeypatch)
 
     state = {"calls": 0}
 
@@ -161,7 +235,8 @@ def test_retry_arxiv_api_does_not_retry_5xx(monkeypatch) -> None:
 
     with pytest.raises(httpx.HTTPStatusError):
         f()
-    assert state["calls"] == 1
+    assert state["calls"] == 3
+    assert clock.sleeps == [60.0, 120.0]
 
 
 # ---- progress hook bridging ----------------------------------------------

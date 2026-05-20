@@ -170,19 +170,38 @@ retry_http = retry(
 
 
 def is_429(exc: BaseException) -> bool:
-    """Predicate matching only HTTP 429 — used by ``retry_arxiv_api``.
+    """Predicate matching only HTTP 429 — the *narrow* 429-only path.
 
-    Deliberately *excludes* ``httpx.TransportError`` (read timeout,
-    connection reset). Per arxiv community evidence, those are arxiv's
-    escalation mode for repeat offenders — the server accepts the TCP
-    connection then never responds. Retrying just holds the connection
-    open and deepens the throttle. Surface it instead so the caller
-    can back off cleanly.
+    The broader :func:`is_arxiv_retryable` adds 503 + a bounded
+    transport-error retry. Kept exported as a building block because
+    "is this specifically a 429?" remains a useful test/observability
+    question even though ``retry_arxiv_api`` no longer uses it.
+
+    We don't retry transport errors blindly via this predicate — the
+    indistinguishable failure shapes (silent CDN/throttle/network/sleep
+    wedge) suggest backing off if it recurs, which is what the bounded
+    retry in :func:`is_arxiv_retryable` provides.
     """
     return (
         isinstance(exc, httpx.HTTPStatusError)
         and exc.response.status_code == 429
     )
+
+
+def is_arxiv_retryable(exc: BaseException) -> bool:
+    """Retry on 429, 503 (Fastly/arxiv flow control), or one transport blip.
+
+    Distinct from :func:`is_transient`: that one is used for non-arxiv
+    hosts and matches all 5xx + all transport errors freely. Here we
+    stay conservative — only 429/503 (the documented arxiv flow-control
+    signals) plus transport errors (Fastly first-byte-timeout, network
+    artifacts, macOS sleep) bounded by ``retry_arxiv_api``'s 3-attempt
+    cap. Anything else (4xx, 502/504, RuntimeError, etc.) surfaces.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        sc = exc.response.status_code
+        return sc == 429 or sc == 503
+    return isinstance(exc, httpx.TransportError)
 
 
 class _wait_arxiv_429(wait_base):
@@ -213,14 +232,17 @@ class _wait_arxiv_429(wait_base):
 
 
 # arxiv's metadata API needs its own retry policy, distinct from the
-# generic ``retry_http``: only retry 429 (honoring Retry-After), never
-# retry transport errors (those signal IP-level escalation — see the
-# is_429 docstring), and cap at 3 attempts so a sustained throttle
-# event surfaces in seconds, not minutes.
+# generic ``retry_http``: retry 429 + 503 (the documented arxiv flow-
+# control signals — Retry-After honored on both) plus one bounded
+# transport-error retry (Fastly first-byte-timeout, network artifacts,
+# macOS sleep wedges self-heal). Cap at 3 attempts so a sustained
+# throttle event surfaces in seconds-to-minutes, not unbounded. 502/
+# 504 and other 5xx are NOT retried here — they go through the broader
+# ``retry_http`` policy on non-arxiv code paths.
 retry_arxiv_api = retry(
     stop=stop_after_attempt(3),
     wait=_wait_arxiv_429(),
-    retry=retry_if_exception(is_429),
+    retry=retry_if_exception(is_arxiv_retryable),
     before_sleep=_log_retry,
     sleep=heartbeat_sleep,
     reraise=True,

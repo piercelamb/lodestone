@@ -145,15 +145,19 @@ def _arxiv_api_get(arxiv_id: str) -> str:
     actually prevents 429s in the user-driven CLI workflow — retries
     can recover from a single slip but not a sustained pattern.
 
-    Retries: only HTTP 429 is retried (3 attempts, honoring Retry-After,
-    else 60s/120s waits). Transport errors / read timeouts are *not*
-    retried — those signal arxiv has escalated to silent IP-throttling
-    and further attempts deepen the offense; they're surfaced to the
-    caller so the user can back off.
+    Retries: 429 and 503 (the documented arxiv flow-control signals)
+    plus one bounded transport-error retry (Fastly first-byte-timeout,
+    network artifacts, macOS sleep wedges); 3 attempts total, honoring
+    Retry-After on HTTPStatusError or falling back to 60s/120s waits.
+    Other 4xx and 5xx (404, 502, 504, etc.) surface immediately so the
+    caller can react. The caller (`_default_arxiv_lookup`) re-wraps
+    post-retry exceptions into a more actionable RuntimeError for the
+    MCP envelope.
 
     Read timeout is 15s rather than the default 30s — arxiv responds in
     well under a second when not throttling, and a long timeout just
-    extends the wait when the connection has been silently dropped.
+    extends the wait when the connection has been silently dropped (one
+    bounded retry above gives self-healing for transient wedges).
     """
     wait_for_arxiv_slot()
     url = _ARXIV_API_URL.format(arxiv_id=arxiv_id)
@@ -167,7 +171,25 @@ def _default_arxiv_lookup(arxiv_id: str) -> _ArxivMetadata:
     """Query arxiv's Atom export for a single id. Version suffix accepted."""
     import xml.etree.ElementTree as ET
 
-    xml_text = _arxiv_api_get(arxiv_id)
+    try:
+        xml_text = _arxiv_api_get(arxiv_id)
+    except httpx.TransportError as exc:
+        raise RuntimeError(
+            f"arxiv API did not respond within retry budget for {arxiv_id!r} "
+            f"(possible arxiv throttling, CDN first-byte-timeout, or local "
+            f"network issue — wait a few minutes and retry). "
+            f"raw: {type(exc).__name__}: {exc}"
+        ) from exc
+    except httpx.HTTPStatusError as exc:
+        sc = exc.response.status_code
+        if sc in (429, 503):
+            raise RuntimeError(
+                f"arxiv API rate-limited request for {arxiv_id!r} "
+                f"(HTTP {sc} after retry budget exhausted — wait several "
+                f"minutes and retry; arxiv asks for >=3s between requests "
+                f"across all your machines)."
+            ) from exc
+        raise  # 4xx and other 5xx: keep original, those carry info already.
     root = ET.fromstring(xml_text)
     entry = root.find(f"{{{_ATOM_NS}}}entry")
     if entry is None:
