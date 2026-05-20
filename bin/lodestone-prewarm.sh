@@ -42,7 +42,7 @@ if [[ "$current_hash" == "$stored_hash" ]]; then
   exit 0
 fi
 
-echo "[lodestone] First-time dependency install — running 'uv sync' (~30-90s). Tools will appear after this finishes."
+echo "[lodestone] First-time dependency install — running 'uv sync' (~30-90s)."
 
 cd "$CLAUDE_PLUGIN_ROOT"
 if ! uv sync; then
@@ -51,4 +51,4 @@ if ! uv sync; then
 fi
 
 echo "$current_hash" > "$hash_file"
-echo "[lodestone] Dependency install complete."
+echo "[lodestone] Dependency install complete. If lodestone MCP tools don't appear in this session, fully quit and relaunch Claude Code — Claude Code launches MCP servers in parallel with this hook and the lodestone server may have already failed against the empty venv. The canonical install flow runs /lodestone:doctor before the first restart to avoid this entirely."
