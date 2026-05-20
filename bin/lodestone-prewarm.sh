@@ -9,10 +9,19 @@
 # status appears in the user's session when sync actually runs.
 set -euo pipefail
 
-# Fail loud if launched outside the plugin context (env vars come from
-# Claude Code's hook runner).
-: "${CLAUDE_PLUGIN_ROOT:?CLAUDE_PLUGIN_ROOT not set — prewarm must run as a plugin hook}"
-: "${CLAUDE_PLUGIN_DATA:?CLAUDE_PLUGIN_DATA not set — prewarm must run as a plugin hook}"
+# Resolve plugin context. Claude Code's hook runner exports both vars
+# (and that's the production path), but /lodestone:doctor remediation
+# also invokes this script via the Bash tool in a session that doesn't
+# have them set. Self-discovery from the script's own location handles
+# that case correctly:
+#   - PLUGIN_ROOT is `dirname(dirname(<this script>))` — the script
+#     lives at <plugin-root>/bin/lodestone-prewarm.sh by construction.
+#   - PLUGIN_DATA defaults to the @-separated convention Claude Code
+#     uses today (~/.claude/plugins/data/<plugin>@<marketplace>).
+_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+: "${CLAUDE_PLUGIN_ROOT:=$(cd "$_script_dir/.." && pwd)}"
+: "${CLAUDE_PLUGIN_DATA:=$HOME/.claude/plugins/data/lodestone@piercelamb-plugins}"
+export CLAUDE_PLUGIN_ROOT CLAUDE_PLUGIN_DATA
 
 if ! command -v uv >/dev/null 2>&1; then
   echo "[lodestone prewarm] uv not found on PATH. Install from https://astral.sh/uv and run /lodestone:doctor." >&2
