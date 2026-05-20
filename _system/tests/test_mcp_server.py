@@ -1903,6 +1903,15 @@ class TestIngestProgress:
         # the module the dispatcher imports from.
         from _system.scripts import validate_models
         monkeypatch.setattr(validate_models, "check_models", lambda: None)
+        # Prefetch runs ensure_model_cached for both models at the top of
+        # every ingest dispatcher; we no-op snapshot_download so neither
+        # the cache nor the network are touched, but the prefetch's
+        # _CumulativeProgress still emits its stage-boundary frames.
+        import huggingface_hub
+        monkeypatch.setattr(
+            huggingface_hub, "snapshot_download",
+            lambda repo_id, *a, **kw: f"/fake/{repo_id}",
+        )
         return calls
 
     def test_ingest_paper_emits_progress(self, fig_db, monkeypatch):
@@ -1929,13 +1938,18 @@ class TestIngestProgress:
         sc = resp["result"]["structuredContent"]
         assert sc == {"kind": "paper", "status": "INDEXED"}
 
-        # Stub fired 3 staged ticks + a final 'complete' tick. The
-        # dispatcher itself emits one upfront 'checking models' tick. So
-        # 5 progress notifications total.
+        # Frame budget for ingest_paper with prefetch:
+        #   1  "checking models"               (dispatcher)
+        #   1  "preparing lodestone models"    (_prefetch start)
+        #   1  "Downloaded bge-small-en-v1.5"  (stage exit)
+        #   1  "Downloaded gliner2-large-v1"   (stage exit)
+        #   3  step-{0..2}                     (stubbed pipeline)
+        #   1  complete                        (stubbed pipeline)
+        # snapshot_download is a no-op so no per-byte frames fire.
         progress_msgs = [
             m for m in sent if m.get("method") == "notifications/progress"
         ]
-        assert len(progress_msgs) == 5
+        assert len(progress_msgs) == 8
         for m in progress_msgs:
             assert m["params"]["progressToken"] == "tok-1"
             assert isinstance(m["params"]["progress"], int)
@@ -2009,9 +2023,98 @@ class TestIngestProgress:
         progress_msgs = [
             m for m in sent if m.get("method") == "notifications/progress"
         ]
-        # 1 'checking models' + 2 step ticks + 1 'complete' = 4.
-        assert len(progress_msgs) == 4
+        # 1 'checking models' + 1 'preparing' + 2 'Downloaded' (stage exits)
+        # + 2 step ticks + 1 'complete' = 7.
+        assert len(progress_msgs) == 7
         assert all(
             m["params"]["progressToken"] == "tok-9" for m in progress_msgs
         )
+
+    def test_ingest_paper_prefetches_both_models_monotone_bytes(
+        self, fig_db, monkeypatch,
+    ):
+        """When snapshot_download streams chunks via the passed tqdm_class,
+        the ingest dispatch should surface ONE consolidated progress
+        stream — byte counters monotone non-decreasing across both models,
+        all carrying the client's progressToken."""
+        from _system.scripts import ingest as ingest_mod
+        from _system.scripts import validate_models
+
+        sent: list[dict] = []
+        monkeypatch.setattr(mcp_server, "_send", lambda msg: sent.append(msg))
+
+        # Disable the prefetch rate-limit so every chunk emits.
+        monkeypatch.setattr(validate_models, "_PROGRESS_RATE_LIMIT_S", 0.0)
+
+        # Provider check is irrelevant for this test.
+        monkeypatch.setattr(validate_models, "check_models", lambda: None)
+
+        # Fake snapshot_download that walks chunks through the tqdm shim
+        # (mirroring HF's downloader behavior). Per-model chunk sizes are
+        # different to make off-by-one byte tracking visible.
+        chunks_by_repo = {
+            str(validate_models.ModelId.BGE):     [1000, 2000, 3000],
+            str(validate_models.ModelId.GLINER2): [5000, 5000, 5000, 5000],
+        }
+        import huggingface_hub
+
+        def fake_snapshot(repo_id, *args, **kwargs):
+            tqdm_class = kwargs.get("tqdm_class")
+            assert tqdm_class is not None
+            with tqdm_class(total=sum(chunks_by_repo[repo_id])) as bar:
+                for n in chunks_by_repo[repo_id]:
+                    bar.update(n)
+            return f"/fake/{repo_id}"
+
+        monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot)
+
+        # Stub the actual ingest so we don't run the pipeline.
+        def fake_ingest(**kwargs):
+            return {"kind": "paper", "status": "INDEXED"}
+
+        monkeypatch.setattr(ingest_mod, "ingest", fake_ingest)
+
+        state = _make_state(fig_db)
+        resp = mcp_server._handle_tools_call(
+            state,
+            {
+                "jsonrpc": "2.0",
+                "id": 42,
+                "method": "tools/call",
+                "params": {
+                    "name": "ingest_paper",
+                    "arguments": {"url": "2301.12345"},
+                    "_meta": {"progressToken": "tok-prefetch"},
+                },
+            },
+        )
+        assert not _is_error(resp), resp
+
+        progress_msgs = [
+            m for m in sent if m.get("method") == "notifications/progress"
+        ]
+        assert progress_msgs, "expected progress notifications"
+        assert all(
+            m["params"]["progressToken"] == "tok-prefetch"
+            for m in progress_msgs
+        )
+
+        # Frames whose message mentions "Downloading lodestone models" or
+        # "Downloaded" come from the prefetch; their byte counts must be
+        # monotone non-decreasing.
+        prefetch_bytes = [
+            m["params"]["progress"]
+            for m in progress_msgs
+            if "lodestone models" in m["params"]["message"]
+            or m["params"]["message"].startswith("Downloaded ")
+        ]
+        assert prefetch_bytes, "expected prefetch byte frames"
+        assert prefetch_bytes == sorted(prefetch_bytes), (
+            f"prefetch byte stream not monotone: {prefetch_bytes}"
+        )
+        # Final cumulative count is at least the sum of all simulated chunks.
+        observed_total_chunks = sum(
+            sum(v) for v in chunks_by_repo.values()
+        )
+        assert prefetch_bytes[-1] >= observed_total_chunks
 

@@ -20,7 +20,9 @@ Where the Deep Trilogy is built for *writing* software, lodestone is built for *
 /plugin install lodestone
 /plugin install deep-sota
 ```
-Restart Claude Code. Hand [`/deep-sota`](https://github.com/piercelamb/deep-sota) an arXiv / GitHub / blog URL to ingest, or a research question to investigate — it picks the right tools (search, read, figures, citations, code repos) and surfaces coverage gaps honestly instead of hallucinating.
+Restart Claude Code. The first session runs a one-time dependency install (~30–90s) via a `SessionStart` prewarm hook — you'll see a `[lodestone] First-time dependency install…` line in the session and a `[lodestone] Dependency install complete.` line when it's done. Subsequent sessions skip this entirely. Two CPU-only HuggingFace models (~400 MB total) download lazily on the first ingest with live progress. Run **`/lodestone:doctor`** if `mcp__lodestone__*` tools don't appear — it now offers to fix the common `/plugin install`-mid-session case automatically.
+
+Hand [`/deep-sota`](https://github.com/piercelamb/deep-sota) an arXiv / GitHub / blog URL to ingest, or a research question to investigate — it picks the right tools (search, read, figures, citations, code repos) and surfaces coverage gaps honestly instead of hallucinating.
 
 **Optional — pre-seed the taxonomy** (domains and collections) before your first ingest. Either use [my taxonomy](./taxonomy.json) or write your own in the same shape, then point Claude at [`seed_taxonomy.py`](./_system/scripts/seed_taxonomy.py). Skip seeding entirely and the classify step grows the taxonomy from scratch as you ingest — both paths are fully supported. See [Seeding the Taxonomy](#seeding-the-taxonomy).
 
@@ -396,7 +398,7 @@ model = "claude-opus-4-7"  # see _system/llm/<provider>_adapter.py for the catal
 temperature = 0.2
 ```
 
-The first ingest call also downloads two CPU-only HuggingFace models — `bge-small-en-v1.5` (embeddings) and `gliner2-large-v1` (entity extraction), ~400 MB total. It also clones the paper's GitHub repo if one is linked.
+The first ingest call also downloads two CPU-only HuggingFace models — `bge-small-en-v1.5` (embeddings) and `gliner2-large-v1` (entity extraction), ~400 MB total — to `~/.cache/huggingface/`. From the MCP server, the download streams live `notifications/progress` to the client so it's visible, not an opaque hang; subsequent ingests reuse the cached weights. It also clones the paper's GitHub repo if one is linked.
 
 Verify the DB is populated:
 ```sh
@@ -434,7 +436,7 @@ Most MCP clients use a JSON config that maps a server name to a launch command. 
 Notes:
 - Use an **absolute path** for `command` — clients launch with an unpredictable working directory and PATH.
 - `LODESTONE_DB` must be absolute; the file is auto-created if missing.
-- `MCP_TIMEOUT` (server startup, ms) and `MCP_TOOL_TIMEOUT` (per-tool-call, ms) are read by the client, not the server. The 30-minute tool timeout matters for `ingest_paper` — most clients default to 60 s, which kills mid-ingest. Set whatever your client's equivalent key is.
+- `MCP_TIMEOUT` (server startup, ms) and `MCP_TOOL_TIMEOUT` (per-tool-call, ms) are read by some MCP clients; the exact default isn't formally documented for Claude Code. Long ingests stream `notifications/progress` to keep the call alive (per the MCP spec, clients should treat progress as activity). If your client still kills mid-ingest, set its equivalent timeout key generously — the example block above uses 30 minutes for `ingest_paper`.
 - If your LLM provider key for classification isn't already in the launching shell, add it to `env`.
 
 **Client-specific config paths** (verify against current docs — these change):
@@ -663,7 +665,7 @@ Model catalogs (with descriptions and the default at index 0) live in `_system/l
 | `GEMINI_API_KEY` | Provider key for Gemini classification. |
 | `XDG_CONFIG_HOME` | Overrides the config directory root (default `~/.config`). |
 | `MCP_TIMEOUT` | MCP server startup timeout (default 30 s). |
-| `MCP_TOOL_TIMEOUT` | Per-tool-call timeout (default 30 min — long enough for ingest). |
+| `MCP_TOOL_TIMEOUT` | Per-tool-call timeout (ms). Read by some MCP clients; default isn't formally documented for Claude Code. Ingest streams `notifications/progress` to signal activity — set generously (e.g. 1800000 = 30 min) if your client kills long calls. |
 
 Provider selection itself is **not** driven by env-var precedence — it's driven by `~/.config/lodestone/config.toml`. Set whatever provider keys you want; the first CLI ingest (or `/deep-sota` `validate-env.sh`) picks one and persists the choice. See [LLM provider and model](#llm-provider-and-model) above for the full resolution order.
 

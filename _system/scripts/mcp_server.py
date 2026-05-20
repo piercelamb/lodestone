@@ -663,6 +663,32 @@ def _query_dispatch(conn: sqlite3.Connection, args: dict) -> dict:
     return mode_query(conn, sql=args["sql"])
 
 
+def _prefetch_lodestone_models(progress) -> None:
+    """Pre-warm both HF model caches with one consolidated progress stream.
+
+    Otherwise bge (resolver) and gliner (entity extraction) trickle in
+    lazily at different pipeline stages, surfacing as two separate
+    multi-minute hangs to the user. Both are pulled before the pipeline
+    starts so the actual ingest stages observe a warm cache and their
+    own model-load calls become no-ops.
+    """
+    from _system.scripts.validate_models import (
+        ModelId,
+        _CumulativeProgress,
+        ensure_model_cached,
+    )
+
+    cp = _CumulativeProgress([
+        (ModelId.BGE,     "bge-small-en-v1.5"),
+        (ModelId.GLINER2, "gliner2-large-v1"),
+    ])
+    if progress is not None:
+        progress("preparing lodestone models", 0, cp.total)
+    for model_id, label in cp.stages_with_labels:
+        with cp.stage(model_id, label):
+            ensure_model_cached(model_id)
+
+
 def _ingest_paper_dispatch(
     conn: sqlite3.Connection, args: dict, progress=None,
 ) -> dict:
@@ -676,6 +702,7 @@ def _ingest_paper_dispatch(
     if progress is not None:
         progress("checking models", 0, 1)
     check_models()
+    _prefetch_lodestone_models(progress)
     init_db(conn)
     arxiv_id = parse_arxiv_id(args["url"])
     return ingest(
@@ -697,6 +724,7 @@ def _ingest_repo_dispatch(
     if progress is not None:
         progress("checking models", 0, 1)
     check_models()
+    _prefetch_lodestone_models(progress)
     init_db(conn)
     return ingest_repo_only(
         conn=conn,
@@ -717,6 +745,7 @@ def _ingest_post_dispatch(
     if progress is not None:
         progress("checking models", 0, 1)
     check_models()
+    _prefetch_lodestone_models(progress)
     init_db(conn)
     return ingest_post(
         conn=conn,
