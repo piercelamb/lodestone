@@ -23,8 +23,8 @@ Requires [`uv`](https://docs.astral.sh/uv/) on `PATH`.
 /plugin install lodestone
 /plugin install deep-sota
 /reload-plugins
-/mcp -> find lodestone -> enable
 /lodestone:doctor
+/mcp -> find lodestone -> enable or reconnect
 ```
 Then **fully quit and relaunch Claude Code** (not `/reload-plugins`) — once. Done.
 
