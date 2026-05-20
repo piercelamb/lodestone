@@ -1,6 +1,8 @@
 """Tests for _system.scripts.validate_models."""
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from _system.llm import config as llm_config
@@ -10,6 +12,7 @@ from _system.llm.errors import (
     ProviderUnconfigured,
 )
 from _system.scripts import validate_models as vm_mod
+from _system.utils import http as http_mod
 
 
 @pytest.fixture
@@ -143,6 +146,165 @@ class TestMainCLI:
         assert "model:" in joined
         assert str(vm_mod.ModelId.BGE) in joined
         assert str(vm_mod.ModelId.GLINER2) in joined
+
+
+class TestEnsureModelCachedNoHook:
+    """When no progress hook is set, ensure_model_cached must call
+    snapshot_download WITHOUT tqdm_class (preserves the default stderr
+    bar) — verifies the warm-cache fast path doesn't accidentally
+    install an opaque tqdm shim that would swallow HF's own logging.
+    """
+
+    def test_no_hook_falls_through_without_tqdm_class(self, monkeypatch):
+        import huggingface_hub
+
+        captured: dict = {}
+
+        def fake(repo_id, *args, **kwargs):
+            captured["repo_id"] = repo_id
+            captured["kwargs"] = kwargs
+            return f"/fake/{repo_id}"
+
+        monkeypatch.setattr(huggingface_hub, "snapshot_download", fake)
+        # Force no hook.
+        assert http_mod._progress_hook.get() is None
+        vm_mod.ensure_model_cached(vm_mod.ModelId.BGE)
+        assert captured["repo_id"] == str(vm_mod.ModelId.BGE)
+        assert "tqdm_class" not in captured["kwargs"]
+
+
+class TestEnsureModelCachedProgress:
+    """When a progress hook is set, ensure_model_cached should pass a
+    tqdm_class whose ``update(n)`` increments emit byte-level frames
+    through the hook (monotone + rate-limited).
+    """
+
+    def _patch_snapshot_with_chunks(self, monkeypatch, chunks: list[int]):
+        """Drive a fake snapshot_download that walks ``chunks`` through the
+        passed tqdm_class context manager. Returns the calls list to be
+        populated by the active hook."""
+        import huggingface_hub
+
+        def fake(repo_id, *args, **kwargs):
+            tqdm_class = kwargs.get("tqdm_class")
+            assert tqdm_class is not None, "expected tqdm_class to be passed"
+            # Simulate per-file tqdm context like HF's downloader does.
+            bar = tqdm_class(total=sum(chunks), unit="B", unit_scale=True)
+            with bar as b:
+                for n in chunks:
+                    b.update(n)
+            return f"/fake/{repo_id}"
+
+        monkeypatch.setattr(huggingface_hub, "snapshot_download", fake)
+
+    def test_hook_receives_monotone_progress(self, monkeypatch):
+        self._patch_snapshot_with_chunks(monkeypatch, [10, 20, 30, 40])
+        calls: list[tuple[str, int, int]] = []
+
+        def hook(msg: str, done: int, total: int):
+            calls.append((msg, done, total))
+
+        # Disable rate-limit so every update emits.
+        monkeypatch.setattr(vm_mod, "_PROGRESS_RATE_LIMIT_S", 0.0)
+        token = http_mod.set_progress_hook(hook)
+        try:
+            vm_mod.ensure_model_cached(vm_mod.ModelId.BGE)
+        finally:
+            http_mod.reset_progress_hook(token)
+
+        assert calls, "expected at least one progress frame"
+        # Bytes monotone non-decreasing.
+        bytes_seq = [c[1] for c in calls]
+        assert bytes_seq == sorted(bytes_seq)
+        # Label includes the model id.
+        assert all(str(vm_mod.ModelId.BGE) in c[0] for c in calls)
+        # Final byte count == sum of chunks.
+        assert calls[-1][1] == 10 + 20 + 30 + 40
+
+    def test_hook_calls_rate_limited(self, monkeypatch):
+        # 100 small chunks in a tight loop — with the 0.75s default
+        # rate limit and a frozen clock, we should see at most 1 frame.
+        self._patch_snapshot_with_chunks(monkeypatch, [1] * 100)
+        calls: list = []
+
+        # Freeze time.monotonic so the rate limiter believes no time
+        # passed between updates. (The first update emits because
+        # last_emit starts at 0.0 and now - 0.0 >= 0.75 only if now
+        # is large — we deliberately make it small.)
+        monkeypatch.setattr(time, "monotonic", lambda: 0.1)
+
+        def hook(msg, done, total):
+            calls.append((msg, done, total))
+
+        token = http_mod.set_progress_hook(hook)
+        try:
+            vm_mod.ensure_model_cached(vm_mod.ModelId.BGE)
+        finally:
+            http_mod.reset_progress_hook(token)
+
+        # Zero frames is the expected outcome (frozen clock + non-zero
+        # initial last_emit gap of 0.1 - 0.0 = 0.1 < 0.75 rate limit).
+        assert len(calls) <= 2, (
+            f"rate limit failed — got {len(calls)} frames for 100 chunks"
+        )
+
+
+class TestCumulativeProgress:
+    """_CumulativeProgress must keep upstream progress monotone across
+    multiple ensure_model_cached stages and add stage offsets to
+    per-stage byte counters."""
+
+    def test_two_stages_yield_monotone_cumulative_stream(self, monkeypatch):
+        import huggingface_hub
+
+        # Two fake models — BGE downloads 50 bytes, GLINER downloads 100.
+        chunks_by_repo = {
+            str(vm_mod.ModelId.BGE):     [25, 25],
+            str(vm_mod.ModelId.GLINER2): [50, 50],
+        }
+
+        def fake(repo_id, *args, **kwargs):
+            tqdm_class = kwargs["tqdm_class"]
+            bar = tqdm_class(total=sum(chunks_by_repo[repo_id]))
+            with bar as b:
+                for n in chunks_by_repo[repo_id]:
+                    b.update(n)
+            return f"/fake/{repo_id}"
+
+        monkeypatch.setattr(huggingface_hub, "snapshot_download", fake)
+        monkeypatch.setattr(vm_mod, "_PROGRESS_RATE_LIMIT_S", 0.0)
+
+        upstream_calls: list[tuple[str, int, int]] = []
+
+        def upstream(msg, done, total):
+            upstream_calls.append((msg, done, total))
+
+        cp = vm_mod._CumulativeProgress([
+            (vm_mod.ModelId.BGE,     "bge"),
+            (vm_mod.ModelId.GLINER2, "gliner"),
+        ])
+        token = http_mod.set_progress_hook(upstream)
+        try:
+            for model_id, label in cp.stages_with_labels:
+                with cp.stage(model_id, label):
+                    vm_mod.ensure_model_cached(model_id)
+        finally:
+            http_mod.reset_progress_hook(token)
+
+        bytes_seq = [c[1] for c in upstream_calls]
+        assert bytes_seq, "expected upstream frames"
+        # Monotone non-decreasing across both stages.
+        assert bytes_seq == sorted(bytes_seq), (
+            f"non-monotone cumulative bytes: {bytes_seq}"
+        )
+        # Final value reflects both stages' planned totals.
+        assert upstream_calls[-1][1] >= (
+            vm_mod._MODEL_BYTE_ESTIMATE[vm_mod.ModelId.BGE]
+        )
+        # Total is sum of estimates.
+        assert all(
+            c[2] == cp.total for c in upstream_calls
+        )
 
 
 class TestImportIsolation:

@@ -146,6 +146,12 @@ def _get_model() -> Any:
     """
     global _MODEL
     if _MODEL is None:
+        # Populate the HF cache first; emits byte-level progress through
+        # the active _progress_hook when the MCP server has one set.
+        # GLiNER2.from_pretrained then finds the snapshot present.
+        from _system.scripts.validate_models import ModelId, ensure_model_cached
+
+        ensure_model_cached(ModelId.GLINER2)
         from gliner2 import GLiNER2
         _MODEL = GLiNER2.from_pretrained("fastino/gliner2-large-v1")
     return _MODEL

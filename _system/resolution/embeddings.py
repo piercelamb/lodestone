@@ -23,6 +23,14 @@ class Embedder:
     def _ensure_loaded(self) -> None:
         if self._model is not None:
             return
+        # Ensure the HF cache is populated first. On a cold cache this
+        # emits byte-level progress via the active _progress_hook (set
+        # by the MCP server for the duration of an ingest tool call);
+        # SentenceTransformer then finds the snapshot present and its
+        # constructor stays silent.
+        from _system.scripts.validate_models import ModelId, ensure_model_cached
+
+        ensure_model_cached(ModelId.BGE)
         # Import inside the method so ``import embeddings`` does not pull in
         # torch / sentence_transformers until someone actually embeds text.
         from sentence_transformers import SentenceTransformer
