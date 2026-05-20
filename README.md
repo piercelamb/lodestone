@@ -28,6 +28,14 @@ Requires [`uv`](https://docs.astral.sh/uv/) on `PATH`.
 ```
 Then **fully quit and relaunch Claude Code** (not `/reload-plugins`) — once. Done.
 
+Now seed your corpus — `/deep-sota` accepts arXiv, code repo, and blog post URLs:
+
+```
+/deep-sota https://arxiv.org/abs/2305.10601                       # arXiv paper
+/deep-sota https://github.com/owner/repo                          # code repo
+/deep-sota https://lilianweng.github.io/posts/2023-06-23-agent/   # blog post
+```
+
 Why this sequence: `/lodestone:doctor` is the canonical first-run setup. It runs the one-time `uv sync` (~30–90s), walks you through the LLM provider + model picker (writing `~/.config/lodestone/config.toml`), and downloads the two CPU-only HuggingFace models (`bge-small-en-v1.5` embeddings + `gliner2-large-v1` entity extraction, ~400 MB total) in the background while you answer the picker prompts. After doctor finishes, Claude Code's next startup finds a populated venv on the first attempt, config is in place, and models are cached — `mcp__lodestone__*` tools register immediately and your first ingest doesn't have to download anything. If you skip the doctor step and just restart, Claude Code launches the MCP server in parallel with the SessionStart prewarm hook — the MCP server hits an empty venv, exits 1, and Claude Code doesn't retry it mid-session, so you'd need a *second* restart for tools to appear. Doctor preempts that race.
 
 If you skip doctor entirely the fallbacks still work: HF models download lazily on the first ingest call with live `notifications/progress`, and provider/model selection falls through to `/deep-sota`'s `validate-env.sh` picker on the first ingest. Doctor just folds both into one upfront step. Subsequent sessions skip the prewarm entirely (it's hash-gated against `pyproject.toml` + `uv.lock`).
