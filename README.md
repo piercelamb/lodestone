@@ -30,7 +30,7 @@ Then **fully quit and relaunch Claude Code** (not `/reload-plugins`) — once. D
 
 Why this sequence: `/lodestone:doctor` is the canonical first-run setup. It runs the one-time `uv sync` (~30–90s), walks you through the LLM provider + model picker (writing `~/.config/lodestone/config.toml`), and downloads the two CPU-only HuggingFace models (`bge-small-en-v1.5` embeddings + `gliner2-large-v1` entity extraction, ~400 MB total) in the background while you answer the picker prompts. After doctor finishes, Claude Code's next startup finds a populated venv on the first attempt, config is in place, and models are cached — `mcp__lodestone__*` tools register immediately and your first ingest doesn't have to download anything. If you skip the doctor step and just restart, Claude Code launches the MCP server in parallel with the SessionStart prewarm hook — the MCP server hits an empty venv, exits 1, and Claude Code doesn't retry it mid-session, so you'd need a *second* restart for tools to appear. Doctor preempts that race.
 
-If you skip doctor entirely the fallbacks still work: HF models download lazily on the first ingest call with live `notifications/progress`, and provider/model selection falls through to `/deep-sota`'s `validate-env.sh` picker on the first ingest. Doctor just folds both into one upfront step. Subsequent sessions skip the prewarm entirely (it's hash-gated against `pyproject.toml` + `uv.lock`).
+If you skip doctor entirely, HF models download lazily on the first ingest call with live `notifications/progress`, **but** `/deep-sota` will refuse to ingest until `~/.config/lodestone/config.toml` exists — it reads the file directly, sees no provider/model, and tells you to run `/lodestone:doctor`. Doctor is the only provider/model picker in the plugin path. Subsequent sessions skip the prewarm entirely (it's hash-gated against `pyproject.toml` + `uv.lock`).
 
 Hand [`/deep-sota`](https://github.com/piercelamb/deep-sota) an arXiv / GitHub / blog URL to ingest, or a research question to investigate — it picks the right tools (search, read, figures, citations, code repos) and surfaces coverage gaps honestly instead of hallucinating.
 
@@ -663,7 +663,7 @@ Provider and model selection is persisted in **`~/.config/lodestone/config.toml`
 3. **No config, multiple provider API keys set, TTY available?** Prompt the user (provider menu, then model menu), write the config.
 4. **No config, multiple keys set, no TTY?** Raise `ProviderAmbiguous` with instructions to write the config by hand. The MCP server hits this path because it can't prompt.
 
-For plugin users, **`/lodestone:doctor`** is the canonical first-run picker — it walks you through provider + model selection and writes the config upfront, before any MCP call or ingest happens. `/deep-sota`'s bundled `validate-env.sh` remains as a fallback that triggers on the first ingest if the config is still missing (e.g. you skipped doctor) or if an ingest hits an auth/config error. From a bare standalone install (no plugin), run any CLI ingest first to seed the config — or write the TOML directly.
+For plugin users, **`/lodestone:doctor`** is the **only** first-run picker — it walks you through provider + model selection and writes the config upfront, before any MCP call or ingest happens. `/deep-sota` does not run its own picker; if you try to ingest without `config.toml`, the skill stops and tells you to run `/lodestone:doctor`. From a bare standalone install (no plugin), run any CLI ingest first to seed the config — or write the TOML directly.
 
 To change provider or model later, edit `~/.config/lodestone/config.toml`:
 
@@ -688,7 +688,7 @@ Model catalogs (with descriptions and the default at index 0) live in `_system/l
 | `MCP_TIMEOUT` | MCP server startup timeout (default 30 s). |
 | `MCP_TOOL_TIMEOUT` | Per-tool-call timeout (ms). Read by some MCP clients. Ingest streams `notifications/progress` to signal activity — set generously (e.g. 1800000 = 30 min) if your client kills long calls. |
 
-Provider selection itself is **not** driven by env-var precedence — it's driven by `~/.config/lodestone/config.toml`. Set whatever provider keys you want; `/lodestone:doctor` (canonical, plugin path) or the first CLI ingest / `/deep-sota` `validate-env.sh` (fallback) picks one and persists the choice. See [LLM provider and model](#llm-provider-and-model) above for the full resolution order.
+Provider selection itself is **not** driven by env-var precedence — it's driven by `~/.config/lodestone/config.toml`. Set whatever provider keys you want; `/lodestone:doctor` (plugin path) or the first CLI ingest's interactive picker (standalone path) reads them and persists the choice. See [LLM provider and model](#llm-provider-and-model) above for the full resolution order.
 
 LLM adapter and httpx timeouts are capped server-side so a wedged downstream request can't hang the MCP server post-sleep.
 
