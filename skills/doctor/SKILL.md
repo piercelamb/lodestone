@@ -54,10 +54,9 @@ If absent: the plugin's root `.mcp.json` didn't register. Fix line: `open /mcp -
 
 ### HuggingFace model cache
 
-!`test -d "$HOME/.cache/huggingface/hub/models--BAAI--bge-small-en-v1.5" && echo "bge cached" || echo "bge NOT cached"`
-!`test -d "$HOME/.cache/huggingface/hub/models--fastino--gliner2-large-v1" && echo "gliner cached" || echo "gliner NOT cached"`
+!`bash "${CLAUDE_SKILL_DIR}/scripts/check-hf-cache.sh"`
 
-Two CPU-only HuggingFace models are required at ingest time: `BAAI/bge-small-en-v1.5` (~133 MB, embeddings) and `fastino/gliner2-large-v1` (~285 MB, entity extraction). If both are cached, PASS. If either reports "NOT cached", FAIL — fix line: `Claude will download the missing model(s) now — see Model download remediation below`.
+Two CPU-only HuggingFace models are required at ingest time: `BAAI/bge-small-en-v1.5` (~133 MB, embeddings) and `fastino/gliner2-large-v1` (~285 MB, entity extraction). The script uses `huggingface_hub.snapshot_download(local_files_only=True)` to verify completeness — same call path the loader libraries use, just with the network door closed — so partial downloads and missing variant files surface as "NOT cached" rather than false-positive PASSing on directory existence alone. If both report "cached", PASS. If either reports "NOT cached" (or "cached (loose check…)" when the venv isn't ready yet — that's a weaker check), FAIL — fix line: `Claude will download the missing model(s) now — see Model download remediation below`.
 
 ### LLM provider config
 
