@@ -25,6 +25,7 @@ one monotone progress stream (MCP spec requirement).
 """
 from __future__ import annotations
 
+import sys
 import time
 from contextlib import contextmanager
 from enum import StrEnum
@@ -327,7 +328,26 @@ def check_models() -> str:
     return resolved.provider.value
 
 
+def ensure_models_cached() -> None:
+    """Idempotently fetch both ML models without touching provider config.
+
+    Used by `/lodestone:doctor` when running the HF download in parallel
+    with the provider/model wizard: at that point ``config.toml`` does
+    not yet exist, so ``resolve_provider`` would raise. We just need the
+    bytes on disk — provider validation happens at ingest time.
+    """
+    _check_model(ModelId.BGE)
+    _check_model(ModelId.GLINER2)
+
+
 def main() -> None:
+    models_only = "--models-only" in sys.argv[1:]
+    if models_only:
+        ensure_models_cached()
+        print(f"{ModelId.BGE}: present")
+        print(f"{ModelId.GLINER2}: present")
+        return
+
     provider_name = check_models()
     # Reload to surface the resolved model alongside the provider name.
     resolved = resolve_provider()
