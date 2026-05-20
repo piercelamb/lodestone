@@ -10,6 +10,7 @@ class).
 """
 from __future__ import annotations
 
+import time
 from contextvars import ContextVar
 from typing import Callable, Optional
 
@@ -96,6 +97,42 @@ def _log_retry(retry_state) -> None:
             _LOG.warning("progress hook raised, ignoring: %r", cb_exc)
 
 
+# Heartbeat cadence for ``heartbeat_sleep``. Chosen comfortably under the
+# MCP TypeScript SDK's 60s read timeout (DEFAULT_REQUEST_TIMEOUT_MSEC),
+# which Claude Code inherits and does not opt out of via
+# ``resetTimeoutOnProgress`` today. See planning doc no-mcp-timeouts.md.
+_HEARTBEAT_INTERVAL_S = 10.0
+
+
+def heartbeat_sleep(seconds: float) -> None:
+    """``time.sleep`` replacement that emits MCP progress frames during long waits.
+
+    Wired into tenacity decorators via their ``sleep=`` kwarg so retry
+    sleeps don't go silent for >60s and trip the MCP client's read
+    timeout. Falls back to plain ``time.sleep`` when no progress hook is
+    installed (CLI ingest, tests) or the wait is short enough not to
+    matter — preserving identical behavior outside the MCP context.
+    """
+    cb = _progress_hook.get()
+    if cb is None or seconds <= _HEARTBEAT_INTERVAL_S:
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(_HEARTBEAT_INTERVAL_S, remaining))
+        try:
+            cb(
+                f"waiting on retry "
+                f"({int(max(0, deadline - time.monotonic()))}s remaining)",
+                0, 0,
+            )
+        except Exception as cb_exc:  # noqa: BLE001 — mirror _log_retry
+            _LOG.warning("progress hook raised, ignoring: %r", cb_exc)
+
+
 def make_default_client() -> httpx.Client:
     """Construct an httpx client with the project UA, granular timeouts, follow_redirects."""
     return httpx.Client(
@@ -127,6 +164,7 @@ retry_http = retry(
     wait=wait_exponential(multiplier=3, min=3, max=60),
     retry=retry_if_exception(is_transient),
     before_sleep=_log_retry,
+    sleep=heartbeat_sleep,
     reraise=True,
 )
 
@@ -184,5 +222,6 @@ retry_arxiv_api = retry(
     wait=_wait_arxiv_429(),
     retry=retry_if_exception(is_429),
     before_sleep=_log_retry,
+    sleep=heartbeat_sleep,
     reraise=True,
 )

@@ -36,6 +36,7 @@ from tenacity import (
     wait_exponential,
 )
 
+from _system.utils.http import heartbeat_sleep
 from _system.utils.logging import get_logger
 
 _LOG = get_logger("latex.eprint")
@@ -69,6 +70,7 @@ _retry_http = retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(min=0.5, max=4.0),
     retry=retry_if_exception(_is_transient),
+    sleep=heartbeat_sleep,
     reraise=True,
 )
 

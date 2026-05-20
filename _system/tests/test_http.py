@@ -113,9 +113,9 @@ def test_retry_arxiv_api_does_not_retry_transport_errors() -> None:
 def test_retry_arxiv_api_retries_429_then_succeeds(monkeypatch) -> None:
     """A 429 followed by 200 → second attempt succeeds; sleep is honored."""
     sleeps: list[float] = []
-    # tenacity uses time.sleep internally — patch it so the test runs fast.
-    import tenacity.nap
-    monkeypatch.setattr(tenacity.nap.time, "sleep", lambda s: sleeps.append(s))
+    # retry_arxiv_api was wired with sleep=heartbeat_sleep, which calls
+    # time.sleep on the http module. Patch that so the test runs fast.
+    monkeypatch.setattr(http_utils.time, "sleep", lambda s: sleeps.append(s))
 
     state = {"calls": 0}
 
@@ -134,8 +134,7 @@ def test_retry_arxiv_api_retries_429_then_succeeds(monkeypatch) -> None:
 
 def test_retry_arxiv_api_caps_at_three_attempts(monkeypatch) -> None:
     """Persistent 429 → 3 attempts then re-raise."""
-    import tenacity.nap
-    monkeypatch.setattr(tenacity.nap.time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_utils.time, "sleep", lambda s: None)
 
     state = {"calls": 0}
 
@@ -151,8 +150,7 @@ def test_retry_arxiv_api_caps_at_three_attempts(monkeypatch) -> None:
 
 def test_retry_arxiv_api_does_not_retry_5xx(monkeypatch) -> None:
     """Only 429 retries on the arxiv API path; 503 surfaces immediately."""
-    import tenacity.nap
-    monkeypatch.setattr(tenacity.nap.time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_utils.time, "sleep", lambda s: None)
 
     state = {"calls": 0}
 
@@ -169,10 +167,25 @@ def test_retry_arxiv_api_does_not_retry_5xx(monkeypatch) -> None:
 # ---- progress hook bridging ----------------------------------------------
 
 
+def _skip_heartbeat_loop(monkeypatch) -> None:
+    """Patch http_utils.time so heartbeat_sleep exits before its first iteration.
+
+    Each monotonic() call jumps far enough that the loop's ``remaining``
+    is immediately negative, so no time.sleep happens and no heartbeat
+    ticks are emitted. Used by tests that want to assert only on
+    _log_retry frames (the heartbeat coverage lives in its own block).
+    """
+    clock = [0.0]
+    def monotonic() -> float:
+        clock[0] += 1e6
+        return clock[0]
+    monkeypatch.setattr(http_utils.time, "sleep", lambda s: None)
+    monkeypatch.setattr(http_utils.time, "monotonic", monotonic)
+
+
 def test_progress_hook_fires_on_retry(monkeypatch) -> None:
     """When a progress hook is installed, retries emit (message, 0, 0) ticks."""
-    import tenacity.nap
-    monkeypatch.setattr(tenacity.nap.time, "sleep", lambda s: None)
+    _skip_heartbeat_loop(monkeypatch)
 
     ticks: list[tuple[str, int, int]] = []
     token = http_utils.set_progress_hook(lambda m, p, t: ticks.append((m, p, t)))
@@ -199,8 +212,9 @@ def test_progress_hook_fires_on_retry(monkeypatch) -> None:
 
 def test_progress_hook_unset_means_no_tick(monkeypatch) -> None:
     """With no hook installed, retries log but don't try to dispatch a tick."""
-    import tenacity.nap
-    monkeypatch.setattr(tenacity.nap.time, "sleep", lambda s: None)
+    # No hook → heartbeat_sleep falls back to plain time.sleep; patch that
+    # so the test doesn't spend 60s+120s actually sleeping.
+    monkeypatch.setattr(http_utils.time, "sleep", lambda s: None)
 
     # Sanity-check no leftover hook from another test in this process.
     assert http_utils._progress_hook.get() is None
@@ -215,8 +229,7 @@ def test_progress_hook_unset_means_no_tick(monkeypatch) -> None:
 
 def test_progress_hook_exception_does_not_break_retry(monkeypatch) -> None:
     """A misbehaving hook must not derail the retry loop."""
-    import tenacity.nap
-    monkeypatch.setattr(tenacity.nap.time, "sleep", lambda s: None)
+    _skip_heartbeat_loop(monkeypatch)
 
     def bad_hook(*_args, **_kwargs):
         raise RuntimeError("hook is broken")
@@ -235,3 +248,122 @@ def test_progress_hook_exception_does_not_break_retry(monkeypatch) -> None:
         assert f() == "ok"
     finally:
         http_utils.reset_progress_hook(token)
+
+
+# ---- heartbeat_sleep -----------------------------------------------------
+
+
+class _FakeClock:
+    """Advance time.monotonic in lockstep with time.sleep — deterministic test."""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+        self.sleeps: list[float] = []
+
+    def sleep(self, s: float) -> None:
+        self.sleeps.append(s)
+        self.t += s
+
+    def monotonic(self) -> float:
+        return self.t
+
+
+def _install_fake_clock(monkeypatch) -> _FakeClock:
+    """Patch time.sleep / time.monotonic on the http module's bound ``time``."""
+    clock = _FakeClock()
+    monkeypatch.setattr(http_utils.time, "sleep", clock.sleep)
+    monkeypatch.setattr(http_utils.time, "monotonic", clock.monotonic)
+    return clock
+
+
+def test_heartbeat_sleep_emits_frames_during_long_wait(monkeypatch) -> None:
+    """A 60s wait with a 10s heartbeat → 6 frames, message carries seconds-remaining."""
+    clock = _install_fake_clock(monkeypatch)
+    ticks: list[tuple[str, int, int]] = []
+    token = http_utils.set_progress_hook(lambda m, p, t: ticks.append((m, p, t)))
+    try:
+        http_utils.heartbeat_sleep(60.0)
+    finally:
+        http_utils.reset_progress_hook(token)
+
+    assert len(ticks) == 6
+    for msg, p, total in ticks:
+        assert "waiting on retry" in msg
+        assert "remaining" in msg
+        assert (p, total) == (0, 0)
+    # First emission: ~50s remaining; last emission: 0s remaining.
+    assert "50s remaining" in ticks[0][0]
+    assert "0s remaining" in ticks[-1][0]
+    # 6 sleeps of 10s each (last iteration's remaining == 10, not 0).
+    assert clock.sleeps == [10.0] * 6
+
+
+def test_heartbeat_sleep_no_op_under_interval(monkeypatch) -> None:
+    """A short wait collapses to one plain time.sleep, no heartbeat frames."""
+    clock = _install_fake_clock(monkeypatch)
+    ticks: list[tuple[str, int, int]] = []
+    token = http_utils.set_progress_hook(lambda m, p, t: ticks.append((m, p, t)))
+    try:
+        http_utils.heartbeat_sleep(5.0)
+    finally:
+        http_utils.reset_progress_hook(token)
+
+    assert ticks == []
+    assert clock.sleeps == [5.0]
+
+
+def test_heartbeat_sleep_no_hook_fallback(monkeypatch) -> None:
+    """Without a hook installed, long waits still collapse to one plain time.sleep."""
+    assert http_utils._progress_hook.get() is None
+    clock = _install_fake_clock(monkeypatch)
+    http_utils.heartbeat_sleep(60.0)
+    assert clock.sleeps == [60.0]
+
+
+def test_heartbeat_sleep_hook_exception_does_not_break(monkeypatch) -> None:
+    """A hook that raises mid-wait must not derail the sleep — mirror retry path."""
+    clock = _install_fake_clock(monkeypatch)
+
+    def bad_hook(*_args, **_kwargs):
+        raise RuntimeError("hook is broken")
+
+    token = http_utils.set_progress_hook(bad_hook)
+    try:
+        http_utils.heartbeat_sleep(30.0)  # 3 iterations
+    finally:
+        http_utils.reset_progress_hook(token)
+    # All 3 iterations completed despite the hook raising each time.
+    assert clock.sleeps == [10.0, 10.0, 10.0]
+
+
+def test_retry_arxiv_api_emits_heartbeats_during_429_sleep(monkeypatch) -> None:
+    """Integration: _log_retry pre-sleep frame + heartbeat frames during the 60s wait."""
+    # tenacity's default sleep is bypassed because we passed sleep=heartbeat_sleep
+    # at decorator-build time — but the heartbeat helper itself calls time.sleep,
+    # which we now redirect through the fake clock.
+    clock = _install_fake_clock(monkeypatch)
+
+    ticks: list[tuple[str, int, int]] = []
+    token = http_utils.set_progress_hook(lambda m, p, t: ticks.append((m, p, t)))
+    try:
+        state = {"calls": 0}
+
+        @retry_arxiv_api
+        def f() -> str:
+            state["calls"] += 1
+            if state["calls"] < 2:
+                raise _http_status_error(429)
+            return "ok"
+
+        assert f() == "ok"
+    finally:
+        http_utils.reset_progress_hook(token)
+
+    # First tick is the _log_retry frame ("retry … 429"), then the heartbeats.
+    assert len(ticks) >= 2
+    head_msg = ticks[0][0]
+    assert "retry" in head_msg.lower() and "429" in head_msg
+    body_msgs = [m for m, _, _ in ticks[1:]]
+    assert all("waiting on retry" in m for m in body_msgs)
+    # 60s wait at 10s heartbeat cadence → 6 in-sleep frames.
+    assert len(body_msgs) == 6

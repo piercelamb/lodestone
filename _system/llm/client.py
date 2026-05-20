@@ -33,6 +33,7 @@ from tenacity import (
 from _system.llm.config import Provider
 from _system.llm.errors import LLMTransientError
 from _system.llm.selection import resolve_provider
+from _system.utils.http import heartbeat_sleep
 
 
 T = TypeVar("T", bound=BaseModel)
@@ -64,6 +65,7 @@ def _dispatch(provider: Provider):
     stop=stop_after_attempt(4),
     wait=wait_random_exponential(multiplier=1, min=1, max=30),
     retry=retry_if_exception_type(LLMTransientError),
+    sleep=heartbeat_sleep,
     reraise=True,
 )
 def call_structured(
