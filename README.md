@@ -28,18 +28,19 @@ Requires [`uv`](https://docs.astral.sh/uv/) on `PATH`.
 ```
 Then **fully quit and relaunch Claude Code** (not `/reload-plugins`) — once. Done.
 
-**Optional — pre-seed lodestone's taxonomy** before your first ingest. Either use [my taxonomy](https://github.com/piercelamb/lodestone/blob/main/taxonomy.json) or write your own in the same shape, then point Claude at [`seed_taxonomy.py`](https://github.com/piercelamb/lodestone/blob/main/_system/scripts/seed_taxonomy.py). Skip seeding entirely and the classify step grows the taxonomy from scratch as you ingest — both paths are fully supported. See [Seeding the Taxonomy](https://github.com/piercelamb/lodestone#seeding-the-taxonomy) in the lodestone README.
+Now seed your corpus — `/deep-sota` accepts arXiv, code repo, and blog post URLs:
 
-Then:
 ```
-/deep-sota https://arxiv.org/abs/2305.10601    # ingest a paper
-/deep-sota "long-context retrieval"            # research a question
-/deep-sota "what's the SOTA on RAG with KV-cache offloading?"
+/deep-sota https://arxiv.org/abs/2305.10601                       # arXiv paper
+/deep-sota https://github.com/owner/repo                          # code repo
+/deep-sota https://lilianweng.github.io/posts/2023-06-23-agent/   # blog post
 ```
 
 Why this sequence: `/lodestone:doctor` is the **required** first-run setup. It runs the one-time `uv sync` (~30–90s) so the venv is populated *before* you restart, walks you through the LLM provider + model picker (writing `~/.config/lodestone/config.toml`), and downloads the two CPU-only HuggingFace models (`bge-small-en-v1.5` embeddings + `gliner2-large-v1` entity extraction, ~400 MB total) in the background while you answer the picker. After doctor finishes, the next launch finds a populated venv on the first MCP-server attempt, config in place, and models cached — `mcp__lodestone__*` tools register immediately and your first ingest can start straight away. Skip doctor and three things break: (a) the MCP server hits an empty venv on launch and exits 1, requiring a *second* restart since Claude Code doesn't retry mid-session; (b) `/deep-sota` refuses to ingest because `config.toml` isn't there and tells you to run doctor anyway; (c) the first ingest would have to download the ~400 MB of HF models itself. Subsequent sessions skip the prewarm entirely (it's hash-gated against `pyproject.toml` + `uv.lock`).
 
 Hand [`/deep-sota`](https://github.com/piercelamb/deep-sota) an arXiv / GitHub / blog URL to ingest, or a research question to investigate — it picks the right tools (search, read, figures, citations, code repos) and surfaces coverage gaps honestly instead of hallucinating.
+
+**Optional — pre-seed the taxonomy** (domains and collections) before your first ingest. Either use [my taxonomy](./taxonomy.json) or write your own in the same shape, then point Claude at [`seed_taxonomy.py`](./_system/scripts/seed_taxonomy.py). Skip seeding entirely and the classify step grows the taxonomy from scratch as you ingest — both paths are fully supported. See [Seeding the Taxonomy](#seeding-the-taxonomy).
 
 Prefer to drive the tools yourself? Call `mcp__lodestone__ingest_paper` with an arXiv URL to seed your corpus, and `mcp__lodestone__search` / `read` / `figure` to query it directly.
 
