@@ -307,6 +307,76 @@ class TestCumulativeProgress:
         )
 
 
+class TestProgressTqdmHFContract:
+    """Regression: the tqdm-shaped class we hand HF must satisfy the
+    full contract huggingface_hub + tqdm.contrib.concurrent rely on,
+    not just ``update(n)``.
+
+    HF's snapshot_download:
+      - reads/writes ``bytes_progress.total`` (``+= total``).
+      - calls ``set_description`` on completion.
+    tqdm.contrib.concurrent.thread_map (which HF uses for parallel
+    per-file downloads):
+      - calls ``tqdm_class.get_lock()`` and ``tqdm_class.set_lock(lock)``
+        as **classmethods** on the class object, before any instance
+        exists.
+    Missing any of these crashes with ``AttributeError`` before bytes
+    are fetched.
+    """
+
+    def test_classmethods_get_lock_and_set_lock(self):
+        cls = vm_mod._build_progress_tqdm_class(
+            hook=lambda *a: None, label="x", total_hint=0,
+        )
+        lock = cls.get_lock()
+        assert lock is not None
+        # set_lock must round-trip — thread_map relies on this to
+        # restore the original lock after parallel work.
+        cls.set_lock(lock)
+        assert cls.get_lock() is lock
+
+    def test_instance_has_total_attribute_for_inplace_addition(self):
+        cls = vm_mod._build_progress_tqdm_class(
+            hook=lambda *a: None, label="x", total_hint=0,
+        )
+        bar = cls(total=100, unit="B")
+        # HF does: bytes_progress.total += <new>.
+        bar.total += 50
+        assert bar.total == 150
+
+    def test_instance_accepts_unknown_kwargs(self):
+        cls = vm_mod._build_progress_tqdm_class(
+            hook=lambda *a: None, label="x", total_hint=0,
+        )
+        # HF passes name=, disable=, desc=, initial=, unit=, unit_scale=
+        # through _create_progress_bar's fallback branch.
+        cls(name="hf.snapshot", disable=False, desc="d",
+            initial=0, unit="B", unit_scale=True, total=1)
+
+    def test_positional_iterable_passes_through(self):
+        # tqdm.contrib.concurrent.thread_map does
+        # ``list(tqdm_class(ex.map(fn, items), ...))`` — if our class
+        # doesn't pass through the wrapped iterable, HF's parallel
+        # downloader sees zero files.
+        cls = vm_mod._build_progress_tqdm_class(
+            hook=lambda *a: None, label="x", total_hint=0,
+        )
+        assert list(cls(iter([1, 2, 3]))) == [1, 2, 3]
+
+    def test_thread_map_round_trips_results(self):
+        """End-to-end: drive the actual tqdm.contrib.concurrent.thread_map
+        with our class, the same call site HF uses.
+        """
+        from tqdm.contrib.concurrent import thread_map
+
+        cls = vm_mod._build_progress_tqdm_class(
+            hook=lambda *a: None, label="x", total_hint=0,
+        )
+        result = thread_map(lambda x: x * 2, [1, 2, 3],
+                            tqdm_class=cls, max_workers=2)
+        assert sorted(result) == [2, 4, 6]
+
+
 class TestImportIsolation:
     def test_import_does_not_pull_db_or_heavy_deps(self):
         import importlib
