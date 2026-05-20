@@ -85,8 +85,37 @@ def _build_progress_tqdm_class(hook, label: str, total_hint: int):
     state = {"bytes": 0, "last_emit": 0.0}
 
     class _ProgressTqdm:
+        # huggingface_hub's _snapshot_download mutates `bytes_progress.total`
+        # in-place (`bytes_progress.total += total`), so the attribute must
+        # exist on every instance. tqdm.contrib.concurrent.thread_map also
+        # treats the class itself as a lock-holder, calling
+        # `tqdm_class.get_lock()` / `tqdm_class.set_lock(lock)` as
+        # classmethods — without these, the parallel download path crashes
+        # with `AttributeError: type object '_ProgressTqdm' has no
+        # attribute 'get_lock'` before any bytes are fetched.
+        _lock = None
+
+        @classmethod
+        def get_lock(cls):
+            if cls._lock is None:
+                import threading
+                cls._lock = threading.RLock()
+            return cls._lock
+
+        @classmethod
+        def set_lock(cls, lock):
+            cls._lock = lock
+
         def __init__(self, *args, **kwargs):
-            return
+            # tqdm.contrib.concurrent.thread_map calls
+            # ``tqdm_class(ex.map(fn, *iterables), ...)`` and then iterates
+            # — so when an iterable is passed positionally we must let it
+            # pass through, otherwise HF's parallel file download loop
+            # sees zero files.
+            self._iterable = args[0] if args else None
+            self.total = kwargs.get("total", 0) or 0
+            self.n = kwargs.get("initial", 0) or 0
+            self.disable = kwargs.get("disable", False)
 
         def __enter__(self):
             return self
@@ -134,7 +163,9 @@ def _build_progress_tqdm_class(hook, label: str, total_hint: int):
             return
 
         def __iter__(self):
-            return iter(())
+            if self._iterable is None:
+                return iter(())
+            return iter(self._iterable)
 
     return _ProgressTqdm
 
