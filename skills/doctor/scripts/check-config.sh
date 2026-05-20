@@ -25,4 +25,9 @@ fi
 # --python 3.11 matches lodestone's floor (tomllib requires 3.11+).
 # --no-project keeps this a stdlib-only invocation so it works before
 # the plugin's own venv exists.
-exec uv run --python 3.11 --no-project "$SCRIPT_DIR/check-config.py"
+#
+# Always exit 0: the JSON output carries the status, and SKILL.md's
+# `!` injection treats non-zero exit as a "shell command failed"
+# error — surfacing the JSON to Claude is what matters, not the
+# Python exit code.
+uv run --python 3.11 --no-project "$SCRIPT_DIR/check-config.py" || true
