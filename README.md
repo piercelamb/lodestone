@@ -28,13 +28,18 @@ Requires [`uv`](https://docs.astral.sh/uv/) on `PATH`.
 ```
 Then **fully quit and relaunch Claude Code** (not `/reload-plugins`) — once. Done.
 
-Why this sequence: `/lodestone:doctor` is the canonical first-run setup. It runs the one-time `uv sync` (~30–90s), walks you through the LLM provider + model picker (writing `~/.config/lodestone/config.toml`), and downloads the two CPU-only HuggingFace models (`bge-small-en-v1.5` embeddings + `gliner2-large-v1` entity extraction, ~400 MB total) in the background while you answer the picker prompts. After doctor finishes, Claude Code's next startup finds a populated venv on the first attempt, config is in place, and models are cached — `mcp__lodestone__*` tools register immediately and your first ingest doesn't have to download anything. If you skip the doctor step and just restart, Claude Code launches the MCP server in parallel with the SessionStart prewarm hook — the MCP server hits an empty venv, exits 1, and Claude Code doesn't retry it mid-session, so you'd need a *second* restart for tools to appear. Doctor preempts that race.
+**Optional — pre-seed lodestone's taxonomy** before your first ingest. Either use [my taxonomy](https://github.com/piercelamb/lodestone/blob/main/taxonomy.json) or write your own in the same shape, then point Claude at [`seed_taxonomy.py`](https://github.com/piercelamb/lodestone/blob/main/_system/scripts/seed_taxonomy.py). Skip seeding entirely and the classify step grows the taxonomy from scratch as you ingest — both paths are fully supported. See [Seeding the Taxonomy](https://github.com/piercelamb/lodestone#seeding-the-taxonomy) in the lodestone README.
 
-If you skip doctor entirely, HF models download lazily on the first ingest call with live `notifications/progress`, **but** `/deep-sota` will refuse to ingest until `~/.config/lodestone/config.toml` exists — it reads the file directly, sees no provider/model, and tells you to run `/lodestone:doctor`. Doctor is the only provider/model picker in the plugin path. Subsequent sessions skip the prewarm entirely (it's hash-gated against `pyproject.toml` + `uv.lock`).
+Then:
+```
+/deep-sota https://arxiv.org/abs/2305.10601    # ingest a paper
+/deep-sota "long-context retrieval"            # research a question
+/deep-sota "what's the SOTA on RAG with KV-cache offloading?"
+```
+
+Why this sequence: `/lodestone:doctor` is the **required** first-run setup. It runs the one-time `uv sync` (~30–90s) so the venv is populated *before* you restart, walks you through the LLM provider + model picker (writing `~/.config/lodestone/config.toml`), and downloads the two CPU-only HuggingFace models (`bge-small-en-v1.5` embeddings + `gliner2-large-v1` entity extraction, ~400 MB total) in the background while you answer the picker. After doctor finishes, the next launch finds a populated venv on the first MCP-server attempt, config in place, and models cached — `mcp__lodestone__*` tools register immediately and your first ingest can start straight away. Skip doctor and three things break: (a) the MCP server hits an empty venv on launch and exits 1, requiring a *second* restart since Claude Code doesn't retry mid-session; (b) `/deep-sota` refuses to ingest because `config.toml` isn't there and tells you to run doctor anyway; (c) the first ingest would have to download the ~400 MB of HF models itself. Subsequent sessions skip the prewarm entirely (it's hash-gated against `pyproject.toml` + `uv.lock`).
 
 Hand [`/deep-sota`](https://github.com/piercelamb/deep-sota) an arXiv / GitHub / blog URL to ingest, or a research question to investigate — it picks the right tools (search, read, figures, citations, code repos) and surfaces coverage gaps honestly instead of hallucinating.
-
-**Optional — pre-seed the taxonomy** (domains and collections) before your first ingest. Either use [my taxonomy](./taxonomy.json) or write your own in the same shape, then point Claude at [`seed_taxonomy.py`](./_system/scripts/seed_taxonomy.py). Skip seeding entirely and the classify step grows the taxonomy from scratch as you ingest — both paths are fully supported. See [Seeding the Taxonomy](#seeding-the-taxonomy).
 
 Prefer to drive the tools yourself? Call `mcp__lodestone__ingest_paper` with an arXiv URL to seed your corpus, and `mcp__lodestone__search` / `read` / `figure` to query it directly.
 
@@ -174,9 +179,9 @@ Result: Grounded answers with section-level citations, inline figures, real code
 
 Then **fully quit and relaunch Claude Code** (not `/reload-plugins`).
 
-The `/reload-plugins` step makes the new slash commands (including `/lodestone:doctor`) available in the current session. `/lodestone:doctor` is the canonical first-run setup: it runs the one-time `uv sync` (~30–90s) so the venv is populated *before* you restart, walks you through the LLM provider + model picker and writes `~/.config/lodestone/config.toml`, and downloads the two CPU-only HuggingFace models (`bge-small-en-v1.5` + `gliner2-large-v1`, ~400 MB total) in the background while you answer the picker. On the next launch, Claude Code finds the venv ready on its first MCP-server attempt, config in place, and models cached — `mcp__lodestone__*` tools register immediately and the first ingest doesn't have to download anything.
+The `/reload-plugins` step makes the new slash commands (including `/lodestone:doctor`) available in the current session. `/lodestone:doctor` is the **required** first-run setup: it runs the one-time `uv sync` (~30–90s) so the venv is populated *before* you restart, walks you through the LLM provider + model picker and writes `~/.config/lodestone/config.toml`, and downloads the two CPU-only HuggingFace models (`bge-small-en-v1.5` + `gliner2-large-v1`, ~400 MB total) in the background while you answer the picker. On the next launch, Claude Code finds the venv ready on its first MCP-server attempt, config in place, and models cached — `mcp__lodestone__*` tools register immediately and the first ingest doesn't have to download anything.
 
-If you skip the doctor step and just restart, Claude Code launches the lodestone MCP server in parallel with the SessionStart prewarm hook. The server hits an empty venv, exits 1, and isn't retried until you restart again — so you'd need *two* restarts for tools to appear. The doctor-first flow makes one restart sufficient.
+Skip the doctor step and three things break: the MCP server hits an empty venv on the first launch and exits 1 (you'd need a *second* restart since Claude Code doesn't retry mid-session); `/deep-sota` refuses to ingest because `config.toml` isn't there; and the first ingest would have to download the HF models itself.
 
 **2. Drive the corpus through `/deep-sota` (recommended):**
 
@@ -195,7 +200,7 @@ If you skip the doctor step and just restart, Claude Code launches the lodestone
 /deep-sota "what's the SOTA on RAG architectures with KV-cache offloading?"
 ```
 
-`/deep-sota` runs a coverage check first, picks the right read tools (taxonomy walk, BM25, section reads, citation traversal, figure inlining, code-repo reads), and tells you honestly when lodestone doesn't have something instead of hallucinating. It does **not** auto-ingest on research questions — if the corpus lacks coverage, it'll surface the gap and (for arXiv-id citations) hand you ready-to-run `ingest_paper` calls. The two CPU-only HuggingFace models (`bge-small-en-v1.5` embeddings + `gliner2-large-v1` entity extraction, ~400 MB total) are typically already cached because `/lodestone:doctor` downloaded them upfront; if you skipped doctor, they download lazily on the first ingest with live progress instead.
+`/deep-sota` runs a coverage check first, picks the right read tools (taxonomy walk, BM25, section reads, citation traversal, figure inlining, code-repo reads), and tells you honestly when lodestone doesn't have something instead of hallucinating. It does **not** auto-ingest on research questions — if the corpus lacks coverage, it'll surface the gap and (for arXiv-id citations) hand you ready-to-run `ingest_paper` calls. The two CPU-only HuggingFace models (`bge-small-en-v1.5` embeddings + `gliner2-large-v1` entity extraction, ~400 MB total) are already cached because `/lodestone:doctor` downloaded them as part of the required first-run setup.
 
 **Or, drive lodestone directly (secondary path):**
 
@@ -342,14 +347,12 @@ What each step does:
 | `/plugin marketplace add piercelamb/lodestone` | Adds the `piercelamb-plugins` marketplace. Skip if you already have it from `/deep-project`, `/deep-plan`, or `/deep-implement`. |
 | `/plugin install lodestone` + `/plugin install deep-sota` | Installs both plugins. `/deep-sota` is the [recommended front-end](https://github.com/piercelamb/deep-sota) for the 21 MCP tools. |
 | `/reload-plugins` | Makes the new slash commands (including `/lodestone:doctor`) available in the current session. |
-| `/lodestone:doctor` | The canonical first-run setup: runs `uv sync` (~30–90s) to seed the venv, walks you through the LLM provider + model picker (writes `~/.config/lodestone/config.toml`), and downloads the two HuggingFace models (~400 MB total) in the background while you answer the picker. Idempotent — also doubles as a diagnostic on later runs. |
+| `/lodestone:doctor` | The required first-run setup: runs `uv sync` (~30–90s) to seed the venv, walks you through the LLM provider + model picker (writes `~/.config/lodestone/config.toml`), and downloads the two HuggingFace models (~400 MB total) in the background while you answer the picker. Idempotent — also doubles as a diagnostic on later runs. |
 | Full quit + relaunch | Registers the lodestone MCP server against the now-populated venv. |
 
 > **Why doctor *before* restart?** Claude Code launches MCP servers in parallel with `SessionStart` prewarm hooks ([per its hook docs](https://code.claude.com/docs/en/hooks)) and won't retry a server that fails mid-session. If you skip `/lodestone:doctor` and just restart, the lodestone MCP server attempts to launch against an empty venv, exits 1, and stays unavailable until you restart *a second time*. Doctor-first preempts the race.
 
-If you skip doctor the fallbacks still work: HF embedding weights (~400 MB total) download lazily on the first `ingest_*` call with live progress, and provider/model selection falls back to `/deep-sota`'s first-ingest picker. Doctor just folds both into one upfront step.
-
-If `mcp__lodestone__*` tools don't appear after this sequence, re-run `/lodestone:doctor` — it diagnoses `uv` presence, venv state, MCP registration, DB writability, HF model cache, and LLM provider config in one shot.
+If `mcp__lodestone__*` tools don't appear after this sequence, re-run `/lodestone:doctor` — it diagnoses `uv` presence, venv state, MCP registration, DB writability, HF model cache, and LLM provider config in one shot, and auto-remediates the venv / model / config gaps where it can.
 
 > **Already installed `/deep-project`, `/deep-plan`, or `/deep-implement`?** All five plugins share the `piercelamb-plugins` marketplace. Skip the `marketplace add` step.
 
