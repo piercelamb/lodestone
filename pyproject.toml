@@ -42,6 +42,12 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["_system"]
 
+[tool.uv]
+# Block PyPI versions published less than 7 days ago so the security community
+# has a window to catch supply-chain compromises before we install them.
+# Locked deps are unaffected; this only gates new version resolutions.
+exclude-newer = "7 days"
+
 [tool.pytest.ini_options]
 testpaths = ["_system/tests"]
 pythonpath = ["."]
