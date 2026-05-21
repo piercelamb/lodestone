@@ -2,7 +2,7 @@
 
 # Lodestone: Research Retrieval for Claude Code
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue)
+![Version](https://img.shields.io/badge/version-0.1.1-blue)
 ![Status](https://img.shields.io/badge/status-beta-orange)
 ![License](https://img.shields.io/badge/license-Apache--2.0-green)
 ![Claude Code](https://img.shields.io/badge/Claude%20Code-Plugin-purple)
@@ -895,4 +895,4 @@ See [CHANGELOG.md](CHANGELOG.md) for release history.
 
 ## Version
 
-0.1.0
+0.1.1

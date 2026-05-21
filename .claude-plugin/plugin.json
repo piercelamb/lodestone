@@ -1,7 +1,7 @@
 {
   "name": "lodestone",
   "description": "Local research corpus over arXiv papers, blog posts, and code repos with paper-grounded MCP search/read tools",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": {
     "name": "piercelamb",
     "url": "https://github.com/piercelamb"
