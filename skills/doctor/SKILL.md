@@ -4,7 +4,6 @@ disable-model-invocation: true
 allowed-tools:
   - Bash(command:*)
   - Bash(bash:*)
-  - Bash(mkdir:*)
   - Bash(stat:*)
   - Bash(claude:*)
   - Bash(grep:*)
@@ -42,7 +41,7 @@ Informational. Presence of a hash means a `uv sync` has succeeded for the curren
 
 ### Canonical DB directory
 
-!`mkdir -p "$HOME/.lodestone" && stat -L "$HOME/.lodestone/lodestone.db" 2>&1 || echo "no DB yet (created on first ingest)"`
+!`bash "${CLAUDE_SKILL_DIR}/scripts/check-db.sh"`
 
 Informational. Empty DB is fine — `mcp__lodestone__overview` works against an empty corpus.
 
