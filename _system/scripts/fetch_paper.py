@@ -896,8 +896,8 @@ def _build_fallback_metadata(
     local-PDF orchestrator pre-computes book/chapter slugs and passes them
     via ``paper_name_override`` so the chapter slug convention isn't
     clobbered by :func:`generate_paper_name`. needs_review is left False;
-    convert_paper raises or sets it based on path-specific signals (latex
-    walker skip counters, pdf fallback's unconditional review flag).
+    classify is the sole writer of that column — it flips it True iff the
+    LLM minted a brand-new domain or collection that a human should review.
     """
     _log_soft_dedup(conn, content_hash, arxiv_id)
     if client is None or arxiv_id.startswith("pdf:"):

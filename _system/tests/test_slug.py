@@ -158,6 +158,30 @@ class TestGeneratePaperNameCollision:
                 existing,
             )
 
+    def test_collision_with_acl_legacy_id_stays_regex_valid(self):
+        # ACL legacy ids carry an uppercase letter and a hyphen; the
+        # sanitized tiebreaker must drop them so the slug regex passes.
+        existing = {"proceedings_2019"}
+        slug = generate_paper_name(
+            "Proceedings",
+            "2019-01-01",
+            "acl:P19-1001",
+            existing,
+        )
+        _assert_valid_slug(slug)
+        assert slug.startswith("proceedings_2019_")
+
+    def test_collision_with_acl_modern_id_stays_regex_valid(self):
+        existing = {"toy_2021"}
+        slug = generate_paper_name(
+            "Toy",
+            "2021-01-01",
+            "acl:2021.acl-long.285",
+            existing,
+        )
+        _assert_valid_slug(slug)
+        assert slug.startswith("toy_2021_")
+
 
 class TestGeneratePaperNameInvariants:
     @pytest.mark.parametrize(

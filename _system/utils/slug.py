@@ -45,7 +45,14 @@ def _fold_lower(s: str) -> str:
 
 
 def _strip_arxiv_id(arxiv_id: str) -> str:
-    return _VERSION_SUFFIX_RE.sub("", arxiv_id).replace(".", "")
+    # Drop the optional vN suffix, lowercase, and strip every non-alphanumeric
+    # so the result is safe to embed in a slug that must match
+    # ^[a-z0-9_]+$. Arxiv ids (e.g. "2512.03413") are alnum after dot removal,
+    # so this preserves the prior "_03413" tiebreaker shape. Non-arxiv ids
+    # like "acl:P19-1001" or "pdf:abc:ch01" carry ':' / '-' that would
+    # otherwise survive into the tiebreaker and break the slug regex check.
+    no_version = _VERSION_SUFFIX_RE.sub("", arxiv_id)
+    return _NON_ALNUM_RE.sub("", _fold_lower(no_version))
 
 
 def _colon_branch(title: str) -> str:

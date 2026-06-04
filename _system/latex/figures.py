@@ -6,8 +6,10 @@ and label, and resolves the path against the tarball root.
 
 PDF / EPS / SVG figures are flagged as missing — pillow can't render
 them without librsvg / poppler, and we want the fallback to stay pure
-Python. They surface as placeholders in the markdown, contributing to
-``needs_review = 1``.
+Python. They surface as placeholders in the markdown so the gap is
+visible to readers; the convert pipeline logs the skip counters via
+``_LOG.warning`` (``papers.needs_review`` is no longer toggled — that
+column is now reserved for classify's brand-new-taxonomy review queue).
 
 TikZ-only figures (``\\begin{figure}\\begin{tikzpicture}...``) get a
 descriptor with ``local_path = None`` so the walker can emit an

@@ -77,7 +77,7 @@ def _ingest_pdf(conn, arxiv_id: str = "2604.23644") -> str:
     return pm.paper_name
 
 
-def test_convert_pdf_fallback_produces_markdown_and_flags_review(conn):
+def test_convert_pdf_fallback_produces_markdown(conn):
     name = _ingest_pdf(conn)
     result = convert(paper_name=name, conn=conn)
 
@@ -97,7 +97,9 @@ def test_convert_pdf_fallback_produces_markdown_and_flags_review(conn):
     assert not markdown.startswith(PDF_SENTINEL_PREFIX)
     assert raw_html is None
     assert status == "converted"
-    assert needs_review == 1
+    # needs_review is reserved for "classify minted a new taxonomy entry";
+    # convert never sets it, regardless of html_source.
+    assert needs_review == 0
 
     refs = conn.execute(
         "SELECT COUNT(*) FROM paper_references WHERE paper_id = "

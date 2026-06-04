@@ -10,6 +10,9 @@ Two entry shapes:
 - ``--repo <github_url>`` — standalone-repo ingest. Runs resolve_repo
   → fetch_repo → classify_repo. Repos with no usable README terminate
   at ORPHANED (still searchable by name/path/file content).
+- ``--acl <id-or-url>`` — ACL Anthology PDF ingest. MODS metadata +
+  PDF rendering (no HTML/LaTeX fulltext on Anthology). No repo
+  discovery — ACL papers don't carry an arxiv-id keyed PwC lookup.
 
 Stage function contract: every stage accepts its shared
 ``sqlite3.Connection`` as a keyword-only argument named ``conn`` and
@@ -49,6 +52,7 @@ from _system.scripts.classify_repo import classify as classify_repo_stage
 from _system.scripts.convert_paper import convert as convert_stage
 from _system.scripts.convert_post import convert as convert_post_stage
 from _system.scripts.extract_entities import extract as extract_stage
+from _system.scripts.fetch_acl import fetch as fetch_acl_stage
 from _system.scripts.fetch_paper import fetch as fetch_stage
 from _system.scripts.fetch_post import fetch as fetch_post_stage
 from _system.scripts.fetch_repo import fetch_repo as fetch_repo_stage
@@ -65,6 +69,7 @@ from _system.scripts.load_pdf import (
 )
 from _system.scripts.resolve_repo import resolve as resolve_repo_stage
 from _system.scripts.validate_models import check_models
+from _system.utils.acl_urls import parse_acl_id
 from _system.utils.arxiv_urls import parse_arxiv_id
 from _system.utils.logging import get_logger
 from _system.utils.slug import (
@@ -502,6 +507,131 @@ def ingest(
                 collection=paper_collection,
             )
             _run_paper_linked_repo_fetch(conn, repo_slug=repo_row.repo_slug)
+
+    return _summary_paper(conn, arxiv_id)
+
+
+def ingest_acl(
+    *,
+    conn: sqlite3.Connection,
+    acl_id: str,
+    force: bool = False,
+    domain: str | None = None,
+    progress: ProgressFn | None = None,
+) -> dict:
+    """Run the ACL Anthology ingest pipeline. Returns the summary dict.
+
+    Near-clone of :func:`ingest` minus the repo-discovery block: ACL
+    papers don't carry a PaperswithCode arxiv-id keyed lookup, and the
+    MODS metadata exposes no arxiv-comment analog. The paper itself
+    rides on a synthetic ``arxiv_id = "acl:<id>"`` so downstream stages
+    (convert / classify / extract / index) treat it identically to an
+    arxiv paper that hit the PDF fallback path.
+    """
+    def _tick(msg: str, done: int, total: int) -> None:
+        if progress is not None:
+            progress(msg, done, total)
+
+    arxiv_id = f"acl:{acl_id}"
+
+    row = _get_paper_row(conn, arxiv_id)
+
+    if row is not None and force:
+        _LOG.info(
+            "force cascade: wiping paper id=%s arxiv_id=%s (taxonomy preserved)",
+            row.id, arxiv_id,
+        )
+        _force_delete_paper(conn, paper_id=row.id)
+        _LOG.warning(
+            "cascade committed for arxiv_id=%s; beginning fresh ingest — "
+            "if fetch fails the paper is gone until a successful rerun",
+            arxiv_id,
+        )
+        row = None
+
+    current: PaperStatus | None = None
+    paper_name: str | None = None
+
+    if row is not None:
+        try:
+            current = PaperStatus(row.status)
+        except ValueError as exc:
+            raise ValueError(
+                f"papers.status={row.status!r} for arxiv_id={arxiv_id!r} "
+                "is not a recognized PaperStatus"
+            ) from exc
+        paper_name = row.name
+
+        if current is PaperStatus.FAILED_HTML:
+            _LOG.info(
+                "paper %s is FAILED_HTML; use --force to retry fetch", arxiv_id
+            )
+            _tick("already complete", 0, 0)
+            return _summary_paper(conn, arxiv_id)
+
+    stages_to_run = _remaining_paper_stages(current)
+    _LOG.info(
+        "ingest_acl arxiv_id=%s current_status=%s stages_to_run=%s",
+        arxiv_id, current, stages_to_run,
+    )
+
+    total = len(stages_to_run)
+    done = 0
+
+    if total == 0:
+        _tick("already complete", 0, 0)
+        return _summary_paper(conn, arxiv_id)
+
+    if Stage.FETCH in stages_to_run:
+        _tick(f"starting {Stage.FETCH.value}", done, total)
+        fetch_acl_stage(
+            conn=conn,
+            acl_id=acl_id,
+            force=force,
+            domain_override=domain,
+        )
+        post_fetch = _get_paper_row(conn, arxiv_id)
+        if post_fetch is None:
+            raise RuntimeError(
+                f"fetch_acl() returned without persisting a papers row for {arxiv_id!r}"
+            )
+        paper_name = post_fetch.name
+        if PaperStatus(post_fetch.status) is PaperStatus.FAILED_HTML:
+            _LOG.warning("fetch_acl produced FAILED_HTML for %s; halting pipeline", arxiv_id)
+            done += 1
+            _tick("complete", done, total)
+            return _summary_paper(conn, arxiv_id)
+        done += 1
+
+    if paper_name is None:
+        raise RuntimeError(
+            f"internal invariant: no paper_name resolved for {arxiv_id!r} "
+            "after resume lookup and without scheduling fetch"
+        )
+
+    if Stage.CONVERT in stages_to_run:
+        _tick(f"starting {Stage.CONVERT.value}", done, total)
+        convert_stage(conn=conn, paper_name=paper_name, force=force)
+        done += 1
+    if Stage.CLASSIFY in stages_to_run:
+        _tick(f"starting {Stage.CLASSIFY.value}", done, total)
+        classify_paper_stage(
+            conn=conn,
+            paper_name=paper_name,
+            force=force,
+            domain_override=domain,
+        )
+        done += 1
+    if Stage.EXTRACT in stages_to_run:
+        _tick(f"starting {Stage.EXTRACT.value}", done, total)
+        extract_stage(conn=conn, paper_name=paper_name, force=force)
+        done += 1
+    if Stage.INDEX in stages_to_run:
+        _tick(f"starting {Stage.INDEX.value}", done, total)
+        index_stage(conn=conn, paper_name=paper_name, force=force)
+        done += 1
+
+    _tick("complete", done, total)
 
     return _summary_paper(conn, arxiv_id)
 
@@ -1430,6 +1560,11 @@ def main(argv: list[str] | None = None) -> None:
     target.add_argument("--post", default=None, help="blog post URL")
     target.add_argument("--pdf", default=None,
                         help="local PDF path; outline-split into per-chapter rows by default")
+    target.add_argument("--acl", default=None,
+                        help="ACL Anthology paper id or URL "
+                             "(e.g. 2021.acl-long.285, P19-1001, "
+                             "https://aclanthology.org/2021.acl-long.285/, "
+                             "or its .pdf/.xml/.bib asset URL)")
     parser.add_argument("--no-split", action="store_true",
                         help="ingest the whole PDF as a single row (skips outline validation); "
                              "only meaningful with --pdf")
@@ -1535,6 +1670,20 @@ def main(argv: list[str] | None = None) -> None:
                         "ingest the whole file as a single row with --no-split."
                     )
                     raise SystemExit(msg)
+        finally:
+            conn.close()
+    elif args.acl:
+        acl_id = parse_acl_id(args.acl)
+        check_models()
+        conn = get_conn(Path(args.db))
+        try:
+            init_db(conn)
+            summary = ingest_acl(
+                conn=conn,
+                acl_id=acl_id,
+                force=args.force,
+                domain=args.domain,
+            )
         finally:
             conn.close()
     else:
