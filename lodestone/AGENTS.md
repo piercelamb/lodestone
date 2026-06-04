@@ -49,6 +49,11 @@ Five modes, all emit JSON by default. Add `--human` for pretty text.
 
 ```
 uv run _system/scripts/ingest.py --url <arxiv_url_or_id> [--force] [--domain <slug>]
+uv run _system/scripts/ingest.py --repo <github_url>      [--force] [--domain <slug>]
+uv run _system/scripts/ingest.py --post <post_url>        [--force] [--domain <slug>]
+uv run _system/scripts/ingest.py --pdf <local_path> [--no-split] [--force] [--domain <slug>]
+uv run _system/scripts/ingest.py --pdf <chapter_path> --book-slug <slug> \
+       --chapter-index <N> [--chapter-title <title>] [--force] [--domain <slug>]
 ```
 
 - **Resumable** (by design — see below). Rerunning on the same
@@ -61,6 +66,40 @@ uv run _system/scripts/ingest.py --url <arxiv_url_or_id> [--force] [--domain <sl
   lost.
 - `--domain <slug>` overrides the classifier's domain choice and
   threads through to both fetch and classify.
+- `--pdf <local_path>` ingests a local PDF book. Outline-split by
+  default: one `papers` row per level-1 TOC entry. Chapters share the
+  book's `content_hash`; `arxiv_id` is synthetic
+  (`pdf:<sha256[:12]>:ch<NN>`); `paper_name` is
+  `<book_slug>__ch<NN>_<chapter_slug>` (zero-padded so
+  `ORDER BY paper_name` returns chapters in TOC order). When level-1
+  yields fewer than 3 entries (books partitioned into "volumes" or
+  "parts" with the real chapters at level-2), `discover_chapters`
+  auto-falls back to level-2 if it has ≥3 entries; level-2 chapter
+  boundaries are clipped at level-1 part headers so chapters don't
+  bleed across parts. Consecutive TOC entries pointing at the same
+  page are deduped (e.g. "Bibliography" + "Subject Index" registered
+  at the same start page). PDFs whose embedded outline still can't be
+  split fail fast — re-run with `--no-split` to ingest the whole PDF
+  as one row (bare `<book_slug>` / `pdf:<sha256[:12]>`), or pre-slice
+  manually. `--force` cascades all rows whose `arxiv_id` matches
+  `pdf:<sha256[:12]>%` in one transaction. **Limitation**: bibliography
+  back-resolution in `search.py` builds `arxiv.org/abs/...` hints from
+  `arxiv_id`; for `pdf:` ids the hint is bogus (book chapters are very
+  unlikely to be cited by `pdf:` id anyway).
+- `--pdf <chapter_path> --book-slug <slug> --chapter-index <N>` is the
+  hand-sliced variant: ingest one chapter PDF at a time and declare its
+  position in a shared book namespace. `paper_name` follows the same
+  `<book_slug>__ch<NN>_<chapter_slug>` convention, so
+  `SELECT paper_name FROM papers WHERE paper_name LIKE 'foo__%'
+  ORDER BY paper_name` lists the assembled chapters in TOC order
+  exactly like the auto-split path. Per-chapter `content_hash` is the
+  individual file's sha256 (siblings do NOT share an `arxiv_id`
+  prefix); `--force` cascades by `paper_name LIKE '<book_slug>__chNN_%'`
+  instead, so swapping in a different file for the same slot Just
+  Works. `--chapter-title` is optional (defaults to the chapter PDF's
+  title metadata). `--book-slug` must match `^[a-z0-9_]+$` and must
+  not contain `__` (reserved as the book/chapter separator). Mutex
+  with `--no-split`.
 
 Pipeline stages, in order: `fetch → convert → classify → extract →
 index`. Pre-flight (`validate_models.check_models`) runs first —

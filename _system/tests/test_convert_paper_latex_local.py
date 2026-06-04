@@ -115,8 +115,11 @@ def test_convert_latex_local_extracts_references(conn):
     assert "A. Author" in raw_text
 
 
-def test_convert_latex_local_sets_needs_review_on_unknown_macros(conn, monkeypatch):
-    """A paper using \\fancyhighlight should trigger needs_review=1."""
+def test_convert_latex_local_logs_unknown_macros_without_flagging_review(conn, monkeypatch, caplog):
+    """A paper using \\fancyhighlight logs a walker warning but does NOT flag
+    needs_review — that column is reserved for new-taxonomy review only.
+    """
+    import logging
     arxiv_id = "2510.07555"
 
     # Build a custom tarball with an unknown macro.
@@ -153,11 +156,22 @@ def test_convert_latex_local_sets_needs_review_on_unknown_macros(conn, monkeypat
         pm = fetch(conn=conn, arxiv_id=arxiv_id, client=c, arxiv_lookup=lambda _: _meta())
     assert pm.html_source == "latex_local"
 
-    convert(paper_name=pm.paper_name, conn=conn)
+    # The lodestone root logger has propagate=False, so attach caplog's
+    # handler directly (same pattern as test_ingest.py).
+    logger = logging.getLogger("lodestone.scripts.convert_paper")
+    logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger="lodestone.scripts.convert_paper"):
+            convert(paper_name=pm.paper_name, conn=conn)
+    finally:
+        logger.removeHandler(caplog.handler)
     needs_review = conn.execute(
         "SELECT needs_review FROM papers WHERE arxiv_id = ?", (arxiv_id,)
     ).fetchone()[0]
-    assert needs_review == 1
+    assert needs_review == 0
+    assert any(
+        "latex walker partial conversion" in r.message for r in caplog.records
+    ), "walker partial-conversion warning should still fire for observability"
 
 
 def test_convert_latex_local_raises_on_missing_sentinel(conn):

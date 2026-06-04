@@ -3,7 +3,13 @@ from __future__ import annotations
 
 import pytest
 
-from _system.utils.slug import _SLUG_RE, STOP_WORDS, generate_paper_name
+from _system.utils.slug import (
+    _SLUG_RE,
+    STOP_WORDS,
+    generate_book_slug,
+    generate_chapter_slug,
+    generate_paper_name,
+)
 
 
 def _assert_valid_slug(slug: str) -> None:
@@ -152,6 +158,30 @@ class TestGeneratePaperNameCollision:
                 existing,
             )
 
+    def test_collision_with_acl_legacy_id_stays_regex_valid(self):
+        # ACL legacy ids carry an uppercase letter and a hyphen; the
+        # sanitized tiebreaker must drop them so the slug regex passes.
+        existing = {"proceedings_2019"}
+        slug = generate_paper_name(
+            "Proceedings",
+            "2019-01-01",
+            "acl:P19-1001",
+            existing,
+        )
+        _assert_valid_slug(slug)
+        assert slug.startswith("proceedings_2019_")
+
+    def test_collision_with_acl_modern_id_stays_regex_valid(self):
+        existing = {"toy_2021"}
+        slug = generate_paper_name(
+            "Toy",
+            "2021-01-01",
+            "acl:2021.acl-long.285",
+            existing,
+        )
+        _assert_valid_slug(slug)
+        assert slug.startswith("toy_2021_")
+
 
 class TestGeneratePaperNameInvariants:
     @pytest.mark.parametrize(
@@ -177,3 +207,119 @@ class TestGeneratePaperNameInvariants:
             "with", "is", "are", "be",
         })
         assert STOP_WORDS == expected
+
+
+# A 64-char hex string used as a stand-in for a real sha256 content_hash.
+_BOOK_HASH = "deadbeefcafebabe" * 4
+
+
+class TestGenerateBookSlug:
+    def test_base_form_matches_paper_slug_shape(self):
+        slug = generate_book_slug(
+            "Tractatus Logico Philosophicus",
+            "1922-01-01",
+            _BOOK_HASH,
+            set(),
+        )
+        assert slug == "tractatus_logico_philosophicus_1922"
+        _assert_valid_slug(slug)
+
+    def test_collision_uses_content_hash(self):
+        existing = {"tractatus_logico_philosophicus_1922"}
+        slug = generate_book_slug(
+            "Tractatus Logico Philosophicus",
+            "1922-01-01",
+            _BOOK_HASH,
+            existing,
+        )
+        assert slug.endswith(f"_{_BOOK_HASH[-5:]}")
+        _assert_valid_slug(slug)
+
+    def test_only_stop_words_falls_back_to_book(self):
+        slug = generate_book_slug(
+            "A The Of",
+            "2020-01-01",
+            _BOOK_HASH,
+            set(),
+        )
+        assert slug == "book_2020"
+        _assert_valid_slug(slug)
+
+    def test_both_forms_taken_raises(self):
+        suffix = _BOOK_HASH[-5:]
+        existing = {
+            "tractatus_logico_philosophicus_1922",
+            f"tractatus_logico_philosophicus_1922_{suffix}",
+        }
+        with pytest.raises(ValueError):
+            generate_book_slug(
+                "Tractatus Logico Philosophicus",
+                "1922-01-01",
+                _BOOK_HASH,
+                existing,
+            )
+
+
+class TestGenerateChapterSlug:
+    def test_zero_pads_chapter_number(self):
+        slug = generate_chapter_slug(
+            "tractatus_logico_philosophicus_1922",
+            3,
+            "Objects and States of Affairs",
+            set(),
+        )
+        assert slug == "tractatus_logico_philosophicus_1922__ch03_objects_states_affairs"
+        _assert_valid_slug(slug)
+
+    def test_uses_double_underscore_separator(self):
+        slug = generate_chapter_slug(
+            "book_2020", 1, "Intro Talk", set(),
+        )
+        assert "__ch01_" in slug
+
+    def test_validates_against_slug_re(self):
+        slug = generate_chapter_slug(
+            "book_2020", 12, "Hash & Bang!", set(),
+        )
+        _assert_valid_slug(slug)
+
+    def test_falls_back_to_chN_when_title_empty(self):
+        slug = generate_chapter_slug(
+            "book_2020", 7, "", set(),
+        )
+        assert slug == "book_2020__ch07_ch7"
+        _assert_valid_slug(slug)
+
+    def test_falls_back_to_chN_when_title_all_stopwords(self):
+        slug = generate_chapter_slug(
+            "book_2020", 2, "A The Of", set(),
+        )
+        assert slug == "book_2020__ch02_ch2"
+        _assert_valid_slug(slug)
+
+    def test_collision_raises(self):
+        existing = {"book_2020__ch01_intro"}
+        with pytest.raises(ValueError):
+            generate_chapter_slug("book_2020", 1, "Intro", existing)
+
+    def test_rejects_chapter_index_above_99(self):
+        # Two-digit zero-pad caps the slug shape; beyond 99 lex sort
+        # breaks ('ch100' < 'ch11'). The function rejects the input
+        # rather than silently emitting an out-of-order slug.
+        with pytest.raises(ValueError, match=r"1\.\.99"):
+            generate_chapter_slug("book_2020", 100, "Intro", set())
+
+    def test_rejects_chapter_index_zero_or_negative(self):
+        with pytest.raises(ValueError, match=r"1\.\.99"):
+            generate_chapter_slug("book_2020", 0, "Intro", set())
+        with pytest.raises(ValueError, match=r"1\.\.99"):
+            generate_chapter_slug("book_2020", -1, "Intro", set())
+
+    def test_sorts_in_chapter_order(self):
+        # Verifies the zero-padded `ch<NN>` is the load-bearing property
+        # behind `ORDER BY paper_name` returning chapters in TOC order.
+        names = [
+            generate_chapter_slug("b_2020", i, f"chapter {i}", set())
+            for i in (1, 2, 10, 11)
+        ]
+        assert sorted(names) == names

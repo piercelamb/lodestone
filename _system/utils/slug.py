@@ -45,7 +45,14 @@ def _fold_lower(s: str) -> str:
 
 
 def _strip_arxiv_id(arxiv_id: str) -> str:
-    return _VERSION_SUFFIX_RE.sub("", arxiv_id).replace(".", "")
+    # Drop the optional vN suffix, lowercase, and strip every non-alphanumeric
+    # so the result is safe to embed in a slug that must match
+    # ^[a-z0-9_]+$. Arxiv ids (e.g. "2512.03413") are alnum after dot removal,
+    # so this preserves the prior "_03413" tiebreaker shape. Non-arxiv ids
+    # like "acl:P19-1001" or "pdf:abc:ch01" carry ':' / '-' that would
+    # otherwise survive into the tiebreaker and break the slug regex check.
+    no_version = _VERSION_SUFFIX_RE.sub("", arxiv_id)
+    return _NON_ALNUM_RE.sub("", _fold_lower(no_version))
 
 
 def _colon_branch(title: str) -> str:
@@ -120,6 +127,88 @@ def generate_post_name(
             raise ValueError(
                 f"post_name collision unresolved: {slug!r} already in existing"
             )
+
+    if not _SLUG_RE.fullmatch(slug):
+        raise ValueError(f"generated slug violates ^[a-z0-9_]+$: {slug!r}")
+
+    return slug
+
+
+def generate_book_slug(
+    title: str,
+    date_yyyy_mm_dd: str,
+    content_hash: str,
+    existing: set[str],
+) -> str:
+    """Generate a book-level slug analogous to :func:`generate_paper_name`.
+
+    Local PDFs have no arxiv_id, so the collision tiebreaker is the last
+    5 hex chars of the PDF's sha256 ``content_hash``. The slug shape is
+    ``<title-tokens>_<YYYY>`` (or ``_<YYYY>_<hash5>`` on collision). The
+    result is the prefix used by :func:`generate_chapter_slug`.
+    """
+    base = _colon_branch(title) if ":" in title else _stop_word_branch(title)
+    if not base:
+        base = "book"
+
+    slug = f"{base}_{date_yyyy_mm_dd[:4]}"
+
+    if slug in existing:
+        slug = f"{slug}_{content_hash[-5:]}"
+        if slug in existing:
+            raise ValueError(
+                f"book_slug collision unresolved: {slug!r} already in existing"
+            )
+
+    if not _SLUG_RE.fullmatch(slug):
+        raise ValueError(f"generated slug violates ^[a-z0-9_]+$: {slug!r}")
+
+    return slug
+
+
+CHAPTER_INDEX_MAX = 99
+
+
+def generate_chapter_slug(
+    book_slug: str,
+    chapter_index: int,
+    chapter_title: str,
+    existing: set[str],
+) -> str:
+    """Compose ``<book_slug>__ch<NN>_<chapter-tokens>``.
+
+    ``__`` is the book/chapter separator — :func:`generate_paper_name`
+    joins tokens with single ``_`` and never emits ``__`` naturally, so
+    the boundary is unambiguous. ``ch<NN>`` is zero-padded so
+    ``ORDER BY paper_name`` gives chapter order for free. The
+    two-digit padding caps each book at 99 chapters — above that the
+    natural width of ``f"{N:02d}"`` grows (``ch100``) and lexicographic
+    sort breaks (``ch100`` < ``ch11``), so we reject the input up-front
+    rather than silently producing rows that ORDER BY paper_name
+    misorders.
+
+    Chapter title is tokenized the same way as :func:`_stop_word_branch`
+    (lowercase, NFKD-fold, drop stopwords, take first 3 tokens). If the
+    title produces no usable tokens, falls back to ``ch<chapter_index>``
+    (which keeps the slug regex-valid).
+    """
+    if not (1 <= chapter_index <= CHAPTER_INDEX_MAX):
+        raise ValueError(
+            f"chapter_index must be in 1..{CHAPTER_INDEX_MAX} "
+            f"(two-digit zero-pad keeps ORDER BY paper_name in TOC order); "
+            f"got {chapter_index}"
+        )
+
+    chapter_tokens = _stop_word_branch(chapter_title)
+    if not chapter_tokens:
+        chapter_tokens = f"ch{chapter_index}"
+
+    slug = f"{book_slug}__ch{chapter_index:02d}_{chapter_tokens}"
+
+    if slug in existing:
+        raise ValueError(
+            f"chapter slug collision unresolved: {slug!r} already in existing"
+        )
 
     if not _SLUG_RE.fullmatch(slug):
         raise ValueError(f"generated slug violates ^[a-z0-9_]+$: {slug!r}")

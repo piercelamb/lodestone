@@ -109,9 +109,8 @@ def convert(
             f"disagrees with COUNT(figures)={len(db_numbers)}"
         )
 
-    needs_review = False
     if source is HtmlSource.LATEX_LOCAL:
-        markdown, references, figures_count, needs_review = _convert_latex(
+        markdown, references, figures_count = _convert_latex(
             raw_html, db_numbers, paper_name,
         )
     elif source is HtmlSource.PDF_FALLBACK:
@@ -124,9 +123,6 @@ def convert(
         markdown = normalize_pdf_headings(markdown)
         references = []
         figures_count = 0
-        # pymupdf4llm output quality varies on academic PDFs — always
-        # surface in `search.py --needs-review` for human spot-check.
-        needs_review = True
         if db_numbers:
             raise FigureCountMismatch(
                 f"paper_name={paper_name!r}: PDF fallback produces no "
@@ -167,11 +163,6 @@ def convert(
             """,
             (markdown, PaperStatus.CONVERTED.value, paper_name),
         )
-        if needs_review:
-            conn.execute(
-                "UPDATE papers SET needs_review = 1 WHERE id = ?",
-                (paper_id,),
-            )
         # Replace-all semantics on re-convert: the parser is the source of
         # truth for this paper's references. Drop everything we had stored
         # under paper_id and re-insert from the fresh parse. cited_paper_id
@@ -232,14 +223,14 @@ def _convert_latex(
     raw_html: str,
     db_numbers: set[int],
     paper_name: str,
-) -> tuple[str, list, int, bool]:
+) -> tuple[str, list, int]:
     """Run the LaTeX walker over the assembled .tex stored in raw_html.
 
-    Returns ``(markdown, references, figures_count, needs_review)``.
-    ``needs_review`` is True iff the walker reported any unknown macros,
-    unknown envs, or per-section failures — convert sets
-    ``papers.needs_review = 1`` so ``search.py --needs-review`` surfaces
-    partial conversions for human inspection.
+    Returns ``(markdown, references, figures_count)``. Walker quality
+    signals (unknown macros, failed sections, parse errors) are emitted
+    via ``_LOG.warning`` for observability but do NOT touch
+    ``papers.needs_review`` — that column is reserved for "classify
+    minted a brand-new taxonomy entry, human should review it".
     """
     if not raw_html.startswith(LATEX_SENTINEL_PREFIX):
         raise RawHtmlMissing(
@@ -273,11 +264,10 @@ def _convert_latex(
             "(re-fetch with --force)"
         )
 
-    needs_review = bool(
+    if (
         result.skipped_macros or result.skipped_envs
         or result.failed_sections or result.parse_errors
-    )
-    if needs_review:
+    ):
         _LOG.warning(
             "paper_name=%s: latex walker partial conversion — "
             "skipped_macros=%s skipped_envs=%s failed_sections=%s parse_errors=%d",
@@ -285,7 +275,7 @@ def _convert_latex(
             result.failed_sections, result.parse_errors,
         )
 
-    return result.markdown, list(result.references), len(walker_figs), needs_review
+    return result.markdown, list(result.references), len(walker_figs)
 
 
 def _main(argv: list[str] | None = None) -> None:
