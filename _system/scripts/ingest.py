@@ -10,6 +10,9 @@ Two entry shapes:
 - ``--repo <github_url>`` — standalone-repo ingest. Runs resolve_repo
   → fetch_repo → classify_repo. Repos with no usable README terminate
   at ORPHANED (still searchable by name/path/file content).
+- ``--acl <id-or-url>`` — ACL Anthology PDF ingest. MODS metadata +
+  PDF rendering (no HTML/LaTeX fulltext on Anthology). No repo
+  discovery — ACL papers don't carry an arxiv-id keyed PwC lookup.
 
 Stage function contract: every stage accepts its shared
 ``sqlite3.Connection`` as a keyword-only argument named ``conn`` and
@@ -49,6 +52,7 @@ from _system.scripts.classify_repo import classify as classify_repo_stage
 from _system.scripts.convert_paper import convert as convert_stage
 from _system.scripts.convert_post import convert as convert_post_stage
 from _system.scripts.extract_entities import extract as extract_stage
+from _system.scripts.fetch_acl import fetch as fetch_acl_stage
 from _system.scripts.fetch_paper import fetch as fetch_stage
 from _system.scripts.fetch_post import fetch as fetch_post_stage
 from _system.scripts.fetch_repo import fetch_repo as fetch_repo_stage
@@ -65,8 +69,10 @@ from _system.scripts.load_pdf import (
 )
 from _system.scripts.resolve_repo import resolve as resolve_repo_stage
 from _system.scripts.validate_models import check_models
+from _system.utils.acl_urls import parse_acl_id
 from _system.utils.arxiv_urls import parse_arxiv_id
 from _system.utils.logging import get_logger
+from _system.utils.repo_url import parse_repo_url
 from _system.utils.slug import (
     _SLUG_RE,
     existing_slugs,
@@ -116,6 +122,29 @@ def _get_paper_row(conn: sqlite3.Connection, arxiv_id: str) -> _PaperRow | None:
     if row is None:
         return None
     return _PaperRow(id=row[0], name=row[1], status=row[2], needs_review=bool(row[3]))
+
+
+def _resolve_paper_by_identifier(
+    conn: sqlite3.Connection, identifier: str
+) -> tuple[_PaperRow, str] | None:
+    """Look up a paper by paper_name slug first, then arxiv_id.
+
+    Users see paper_name slugs in MCP summaries, so the CLI accepts
+    either token. Returns (row, arxiv_id) on hit, None on miss.
+    """
+    row = conn.execute(
+        "SELECT id, paper_name, status, needs_review, arxiv_id "
+        "  FROM papers WHERE paper_name = ?",
+        (identifier,),
+    ).fetchone()
+    if row is not None:
+        return _PaperRow(
+            id=row[0], name=row[1], status=row[2], needs_review=bool(row[3]),
+        ), row[4]
+    paper = _get_paper_row(conn, identifier)
+    if paper is not None:
+        return paper, identifier
+    return None
 
 
 def _get_repo_row(conn: sqlite3.Connection, *, url: str) -> _RepoRow | None:
@@ -506,6 +535,131 @@ def ingest(
     return _summary_paper(conn, arxiv_id)
 
 
+def ingest_acl(
+    *,
+    conn: sqlite3.Connection,
+    acl_id: str,
+    force: bool = False,
+    domain: str | None = None,
+    progress: ProgressFn | None = None,
+) -> dict:
+    """Run the ACL Anthology ingest pipeline. Returns the summary dict.
+
+    Near-clone of :func:`ingest` minus the repo-discovery block: ACL
+    papers don't carry a PaperswithCode arxiv-id keyed lookup, and the
+    MODS metadata exposes no arxiv-comment analog. The paper itself
+    rides on a synthetic ``arxiv_id = "acl:<id>"`` so downstream stages
+    (convert / classify / extract / index) treat it identically to an
+    arxiv paper that hit the PDF fallback path.
+    """
+    def _tick(msg: str, done: int, total: int) -> None:
+        if progress is not None:
+            progress(msg, done, total)
+
+    arxiv_id = f"acl:{acl_id}"
+
+    row = _get_paper_row(conn, arxiv_id)
+
+    if row is not None and force:
+        _LOG.info(
+            "force cascade: wiping paper id=%s arxiv_id=%s (taxonomy preserved)",
+            row.id, arxiv_id,
+        )
+        _force_delete_paper(conn, paper_id=row.id)
+        _LOG.warning(
+            "cascade committed for arxiv_id=%s; beginning fresh ingest — "
+            "if fetch fails the paper is gone until a successful rerun",
+            arxiv_id,
+        )
+        row = None
+
+    current: PaperStatus | None = None
+    paper_name: str | None = None
+
+    if row is not None:
+        try:
+            current = PaperStatus(row.status)
+        except ValueError as exc:
+            raise ValueError(
+                f"papers.status={row.status!r} for arxiv_id={arxiv_id!r} "
+                "is not a recognized PaperStatus"
+            ) from exc
+        paper_name = row.name
+
+        if current is PaperStatus.FAILED_HTML:
+            _LOG.info(
+                "paper %s is FAILED_HTML; use --force to retry fetch", arxiv_id
+            )
+            _tick("already complete", 0, 0)
+            return _summary_paper(conn, arxiv_id)
+
+    stages_to_run = _remaining_paper_stages(current)
+    _LOG.info(
+        "ingest_acl arxiv_id=%s current_status=%s stages_to_run=%s",
+        arxiv_id, current, stages_to_run,
+    )
+
+    total = len(stages_to_run)
+    done = 0
+
+    if total == 0:
+        _tick("already complete", 0, 0)
+        return _summary_paper(conn, arxiv_id)
+
+    if Stage.FETCH in stages_to_run:
+        _tick(f"starting {Stage.FETCH.value}", done, total)
+        fetch_acl_stage(
+            conn=conn,
+            acl_id=acl_id,
+            force=force,
+            domain_override=domain,
+        )
+        post_fetch = _get_paper_row(conn, arxiv_id)
+        if post_fetch is None:
+            raise RuntimeError(
+                f"fetch_acl() returned without persisting a papers row for {arxiv_id!r}"
+            )
+        paper_name = post_fetch.name
+        if PaperStatus(post_fetch.status) is PaperStatus.FAILED_HTML:
+            _LOG.warning("fetch_acl produced FAILED_HTML for %s; halting pipeline", arxiv_id)
+            done += 1
+            _tick("complete", done, total)
+            return _summary_paper(conn, arxiv_id)
+        done += 1
+
+    if paper_name is None:
+        raise RuntimeError(
+            f"internal invariant: no paper_name resolved for {arxiv_id!r} "
+            "after resume lookup and without scheduling fetch"
+        )
+
+    if Stage.CONVERT in stages_to_run:
+        _tick(f"starting {Stage.CONVERT.value}", done, total)
+        convert_stage(conn=conn, paper_name=paper_name, force=force)
+        done += 1
+    if Stage.CLASSIFY in stages_to_run:
+        _tick(f"starting {Stage.CLASSIFY.value}", done, total)
+        classify_paper_stage(
+            conn=conn,
+            paper_name=paper_name,
+            force=force,
+            domain_override=domain,
+        )
+        done += 1
+    if Stage.EXTRACT in stages_to_run:
+        _tick(f"starting {Stage.EXTRACT.value}", done, total)
+        extract_stage(conn=conn, paper_name=paper_name, force=force)
+        done += 1
+    if Stage.INDEX in stages_to_run:
+        _tick(f"starting {Stage.INDEX.value}", done, total)
+        index_stage(conn=conn, paper_name=paper_name, force=force)
+        done += 1
+
+    _tick("complete", done, total)
+
+    return _summary_paper(conn, arxiv_id)
+
+
 def _propagate_taxonomy_to_repo(
     conn: sqlite3.Connection,
     *,
@@ -680,6 +834,166 @@ def ingest_repo_only(
 
     _tick("complete", done, total)
     return _summary_repo(conn, repo_url)
+
+
+# ---------------------------------------------------------------------------
+# Attach-repo orchestrator (late-released repo for an already-indexed paper)
+# ---------------------------------------------------------------------------
+
+
+def attach_repo_to_paper(
+    *,
+    conn: sqlite3.Connection,
+    paper_identifier: str,
+    repo_url: str,
+    force: bool = False,
+    progress: ProgressFn | None = None,
+) -> dict:
+    """Attach a code repo to an already-indexed paper.
+
+    Wires together the same post-INDEX steps :func:`ingest` runs when a
+    repo URL is discovered at FETCH time — minus the LLM classify pass.
+    Paper-linked repos inherit the paper's domain/collection, so
+    ``classify_repo`` is intentionally skipped (it actively rejects
+    paper-linked repos).
+
+    ``paper_identifier`` accepts either a ``paper_name`` slug or an
+    ``arxiv_id`` (slug is tried first since that's what MCP summaries
+    surface to users).
+    """
+    def _tick(msg: str, done: int, total: int) -> None:
+        if progress is not None:
+            progress(msg, done, total)
+
+    # Canonicalize up front: matches what resolve_repo_stage stores in
+    # repos.url, so the URL-existence/conflict checks below actually
+    # catch non-canonical input forms (.git suffix, www., trailing
+    # slash, uppercase host). Without this the pre-checks miss and
+    # resolve_repo's COALESCE(paper_id, ?) silently preserves the
+    # existing row's paper_id, corrupting cross-paper taxonomy.
+    parts = parse_repo_url(repo_url)
+    if parts is None:
+        raise ValueError(
+            f"unsupported or malformed repo URL: {repo_url!r}; "
+            "must be https://{github.com|gitlab.com|bitbucket.org}/owner/repo"
+        )
+    canonical_url = parts.canonical_url
+
+    resolved = _resolve_paper_by_identifier(conn, paper_identifier)
+    if resolved is None:
+        raise ValueError(
+            f"no paper found matching {paper_identifier!r} "
+            "(tried paper_name then arxiv_id)"
+        )
+    paper, arxiv_id = resolved
+
+    try:
+        paper_status = PaperStatus(paper.status)
+    except ValueError as exc:
+        raise ValueError(
+            f"papers.status={paper.status!r} for paper_name={paper.name!r} "
+            "is not a recognized PaperStatus"
+        ) from exc
+    if paper_status is not PaperStatus.INDEXED:
+        raise ValueError(
+            f"paper {paper.name!r} status={paper_status.value!r}; "
+            f"--attach-repo requires status={PaperStatus.INDEXED.value!r} "
+            "(finish the paper pipeline first via --url)"
+        )
+
+    paper_taxonomy = conn.execute(
+        "SELECT domain, collection FROM papers WHERE id = ?", (paper.id,),
+    ).fetchone()
+    if paper_taxonomy is None:
+        raise ValueError(
+            f"paper {paper.name!r} disappeared between status check and "
+            "taxonomy fetch — concurrent writer?"
+        )
+    paper_domain, paper_collection = paper_taxonomy
+    if paper_domain is None or paper_collection is None:
+        raise ValueError(
+            f"paper {paper.name!r} has no domain/collection — cannot inherit "
+            "taxonomy onto the repo"
+        )
+
+    # URL-conflict checks run BEFORE the force-cascade so a bad new URL
+    # never wipes the paper's existing linked repo without a replacement.
+    existing_for_url = _get_repo_row(conn, url=canonical_url)
+    if existing_for_url is not None:
+        if (
+            existing_for_url.paper_id is not None
+            and existing_for_url.paper_id != paper.id
+        ):
+            raise ValueError(
+                f"repo url={canonical_url!r} is already linked to a different "
+                f"paper (paper_id={existing_for_url.paper_id}); detach there first"
+            )
+        if existing_for_url.paper_id is None:
+            raise ValueError(
+                f"repo url={canonical_url!r} already exists as a standalone "
+                f"repo (slug={existing_for_url.repo_slug!r}); delete it "
+                "before attaching to a paper"
+            )
+
+    existing_for_paper = _get_repo_for_paper(conn, paper.id)
+    if existing_for_paper is not None:
+        if not force:
+            raise ValueError(
+                f"paper {paper.name!r} already has a linked repo "
+                f"(url={existing_for_paper.url!r}, "
+                f"slug={existing_for_paper.repo_slug!r}); "
+                "use --force to replace it"
+            )
+        _LOG.info(
+            "force cascade: wiping linked repo id=%s url=%s for paper %s",
+            existing_for_paper.id, existing_for_paper.url, paper.name,
+        )
+        _force_delete_repo(conn, repo_id=existing_for_paper.id)
+
+    total = 3  # resolve_repo + propagate_taxonomy + fetch_repo
+    done = 0
+
+    _LOG.info(
+        "attach_repo_to_paper paper_name=%s arxiv_id=%s repo_url=%s",
+        paper.name, arxiv_id, canonical_url,
+    )
+
+    _tick(f"starting {Stage.RESOLVE_REPO.value}", done, total)
+    result = resolve_repo_stage(
+        conn=conn,
+        repo_url=canonical_url,
+        paper_id=paper.id,
+    )
+    if result.paper_id != paper.id:
+        # resolve_repo UPSERTs and preserves the existing row's paper_id
+        # via COALESCE; if we get a different paper_id back it means the
+        # URL-conflict pre-check above missed something (e.g., a row
+        # inserted between our SELECT and resolve's UPSERT, or a
+        # canonical-form drift we didn't account for). Fail loud rather
+        # than continue corrupting another paper's repo taxonomy.
+        raise RuntimeError(
+            f"resolve_repo returned paper_id={result.paper_id} for "
+            f"url={canonical_url!r} but expected paper.id={paper.id}; "
+            "URL conflict slipped past the pre-check"
+        )
+    done += 1
+
+    _tick("propagating taxonomy", done, total)
+    _propagate_taxonomy_to_repo(
+        conn,
+        paper_id=paper.id,
+        repo_id=result.repo_id,
+        domain=paper_domain,
+        collection=paper_collection,
+    )
+    done += 1
+
+    _tick(f"starting {Stage.FETCH_REPO.value}", done, total)
+    _run_paper_linked_repo_fetch(conn, repo_slug=result.repo_slug)
+    done += 1
+
+    _tick("complete", done, total)
+    return _summary_paper(conn, arxiv_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1427,9 +1741,20 @@ def main(argv: list[str] | None = None) -> None:
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--url", default=None, help="arxiv URL or bare id (version preserved)")
     target.add_argument("--repo", default=None, help="github/gitlab/bitbucket URL for standalone repo ingest")
+    target.add_argument("--attach-repo", default=None,
+                        help="github/gitlab/bitbucket URL to attach to an already-indexed "
+                             "paper (requires --to-paper); use when a paper's code repo "
+                             "was released after the paper was ingested")
     target.add_argument("--post", default=None, help="blog post URL")
     target.add_argument("--pdf", default=None,
                         help="local PDF path; outline-split into per-chapter rows by default")
+    target.add_argument("--acl", default=None,
+                        help="ACL Anthology paper id or URL "
+                             "(e.g. 2021.acl-long.285, P19-1001, "
+                             "https://aclanthology.org/2021.acl-long.285/, "
+                             "or its .pdf/.xml/.bib asset URL)")
+    parser.add_argument("--to-paper", default=None,
+                        help="paper_name slug or arxiv_id to attach --attach-repo to")
     parser.add_argument("--no-split", action="store_true",
                         help="ingest the whole PDF as a single row (skips outline validation); "
                              "only meaningful with --pdf")
@@ -1457,6 +1782,15 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.no_split and not args.pdf:
         parser.error("--no-split is only meaningful with --pdf")
+    if args.attach_repo and not args.to_paper:
+        parser.error("--attach-repo requires --to-paper")
+    if args.to_paper and not args.attach_repo:
+        parser.error("--to-paper is only meaningful with --attach-repo")
+    if args.attach_repo and args.domain:
+        parser.error(
+            "--domain is not valid with --attach-repo "
+            "(taxonomy is inherited from --to-paper)"
+        )
     manual_chapter = (
         args.book_slug is not None
         or args.chapter_index is not None
@@ -1501,6 +1835,19 @@ def main(argv: list[str] | None = None) -> None:
             )
         finally:
             conn.close()
+    elif args.attach_repo:
+        check_models()
+        conn = get_conn(Path(args.db))
+        try:
+            init_db(conn)
+            summary = attach_repo_to_paper(
+                conn=conn,
+                paper_identifier=args.to_paper,
+                repo_url=args.attach_repo,
+                force=args.force,
+            )
+        finally:
+            conn.close()
     elif args.pdf:
         check_models()
         conn = get_conn(Path(args.db))
@@ -1535,6 +1882,20 @@ def main(argv: list[str] | None = None) -> None:
                         "ingest the whole file as a single row with --no-split."
                     )
                     raise SystemExit(msg)
+        finally:
+            conn.close()
+    elif args.acl:
+        acl_id = parse_acl_id(args.acl)
+        check_models()
+        conn = get_conn(Path(args.db))
+        try:
+            init_db(conn)
+            summary = ingest_acl(
+                conn=conn,
+                acl_id=acl_id,
+                force=args.force,
+                domain=args.domain,
+            )
         finally:
             conn.close()
     else:
