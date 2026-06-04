@@ -1,6 +1,6 @@
 [project]
 name = "lodestone"
-version = "0.1.2"
+version = "0.2.0"
 description = "Lodestone: personal arxiv research knowledge base (single-file SQLite)."
 requires-python = ">=3.11"
 dependencies = [
