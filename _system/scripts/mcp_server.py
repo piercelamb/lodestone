@@ -82,7 +82,7 @@ _LOG = get_logger("scripts.mcp_server")
 # as the result envelope is minimal — see _finalize_result for the gate.
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "lodestone"
-SERVER_VERSION = "0.1.2"
+SERVER_VERSION = "0.2.0"
 
 # Supported protocol versions we'll echo back if the client requests them.
 # Anything else falls back to PROTOCOL_VERSION.
@@ -695,8 +695,9 @@ def _ingest_paper_dispatch(
     # Imports kept local: ingest pulls in HF model validation and the full
     # pipeline graph, which is dead weight for the read-side tools.
     from _system.db.migrations import init_db
-    from _system.scripts.ingest import ingest
+    from _system.scripts.ingest import ingest, ingest_acl
     from _system.scripts.validate_models import check_models
+    from _system.utils.acl_urls import parse_acl_id
     from _system.utils.arxiv_urls import parse_arxiv_id
 
     if progress is not None:
@@ -704,6 +705,24 @@ def _ingest_paper_dispatch(
     check_models()
     _prefetch_lodestone_models(progress)
     init_db(conn)
+
+    # Try ACL first: parse_acl_id is strict (modern YYYY.venue.N or legacy
+    # [A-Z]\d{2}-\d{4} after URL stripping) and arxiv ids never match its
+    # regex, so there's no false-positive collision. parse_arxiv_id is more
+    # permissive and would happily mangle a malformed ACL input.
+    try:
+        acl_id = parse_acl_id(args["url"])
+    except ValueError:
+        pass
+    else:
+        return ingest_acl(
+            conn=conn,
+            acl_id=acl_id,
+            force=bool(args.get("force", False)),
+            domain=args.get("domain"),
+            progress=progress,
+        )
+
     arxiv_id = parse_arxiv_id(args["url"])
     return ingest(
         conn=conn,
@@ -1528,16 +1547,21 @@ TOOLS: list[dict[str, Any]] = [
     {
         "name": "ingest_paper",
         "description": (
-            "Ingest an arXiv paper into the lodestone DB. Runs the full "
-            "pipeline: fetch → convert → classify → extract → index. "
-            "Resumable — re-running on a paper that partially ingested "
-            "picks up at the last completed stage; pass force=true to "
-            "wipe and re-ingest from scratch (preserves global taxonomy). "
-            "Emits MCP progress notifications between stages so the client "
-            "can render a progress bar; total ticks = number of stages "
-            "remaining for this run. If the paper ships a code repo URL, "
-            "the linked repo is registered and cloned as a follow-up "
-            "after the 'complete' tick (no progress events for that step)."
+            "Ingest an arXiv or ACL Anthology paper into the lodestone DB. "
+            "Runs the full pipeline: fetch → convert → classify → extract → "
+            "index. Routes by input shape: ACL Anthology ids (e.g. "
+            "'2021.acl-long.285', 'P19-1001') and aclanthology.org URLs go "
+            "through the ACL pipeline (MODS metadata + PDF body, no repo "
+            "discovery); everything else is treated as arXiv. Resumable — "
+            "re-running on a paper that partially ingested picks up at the "
+            "last completed stage; pass force=true to wipe and re-ingest "
+            "from scratch (preserves global taxonomy). Emits MCP progress "
+            "notifications between stages so the client can render a "
+            "progress bar; total ticks = number of stages remaining for "
+            "this run. If an arxiv paper ships a code repo URL, the linked "
+            "repo is registered and cloned as a follow-up after the "
+            "'complete' tick (no progress events for that step); ACL "
+            "papers have no repo-discovery step."
         ),
         "inputSchema": {
             "type": "object",
@@ -1546,8 +1570,11 @@ TOOLS: list[dict[str, Any]] = [
                     "type": "string",
                     "description": (
                         "arXiv URL or bare ID (version suffix preserved "
-                        "verbatim — '2301.12345v1' and '2301.12345v2' "
-                        "are different rows)."
+                        "verbatim — '2301.12345v1' and '2301.12345v2' are "
+                        "different rows), OR an ACL Anthology id / URL "
+                        "(e.g. '2021.acl-long.285', 'P19-1001', "
+                        "'https://aclanthology.org/2021.acl-long.285/', "
+                        "or the '.pdf' / '.xml' / '.bib' asset URL)."
                     ),
                 },
                 "force": {"type": "boolean", "default": False},
