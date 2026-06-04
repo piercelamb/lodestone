@@ -533,10 +533,27 @@ def _get_existing_paper(conn: sqlite3.Connection, arxiv_id: str) -> PaperMetadat
 
 
 def _log_soft_dedup(conn: sqlite3.Connection, content_hash: str, arxiv_id: str) -> None:
-    row = conn.execute(
-        "SELECT arxiv_id FROM papers WHERE content_hash = ? AND arxiv_id != ? LIMIT 1",
-        (content_hash, arxiv_id),
-    ).fetchone()
+    if arxiv_id.startswith("pdf:"):
+        # Local-PDF chapter rows of one book intentionally share
+        # content_hash by design (siblings under pdf:<hash[:12]>:chNN).
+        # Suppress the warning for in-book matches; only fire on
+        # genuine cross-document collisions.
+        book_prefix = arxiv_id.split(":ch", 1)[0]
+        # hash is hex and book_prefix has no LIKE wildcards, so the
+        # LIKE pattern is safe without ESCAPE.
+        row = conn.execute(
+            "SELECT arxiv_id FROM papers "
+            " WHERE content_hash = ? "
+            "   AND arxiv_id != ? "
+            "   AND arxiv_id NOT LIKE ? "
+            " LIMIT 1",
+            (content_hash, arxiv_id, f"{book_prefix}%"),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT arxiv_id FROM papers WHERE content_hash = ? AND arxiv_id != ? LIMIT 1",
+            (content_hash, arxiv_id),
+        ).fetchone()
     if row is not None:
         _LOG.warning(
             "soft-dedup: content_hash %s also found under arxiv_id %s (current: %s); continuing",
@@ -859,7 +876,7 @@ def fetch(
 def _build_fallback_metadata(
     conn: sqlite3.Connection,
     *,
-    client: httpx.Client,
+    client: httpx.Client | None,
     arxiv_id: str,
     meta: _ArxivMetadata,
     raw_html: str,
@@ -867,20 +884,36 @@ def _build_fallback_metadata(
     content_hash: str,
     domain_override: str | None,
     existing_row: PaperMetadata | None,
+    paper_name_override: str | None = None,
 ) -> PaperMetadata:
     """Common prelude for both fallback persisters: soft-dedup log, code-repo
     discovery, slug resolution, then build the ``PaperMetadata`` row.
 
     Code-repo discovery skips the HTML body parse and goes straight to the
-    arxiv comment + PwC. needs_review is left False; convert_paper raises
-    or sets it based on path-specific signals (latex walker skip counters,
-    pdf fallback's unconditional review flag).
+    arxiv comment + PwC. Local-PDF ingest passes ``client=None`` (or an
+    ``arxiv_id`` starting with ``pdf:``) and the PwC roundtrip is skipped
+    — there is no upstream metadata to resolve a code repo from. The
+    local-PDF orchestrator pre-computes book/chapter slugs and passes them
+    via ``paper_name_override`` so the chapter slug convention isn't
+    clobbered by :func:`generate_paper_name`. needs_review is left False;
+    convert_paper raises or sets it based on path-specific signals (latex
+    walker skip counters, pdf fallback's unconditional review flag).
     """
     _log_soft_dedup(conn, content_hash, arxiv_id)
-    code_repo = _discover_code_repo(client, arxiv_id, "", meta)
-    paper_name, ingested_at = _resolve_slug_and_timestamp(
-        conn, meta, arxiv_id, existing_row,
-    )
+    if client is None or arxiv_id.startswith("pdf:"):
+        code_repo = None
+    else:
+        code_repo = _discover_code_repo(client, arxiv_id, "", meta)
+    if paper_name_override is not None:
+        paper_name = paper_name_override
+        if existing_row is not None and existing_row.ingested_at:
+            ingested_at = existing_row.ingested_at
+        else:
+            ingested_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    else:
+        paper_name, ingested_at = _resolve_slug_and_timestamp(
+            conn, meta, arxiv_id, existing_row,
+        )
     return PaperMetadata(
         arxiv_id=arxiv_id,
         paper_name=paper_name,
@@ -933,6 +966,44 @@ def _persist_latex_fallback(
     return pm
 
 
+def _persist_pdf_row(
+    conn: sqlite3.Connection,
+    *,
+    arxiv_id: str,
+    meta: _ArxivMetadata,
+    markdown: str,
+    content_hash: str,
+    domain_override: str | None,
+    existing_row: PaperMetadata | None,
+    client: httpx.Client | None,
+    paper_name_override: str | None = None,
+) -> PaperMetadata:
+    """Persist a single papers row whose body came from a PDF.
+
+    Shared by the arxiv PDF-fallback path and the local-PDF ingest path.
+    The markdown is stashed verbatim in ``raw_html`` behind
+    :data:`PDF_SENTINEL_PREFIX` — convert_paper strips the sentinel and
+    uses the markdown directly (no re-extraction at convert time). No
+    figures (PDF path skips figure extraction by design). Pass
+    ``paper_name_override`` to bypass :func:`generate_paper_name` (the
+    local-PDF orchestrator computes chapter slugs up front).
+    """
+    pm = _build_fallback_metadata(
+        conn,
+        client=client,
+        arxiv_id=arxiv_id,
+        meta=meta,
+        raw_html=PDF_SENTINEL_PREFIX + markdown,
+        html_source=HtmlSource.PDF_FALLBACK,
+        content_hash=content_hash,
+        domain_override=domain_override,
+        existing_row=existing_row,
+        paper_name_override=paper_name_override,
+    )
+    _persist(conn, pm, figures=[])
+    return pm
+
+
 def _persist_pdf_fallback(
     conn: sqlite3.Connection,
     *,
@@ -943,26 +1014,18 @@ def _persist_pdf_fallback(
     existing_row: PaperMetadata | None,
     client: httpx.Client,
 ) -> PaperMetadata:
-    """Persist a paper that succeeded via the PDF (pymupdf4llm) fallback.
-
-    The markdown is stashed verbatim in ``raw_html`` behind the PDF
-    sentinel — convert_paper strips the sentinel and uses the markdown
-    directly (no re-extraction at convert time). No figures (PDF path
-    skips figure extraction by design).
-    """
-    pm = _build_fallback_metadata(
+    """Thin wrapper around :func:`_persist_pdf_row` for the arxiv PDF
+    fallback path."""
+    return _persist_pdf_row(
         conn,
-        client=client,
         arxiv_id=arxiv_id,
         meta=meta,
-        raw_html=PDF_SENTINEL_PREFIX + pdf_result.markdown,
-        html_source=HtmlSource.PDF_FALLBACK,
+        markdown=pdf_result.markdown,
         content_hash=pdf_result.content_hash,
         domain_override=domain_override,
         existing_row=existing_row,
+        client=client,
     )
-    _persist(conn, pm, figures=[])
-    return pm
 
 
 def _resolve_slug_and_timestamp(
