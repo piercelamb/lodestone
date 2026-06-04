@@ -2118,3 +2118,70 @@ class TestIngestProgress:
         )
         assert prefetch_bytes[-1] >= observed_total_chunks
 
+
+# ===========================================================================
+# ingest_paper — arxiv vs ACL Anthology routing in _ingest_paper_dispatch
+# ===========================================================================
+
+
+class TestIngestPaperRouting:
+    """``mcp__lodestone__ingest_paper`` overloads on input shape: ACL
+    Anthology ids/URLs route to ``ingest_acl`` (MODS + PDF), everything
+    else falls through to the arxiv path. ACL is checked first because
+    ``parse_acl_id`` is strict and arxiv ids never match its regex."""
+
+    def _stub_both_ingests(self, monkeypatch):
+        """Patch ``ingest`` and ``ingest_acl`` to record which path the
+        dispatcher took. Also no-op model checks + prefetch so the test
+        never touches HF caches."""
+        from _system.scripts import ingest as ingest_mod
+        from _system.scripts import validate_models
+
+        called: dict[str, list[dict]] = {"arxiv": [], "acl": []}
+
+        def _fake_ingest(**kwargs):
+            called["arxiv"].append(kwargs)
+            return {"kind": "paper", "status": "INDEXED"}
+
+        def _fake_ingest_acl(**kwargs):
+            called["acl"].append(kwargs)
+            return {"kind": "paper", "status": "INDEXED"}
+
+        monkeypatch.setattr(ingest_mod, "ingest", _fake_ingest)
+        monkeypatch.setattr(ingest_mod, "ingest_acl", _fake_ingest_acl)
+        monkeypatch.setattr(validate_models, "check_models", lambda: None)
+        monkeypatch.setattr(
+            mcp_server, "_prefetch_lodestone_models", lambda progress=None: None
+        )
+        return called
+
+    def test_arxiv_url_routes_to_ingest(self, fig_db, monkeypatch):
+        called = self._stub_both_ingests(monkeypatch)
+        out = mcp_server._ingest_paper_dispatch(
+            fig_db, {"url": "https://arxiv.org/abs/2301.12345"}
+        )
+        assert out == {"kind": "paper", "status": "INDEXED"}
+        assert len(called["arxiv"]) == 1
+        assert called["acl"] == []
+        assert called["arxiv"][0]["arxiv_id"] == "2301.12345"
+
+    def test_bare_acl_id_routes_to_ingest_acl(self, fig_db, monkeypatch):
+        called = self._stub_both_ingests(monkeypatch)
+        out = mcp_server._ingest_paper_dispatch(
+            fig_db, {"url": "2021.acl-long.285"}
+        )
+        assert out == {"kind": "paper", "status": "INDEXED"}
+        assert called["arxiv"] == []
+        assert len(called["acl"]) == 1
+        assert called["acl"][0]["acl_id"] == "2021.acl-long.285"
+
+    def test_acl_url_routes_to_ingest_acl(self, fig_db, monkeypatch):
+        called = self._stub_both_ingests(monkeypatch)
+        out = mcp_server._ingest_paper_dispatch(
+            fig_db, {"url": "https://aclanthology.org/2021.acl-long.285/"}
+        )
+        assert out == {"kind": "paper", "status": "INDEXED"}
+        assert called["arxiv"] == []
+        assert len(called["acl"]) == 1
+        assert called["acl"][0]["acl_id"] == "2021.acl-long.285"
+
