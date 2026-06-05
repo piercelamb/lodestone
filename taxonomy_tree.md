@@ -16,7 +16,6 @@ taxonomy
 │   ├── Knowledge Structuring For Generation
 │   ├── Time-Aware And Web RAG
 │   ├── Query-Conditioned Dynamic RAG
-│   ├── Conversation Understanding And Retrieval
 │   └── RAG Benchmarks And Evaluation
 ├── Document Understanding And OCR
 │   ├── VLM-Based OCR Models
@@ -30,8 +29,17 @@ taxonomy
 │   ├── Table Benchmarks And Datasets
 │   ├── Slide Generation And Editing
 │   ├── Synthetic Document Data
-│   ├── HTML And Web Extraction
-│   └── Conversation Segmentation And Extraction
+│   └── HTML And Web Extraction
+├── Conversation Understanding
+│   ├── Transcript Engineering
+│   ├── Dialogue Topic Segmentation
+│   ├── Dialogue Summarization
+│   ├── Coreference And Entity Tracking
+│   ├── Utterance Classification And Dialogue Acts
+│   ├── Conversational Knowledge Extraction
+│   ├── Dialogue-Grounded Retrieval
+│   ├── Discourse Structure And Coherence
+│   └── Conversational AI Foundations
 ├── Agents
 │   ├── Agent Architectures And Harnesses
 │   ├── Agentic Memory

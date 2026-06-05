@@ -59,7 +59,7 @@ from _system.utils.http import (
 )
 from _system.utils.logging import get_logger
 from _system.utils.repo_url import extract_repo_candidates, normalize_repo_url
-from _system.utils.slug import existing_slugs, generate_paper_name
+from _system.utils.slug import existing_slugs, generate_paper_name, sanitize_domain
 
 __all__ = [
     "fetch",
@@ -1062,6 +1062,14 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--force", action="store_true", help="re-fetch even if present")
     parser.add_argument("--domain", default=None, help="domain override")
     args = parser.parse_args(argv)
+
+    if args.domain is not None:
+        sanitized = sanitize_domain(args.domain)
+        if not sanitized:
+            parser.error(
+                f"--domain={args.domain!r} sanitizes to empty string"
+            )
+        args.domain = sanitized
 
     arxiv_id = parse_arxiv_id(args.url)
     conn = get_conn(Path(args.db))

@@ -212,16 +212,64 @@ def classify(
     )
     del markdown
 
-    existing_domains = load_taxonomy(
-        conn,
-        include_empty_collections=True,
-        include_empty_domains=True,
-        collections_per_domain_limit=_COLLECTIONS_PER_DOMAIN_LIMIT,
-    )
-    existing_domain_names = {d.name for d in existing_domains}
-    max_collections = max(
-        (len(d.collections) for d in existing_domains), default=0
-    )
+    if domain_override is not None:
+        # Lock the LLM to a single domain: sanitize the operator-supplied
+        # name to its canonical slug, then load only that domain's subtree
+        # (no truncation — the prompt is already shrunk to one domain).
+        # If the domain row doesn't exist yet, synthesize an empty node so
+        # the prompt still renders coherently; the row gets created in
+        # the success transaction below (no DB write before the LLM call).
+        domain_override = sanitize_domain(domain_override)
+        if not domain_override:
+            raise ClassifyDomainNameError(
+                "domain_override sanitizes to empty string"
+            )
+        existing_domains = load_taxonomy(
+            conn,
+            domain=domain_override,
+            include_empty_collections=True,
+            include_empty_domains=True,
+            collections_per_domain_limit=None,
+        )
+        # Track whether the override domain already exists in the DB —
+        # only DB-loaded rows go into existing_domain_names, otherwise
+        # _choose_domain would compute insert_new=False against the
+        # synthesized node and the new domain would never be created.
+        domain_row_exists = bool(existing_domains)
+        if not existing_domains:
+            existing_domains = [
+                DomainNode(
+                    name=domain_override,
+                    description=None,
+                    paper_count=0,
+                    collections=(),
+                    overflow=0,
+                    repo_count=0,
+                    post_count=0,
+                )
+            ]
+        existing_domain_names = (
+            {d.name for d in existing_domains} if domain_row_exists else set()
+        )
+        # Pin the schema enums: domain is locked to index 0, collection
+        # enum spans -1 (propose new in this domain) plus every existing
+        # collection in this domain (no 30-cap). Zero-collection domain
+        # collapses to [-1], which the schema already exercises.
+        domain_enum = [0]
+        collection_enum = [-1, *range(len(existing_domains[0].collections))]
+    else:
+        existing_domains = load_taxonomy(
+            conn,
+            include_empty_collections=True,
+            include_empty_domains=True,
+            collections_per_domain_limit=_COLLECTIONS_PER_DOMAIN_LIMIT,
+        )
+        existing_domain_names = {d.name for d in existing_domains}
+        max_collections = max(
+            (len(d.collections) for d in existing_domains), default=0
+        )
+        domain_enum = [-1, *range(len(existing_domains))]
+        collection_enum = [-1, *range(max_collections)]
 
     if kind is SourceKind.PAPER:
         prompt_name = "classify_paper"
@@ -240,8 +288,8 @@ def classify(
             content_placeholder: paper_content,
         },
         schema_replacements={
-            "DOMAIN_INDEX_ENUM": [-1, *range(len(existing_domains))],
-            "COLLECTION_INDEX_ENUM": [-1, *range(max_collections)],
+            "DOMAIN_INDEX_ENUM": domain_enum,
+            "COLLECTION_INDEX_ENUM": collection_enum,
         },
     )
 
@@ -646,10 +694,16 @@ def _choose_domain(
     existing_domains: set[str],
 ) -> _DomainDecision:
     if override is not None:
+        insert_new = override not in existing_domains
+        # An operator-created brand-new domain has no human-authored
+        # description (override path forces it NULL) and no review trail;
+        # flag for review so it shows up in the same queue as LLM-proposed
+        # new domains. Existing-domain overrides stay needs_review=False
+        # because a human already curated that domain.
         return _DomainDecision(
             name=override,
-            insert_new=override not in existing_domains,
-            paper_needs_review=False,
+            insert_new=insert_new,
+            paper_needs_review=insert_new,
         )
 
     treat_as_new = domain_is_new or proposed not in existing_domains
@@ -688,6 +742,14 @@ def _main(argv: Iterable[str] | None = None) -> None:
         help="override the LLM's domain choice with this exact name",
     )
     args = parser.parse_args(argv if argv is None else list(argv))
+
+    if args.domain is not None:
+        sanitized = sanitize_domain(args.domain)
+        if not sanitized:
+            parser.error(
+                f"--domain={args.domain!r} sanitizes to empty string"
+            )
+        args.domain = sanitized
 
     conn = get_conn(Path(args.db))
     try:

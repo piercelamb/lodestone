@@ -689,6 +689,36 @@ def _prefetch_lodestone_models(progress) -> None:
             ensure_model_cached(model_id)
 
 
+def _sanitized_domain_arg(args: dict) -> str | None:
+    """Canonicalize ``domain`` to its slug form before it reaches the pipeline.
+
+    Fetch stages persist the override verbatim onto rows *before* classify
+    runs, so the operator-supplied value has to be canonical by the time
+    it crosses the dispatcher boundary. Raises ``ValueError`` (surfaced as
+    a tool-level ``isError``) if the supplied value is the wrong type or
+    collapses to empty after sanitization. ``domain`` absent / null is the
+    no-override signal; any other shape is an operator mistake we report.
+    """
+    from _system.utils.slug import sanitize_domain
+
+    if "domain" not in args:
+        return None
+    raw = args["domain"]
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError(
+            f"domain must be a string, got {type(raw).__name__}={raw!r}"
+        )
+    sanitized = sanitize_domain(raw)
+    if not sanitized:
+        raise ValueError(
+            f"domain={raw!r} sanitizes to empty string; "
+            "use letters, digits, '_' or '-'"
+        )
+    return sanitized
+
+
 def _ingest_paper_dispatch(
     conn: sqlite3.Connection, args: dict, progress=None,
 ) -> dict:
@@ -699,6 +729,10 @@ def _ingest_paper_dispatch(
     from _system.scripts.validate_models import check_models
     from _system.utils.acl_urls import parse_acl_id
     from _system.utils.arxiv_urls import parse_arxiv_id
+
+    # Sanitize before any expensive work (model checks / preload) so a
+    # bad --domain fails fast.
+    domain = _sanitized_domain_arg(args)
 
     if progress is not None:
         progress("checking models", 0, 1)
@@ -719,7 +753,7 @@ def _ingest_paper_dispatch(
             conn=conn,
             acl_id=acl_id,
             force=bool(args.get("force", False)),
-            domain=args.get("domain"),
+            domain=domain,
             progress=progress,
         )
 
@@ -728,7 +762,7 @@ def _ingest_paper_dispatch(
         conn=conn,
         arxiv_id=arxiv_id,
         force=bool(args.get("force", False)),
-        domain=args.get("domain"),
+        domain=domain,
         progress=progress,
     )
 
@@ -740,6 +774,8 @@ def _ingest_repo_dispatch(
     from _system.scripts.ingest import ingest_repo_only
     from _system.scripts.validate_models import check_models
 
+    domain = _sanitized_domain_arg(args)
+
     if progress is not None:
         progress("checking models", 0, 1)
     check_models()
@@ -749,7 +785,7 @@ def _ingest_repo_dispatch(
         conn=conn,
         repo_url=args["url"],
         force=bool(args.get("force", False)),
-        domain=args.get("domain"),
+        domain=domain,
         progress=progress,
     )
 
@@ -761,6 +797,8 @@ def _ingest_post_dispatch(
     from _system.scripts.ingest import ingest_post
     from _system.scripts.validate_models import check_models
 
+    domain = _sanitized_domain_arg(args)
+
     if progress is not None:
         progress("checking models", 0, 1)
     check_models()
@@ -770,7 +808,7 @@ def _ingest_post_dispatch(
         conn=conn,
         url=args["url"],
         force=bool(args.get("force", False)),
-        domain=args.get("domain"),
+        domain=domain,
         progress=progress,
     )
 
