@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-05
+
+### Added
+- `ingest --domain <name>` (and `mcp__lodestone__ingest_paper/_repo/_post`
+  `domain` arg) locks the classifier to a single domain: only that
+  domain's subtree is rendered to the LLM, the schema enum pins
+  `domain_index=[0]`, and the collection enum is the override domain's
+  full list (no 30-cap truncation). A not-yet-existing override domain
+  is created in the success transaction with `description=NULL` and
+  `needs_review=1` so it lands in the same review queue as
+  LLM-proposed new domains.
+- Override accepts display form OR slug — sanitization is enforced at
+  every operator entry point (`ingest`, `classify_paper/_repo` CLIs,
+  `fetch_paper/_acl/_post` standalone CLIs, and the three MCP
+  dispatchers).
+
+### Changed
+- Promoted "Conversation Understanding" to a top-level taxonomy domain
+  with 9 collections (transcript engineering, dialogue
+  segmentation/summarization, coreference, dialogue acts, knowledge
+  extraction, dialogue-grounded retrieval, discourse structure,
+  conversational AI foundations). Deprecated the two placeholder
+  collections under Retrieval And RAG / Document Understanding And OCR.
+  `taxonomy_tree.md` regenerated.
+
+### Fixed
+- MCP `_sanitized_domain_arg` now rejects non-string `domain` args with
+  a clean `ValueError` (previously raised `AttributeError` on
+  `.lower()`) and runs before `check_models()` so bad input fails fast
+  instead of paying the full HF model verification + preload cost.
+- `classify_repo` ORPHAN short-circuits (no-README / empty-README) now
+  run AFTER override sanitization, so an invalid override raises
+  instead of silently marking ORPHANED. A valid override on an ORPHAN
+  repo logs a warning rather than being silently dropped.
+
 ## [0.2.0] - 2026-06-04
 
 ### Added
