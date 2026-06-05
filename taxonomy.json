@@ -65,10 +65,6 @@
           "description": "Query-time construction of document representations, schemas, or tables over otherwise unstructured extracted content, deferring all corpus structuring to the moment a query arrives."
         },
         {
-          "name": "Conversation Understanding And Retrieval",
-          "description": "Retrieval and semantic understanding over conversational data — meeting transcripts, dialogue, and ASR output — where the source is spoken interaction rather than written documents."
-        },
-        {
           "name": "RAG Benchmarks And Evaluation",
           "description": "Document QA, visual retrieval, and structured-RAG benchmarks, leaderboards, surveys, and debugging tooling."
         }
@@ -125,10 +121,48 @@
         {
           "name": "HTML And Web Extraction",
           "description": "Models and systems that extract structured data from HTML and other semi-structured non-document sources."
+        }
+      ]
+    },
+    {
+      "name": "Conversation Understanding",
+      "description": "Research on extracting structure, content, and meaning from conversational data — meeting transcripts, dialogues, call recordings, and ASR output — covering cleaning, segmenting, summarizing, and resolving references across utterances.",
+      "collections": [
+        {
+          "name": "Transcript Engineering",
+          "description": "Cleaning, normalizing, and reconstructing raw conversation transcripts: disfluency removal, incomplete utterance rewriting (IUR), speaker turn assignment, and other pre-understanding processing of ASR output."
         },
         {
-          "name": "Conversation Segmentation And Extraction",
-          "description": "Topic segmentation, structured extraction from dialogue, and dialogue simulation for training conversational understanding systems."
+          "name": "Dialogue Topic Segmentation",
+          "description": "Splitting conversations into topically coherent segments, including hierarchical and flat segmentation models for meetings, calls, and dialogue."
+        },
+        {
+          "name": "Dialogue Summarization",
+          "description": "Abstractive and extractive summarization of meetings, conversations, and call transcripts, including consensus-focused, discourse-aware, and LLM-driven approaches."
+        },
+        {
+          "name": "Coreference And Entity Tracking",
+          "description": "Pronoun resolution, mention-chain construction, and cross-speaker entity tracking across dialogue turns."
+        },
+        {
+          "name": "Utterance Classification And Dialogue Acts",
+          "description": "Classifying utterances by speech act, intent, role, or sentiment (dialogue-act tagging, multi-party conversation modeling)."
+        },
+        {
+          "name": "Conversational Knowledge Extraction",
+          "description": "Pulling structured facts, decisions, action items, and canonical statements from dialogue into knowledge bases or graphs."
+        },
+        {
+          "name": "Dialogue-Grounded Retrieval",
+          "description": "Retrieval and RAG pipelines that take an in-progress conversation as the query, including conversation-history-aware retrieval and IUR-for-retrieval."
+        },
+        {
+          "name": "Discourse Structure And Coherence",
+          "description": "Theoretical and computational treatments of discourse structure, coherence relations, and the linguistic phenomena of spontaneous human dialogue."
+        },
+        {
+          "name": "Conversational AI Foundations",
+          "description": "Historical, architectural, and survey treatments of dialogue systems, chatbots, voice agents, and conversational LLMs — background context for the field."
         }
       ]
     },
@@ -434,7 +468,7 @@
   "merge_notes": [
     "Collapsed all retrieval-flavored proposals (Document Retrieval, Chunking & Embeddings, Graph RAG, Web RAG, Queries, Rerankers, Grounding, RAS) into a single 'Retrieval And RAG' domain with 15 collections; this is the largest domain and the most tempting to split, but every sub-area shares the same retrieve-then-ground research vocabulary so a single domain matches user mental model.",
     "Merged 'Document Retrieval > Document Parsing And Chunking' partly into Document Understanding (parsing/layout) and partly into Retrieval (chunking strategies); kept chunking under Retrieval because the source proposals consistently treat chunking as a retrieval-pipeline concern.",
-    "Combined 'Conversation Understanding' under Document Understanding rather than its own domain since two of its three collections are extraction/segmentation tasks that share methodology with document parsing; dialogue simulation lives there too for cohesion.",
+    "Conversation Understanding was originally folded under Document Understanding (and dialogue retrieval under Retrieval And RAG), but was later promoted to its own domain as the dialogue-modality twin of Document Understanding And OCR; it owns its full stack including Dialogue-Grounded Retrieval because conversation papers are entangled (repair + segmentation + retrieval in one paper) and multi-collection selection is intra-domain only. The two empty conversation-flavored slots ('Conversation Segmentation And Extraction', 'Conversation Understanding And Retrieval') were deprecated.",
     "Folded 'Sports' (commentary generation + spatial intelligence benchmarks) into the broader Evaluation domain as benchmark datasets rather than a standalone domain, since neither paper warrants a top-level home.",
     "Unified Coding Agents, Computer Use, Automated Browsing, Autoresearch, and the agent-execution-environment collection from 'Academically interesting' under a single Agents domain; this is intentionally broad because all share architectures, sandboxes, and evaluation concerns.",
     "Merged 'Reducing context / context engineering' into Agents (context engineering is mostly an agent-loop problem here) rather than into Reasoning, matching where the source proposals located it.",

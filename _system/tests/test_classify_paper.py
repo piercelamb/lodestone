@@ -772,12 +772,24 @@ def test_proposed_domain_sanitizing_to_empty_raises(tmp_db_with_domain):
         )
 
 
-def test_domain_override_bypasses_llm_choice_and_does_not_flag_review(tmp_db_with_domain):
+def test_domain_override_existing_domain_flags_review_for_new_collection(tmp_db_with_domain):
     _seed_paper(tmp_db_with_domain)
+    # Under the override lock the schema pins domain_index=[0] — the LLM
+    # cannot return -1. Use a domain_index=0 payload with a new collection
+    # to exercise the "new collection still flips needs_review" path.
+    runner = _runner_from_dict(_payload(
+        domain_index=0,
+        collections=[{
+            "index": -1,
+            "new_name": "orchestration patterns",
+            "new_desc": "Design patterns for planner-executor splits.",
+        }],
+        topics=["planner-executor split", "tool routing"],
+    ))
     classify(
         paper_name="paper_name_2024",
         conn=tmp_db_with_domain,
-        call_llm=_fake_runner("classification_new_domain.json"),
+        call_llm=runner,
         domain_override="rag",
     )
     row = tmp_db_with_domain.execute(
@@ -789,12 +801,21 @@ def test_domain_override_bypasses_llm_choice_and_does_not_flag_review(tmp_db_wit
     assert row[1] == 1
 
 
-def test_domain_override_inserts_new_domain_needs_review_false(tmp_db_with_domain):
+def test_domain_override_inserts_new_domain_with_null_description(tmp_db_with_domain):
     _seed_paper(tmp_db_with_domain)
+    runner = _runner_from_dict(_payload(
+        domain_index=0,
+        collections=[{
+            "index": -1,
+            "new_name": "orchestration patterns",
+            "new_desc": "Design patterns for planner-executor splits.",
+        }],
+        topics=["planner-executor split", "tool routing"],
+    ))
     classify(
         paper_name="paper_name_2024",
         conn=tmp_db_with_domain,
-        call_llm=_fake_runner("classification_new_domain.json"),
+        call_llm=runner,
         domain_override="theorem_proving",
     )
     row = tmp_db_with_domain.execute(
@@ -802,7 +823,9 @@ def test_domain_override_inserts_new_domain_needs_review_false(tmp_db_with_domai
         ("paper_name_2024",),
     ).fetchone()
     assert row[0] == "theorem_proving"
-    # New collection still flips needs_review even when domain is overridden.
+    # Operator-created brand-new domain flips needs_review on its own
+    # (no human-authored description, no curation trail); the new
+    # collection here would also flip it.
     assert row[1] == 1
 
     # Override forces a name the LLM didn't propose — we must not attach
@@ -812,6 +835,281 @@ def test_domain_override_inserts_new_domain_needs_review_false(tmp_db_with_domai
     ).fetchone()
     assert domain_row is not None
     assert domain_row[0] is None
+
+
+def test_domain_override_filters_prompt_to_override_subtree(conn):
+    """Under override the rendered taxonomy must contain only the override
+    domain's subtree. Sibling domains seeded in the same DB must not leak
+    into the user prompt."""
+    _seed_domain(conn, name="rag", description="retrieval-augmented generation")
+    _seed_domain(conn, name="theorem_proving", description="formal proofs")
+    _seed_paper(conn)
+
+    captured: dict[str, object] = {}
+
+    def _runner(system: str, user: str, schema: dict, response_model):
+        captured["user"] = user
+        captured["schema"] = schema
+        return response_model.model_validate(_payload(
+            domain_index=0,
+            collections=[{"index": -1, "new_name": "c", "new_desc": "A cluster."}],
+            topics=["t"],
+        ))
+
+    classify(
+        paper_name="paper_name_2024",
+        conn=conn,
+        call_llm=_runner,
+        domain_override="rag",
+    )
+
+    rendered = captured["user"]
+    assert "0. rag" in rendered
+    # Sibling domain must NOT leak into the override-locked prompt.
+    assert "theorem_proving" not in rendered
+
+
+def test_domain_override_pins_schema_enums_no_truncation(conn):
+    """Under override the domain enum collapses to [0] and the collection
+    enum spans the override domain's full list (no 30-cap)."""
+    _seed_domain(conn, name="rag", description="retrieval-augmented generation")
+    # Seed 35 collections to confirm no 30-cap truncation under override.
+    for i in range(35):
+        conn.execute(
+            "INSERT INTO collection_definitions (domain, name, description) VALUES (?, ?, ?)",
+            ("rag", f"c{i:02d}", f"Cluster {i}."),
+        )
+    _seed_paper(conn)
+
+    captured: dict[str, object] = {}
+
+    def _runner(system: str, user: str, schema: dict, response_model):
+        captured["schema"] = schema
+        captured["user"] = user
+        return response_model.model_validate(_payload(
+            domain_index=0,
+            collections=[{"index": 0, "new_name": "", "new_desc": ""}],
+            topics=["t"],
+        ))
+
+    classify(
+        paper_name="paper_name_2024",
+        conn=conn,
+        call_llm=_runner,
+        domain_override="rag",
+    )
+
+    schema = captured["schema"]
+    domain_enum = schema["schema"]["properties"]["domain_index"]["enum"]
+    coll_enum = (
+        schema["schema"]["properties"]["collections"]
+        ["items"]["properties"]["index"]["enum"]
+    )
+    assert domain_enum == [0]
+    # -1 (propose new) + every existing collection (35 of them, no cap).
+    assert coll_enum == [-1, *range(35)]
+    # No "(+ N more...)" overflow leaf under override.
+    assert "more exist" not in captured["user"]
+
+
+def test_domain_override_empty_domain_pins_collection_enum_to_minus_one(conn):
+    """Override domain with zero collections collapses the collection enum
+    to [-1] — propose-new is the only valid path."""
+    _seed_domain(conn, name="rag", description="retrieval-augmented generation")
+    _seed_paper(conn)
+
+    captured: dict[str, object] = {}
+
+    def _runner(system: str, user: str, schema: dict, response_model):
+        captured["schema"] = schema
+        return response_model.model_validate(_payload(
+            domain_index=0,
+            collections=[{
+                "index": -1,
+                "new_name": "fresh cluster",
+                "new_desc": "A fresh cluster.",
+            }],
+            topics=["t"],
+        ))
+
+    classify(
+        paper_name="paper_name_2024",
+        conn=conn,
+        call_llm=_runner,
+        domain_override="rag",
+    )
+
+    coll_enum = (
+        captured["schema"]["schema"]["properties"]["collections"]
+        ["items"]["properties"]["index"]["enum"]
+    )
+    assert coll_enum == [-1]
+
+
+def test_domain_override_existing_collection_pick_does_not_overwrite_curated_definition(conn):
+    """Core regression: picking an existing curated collection by index
+    must NOT graft a new ``collection_definitions`` row with NULL
+    description on top of the curated row. The curated description must
+    survive intact."""
+    _seed_domain(conn, name="conversation_understanding", description="curated domain")
+    conn.execute(
+        "INSERT INTO collection_definitions (domain, name, description) VALUES (?, ?, ?)",
+        (
+            "conversation_understanding",
+            "conversational knowledge extraction",
+            "How agents extract durable knowledge from dialog.",
+        ),
+    )
+    _seed_paper(conn)
+
+    runner = _runner_from_dict(_payload(
+        domain_index=0,
+        collections=[{"index": 0, "new_name": "", "new_desc": ""}],
+        topics=["t"],
+    ))
+    classify(
+        paper_name="paper_name_2024",
+        conn=conn,
+        call_llm=runner,
+        domain_override="conversation_understanding",
+    )
+
+    coll_rows = conn.execute(
+        "SELECT name, description FROM collection_definitions "
+        " WHERE domain = ? ORDER BY name",
+        ("conversation_understanding",),
+    ).fetchall()
+    # Exactly one row — the curated one. No new NULL-description row.
+    assert coll_rows == [(
+        "conversational knowledge extraction",
+        "How agents extract durable knowledge from dialog.",
+    )]
+
+
+def test_domain_override_new_collection_pick_writes_definition_with_description(conn):
+    """A propose-new collection under the override domain must land in
+    ``collection_definitions`` with the LLM-supplied description."""
+    _seed_domain(conn, name="rag", description="retrieval-augmented generation")
+    _seed_paper(conn)
+
+    runner = _runner_from_dict(_payload(
+        domain_index=0,
+        collections=[{
+            "index": -1,
+            "new_name": "hierarchical indexing",
+            "new_desc": "Hierarchical retrieval over long documents.",
+        }],
+        topics=["tree retrieval"],
+    ))
+    classify(
+        paper_name="paper_name_2024",
+        conn=conn,
+        call_llm=runner,
+        domain_override="rag",
+    )
+
+    row = conn.execute(
+        "SELECT description FROM collection_definitions "
+        " WHERE domain = ? AND name = ?",
+        ("rag", "hierarchical indexing"),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "Hierarchical retrieval over long documents."
+
+
+def test_domain_override_nonexistent_domain_creates_row_on_success(conn):
+    """Override naming a not-yet-existing domain must synthesize the node
+    for the prompt (collection enum [-1]) and create the domains row in
+    the success transaction — guards the insert_new bug where the
+    synthesized node leaks into existing_domain_names."""
+    _seed_paper(conn)
+
+    captured: dict[str, object] = {}
+
+    def _runner(system: str, user: str, schema: dict, response_model):
+        captured["schema"] = schema
+        captured["user"] = user
+        return response_model.model_validate(_payload(
+            domain_index=0,
+            collections=[{
+                "index": -1,
+                "new_name": "fresh cluster",
+                "new_desc": "Fresh cluster description.",
+            }],
+            topics=["t"],
+        ))
+
+    # The domain doesn't exist yet anywhere in the DB.
+    pre = conn.execute(
+        "SELECT COUNT(*) FROM domains WHERE name = 'brand_new_domain'"
+    ).fetchone()[0]
+    assert pre == 0
+
+    classify(
+        paper_name="paper_name_2024",
+        conn=conn,
+        call_llm=_runner,
+        domain_override="brand_new_domain",
+    )
+
+    # Prompt rendered the synthesized node, collection enum is [-1].
+    assert "0. brand_new_domain" in captured["user"]
+    coll_enum = (
+        captured["schema"]["schema"]["properties"]["collections"]
+        ["items"]["properties"]["index"]["enum"]
+    )
+    assert coll_enum == [-1]
+
+    # Success transaction created the domains row.
+    post = conn.execute(
+        "SELECT name, description FROM domains WHERE name = 'brand_new_domain'"
+    ).fetchone()
+    assert post is not None
+    # Override path stores NULL description (LLM didn't author this name).
+    assert post[1] is None
+
+
+def test_domain_override_sanitizes_human_input(conn):
+    """A dirty operator-supplied override gets canonicalized to its slug
+    form before anything else sees it."""
+    _seed_paper(conn)
+
+    runner = _runner_from_dict(_payload(
+        domain_index=0,
+        collections=[{
+            "index": -1,
+            "new_name": "ckl",
+            "new_desc": "Conversational knowledge layer.",
+        }],
+        topics=["t"],
+    ))
+    classify(
+        paper_name="paper_name_2024",
+        conn=conn,
+        call_llm=runner,
+        domain_override="Conversation Understanding",
+    )
+
+    row = conn.execute(
+        "SELECT domain FROM papers WHERE paper_name = ?",
+        ("paper_name_2024",),
+    ).fetchone()
+    assert row[0] == "conversation_understanding"
+
+
+def test_domain_override_empty_sanitization_raises(conn):
+    _seed_paper(conn)
+
+    def _explode(*a, **k):
+        raise AssertionError("LLM must not be called when override is invalid")
+
+    with pytest.raises(ClassifyDomainNameError):
+        classify(
+            paper_name="paper_name_2024",
+            conn=conn,
+            call_llm=_explode,
+            domain_override="!!!",
+        )
 
 
 # ===========================================================================

@@ -37,6 +37,7 @@ from _system.utils.http import (
     retry_http as _retry_http,
 )
 from _system.utils.logging import get_logger
+from _system.utils.slug import sanitize_domain
 
 __all__ = ["fetch"]
 
@@ -253,6 +254,14 @@ def main(argv: list[str] | None = None) -> None:
                         help="re-fetch even if present")
     parser.add_argument("--domain", default=None, help="domain override")
     args = parser.parse_args(argv)
+
+    if args.domain is not None:
+        sanitized = sanitize_domain(args.domain)
+        if not sanitized:
+            parser.error(
+                f"--domain={args.domain!r} sanitizes to empty string"
+            )
+        args.domain = sanitized
 
     acl_id = parse_acl_id(args.acl)
     conn = get_conn(Path(args.db))

@@ -37,7 +37,7 @@ from _system.schemas.post_metadata import PostMetadata, PostStatus
 from _system.utils.http import make_default_client, retry_http
 from _system.utils.logging import get_logger
 from _system.utils.repo_url import extract_repo_candidates
-from _system.utils.slug import existing_slugs, generate_post_name
+from _system.utils.slug import existing_slugs, generate_post_name, sanitize_domain
 
 __all__ = ["fetch", "fetch_post"]
 
@@ -462,6 +462,14 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--force", action="store_true", help="re-fetch even if present")
     parser.add_argument("--domain", default=None, help="domain override")
     args = parser.parse_args(argv)
+
+    if args.domain is not None:
+        sanitized = sanitize_domain(args.domain)
+        if not sanitized:
+            parser.error(
+                f"--domain={args.domain!r} sanitizes to empty string"
+            )
+        args.domain = sanitized
 
     conn = get_conn(Path(args.db))
     try:

@@ -103,6 +103,15 @@ def classify(
     """
     del force  # parity with other stage callers; idempotency is via DELETE+INSERT.
 
+    # Validate the operator-supplied override at the top so an invalid
+    # value raises before ORPHAN short-circuits silently swallow it.
+    if domain_override is not None:
+        domain_override = sanitize_domain(domain_override)
+        if not domain_override:
+            raise ClassifyRepoDomainNameError(
+                "domain_override sanitizes to empty string"
+            )
+
     row = conn.execute(
         """
         SELECT id, status, has_readme, paper_id, description
@@ -145,6 +154,11 @@ def classify(
     # ground a domain/collection in. Mark them ORPHANED and move on; the
     # files remain searchable by path / file content.
     if not has_readme:
+        if domain_override is not None:
+            _LOG.warning(
+                "repo %s has no README; --domain=%s is being dropped on the ORPHAN path",
+                repo_slug, domain_override,
+            )
         with transaction(conn):
             conn.execute(
                 "UPDATE repos SET status = ? WHERE id = ?",
@@ -174,6 +188,11 @@ def classify(
         )
     readme_content = (readme_row[0] or "").strip()
     if not readme_content:
+        if domain_override is not None:
+            _LOG.warning(
+                "repo %s README is empty; --domain=%s is being dropped on the ORPHAN path",
+                repo_slug, domain_override,
+            )
         with transaction(conn):
             conn.execute(
                 "UPDATE repos SET status = ? WHERE id = ?",
@@ -194,16 +213,48 @@ def classify(
 
     readme_truncated = readme_content[:_README_CONTENT_MAX_CHARS]
 
-    existing_domains = load_taxonomy(
-        conn,
-        include_empty_collections=True,
-        include_empty_domains=True,
-        collections_per_domain_limit=_COLLECTIONS_PER_DOMAIN_LIMIT,
-    )
-    existing_domain_names = {d.name for d in existing_domains}
-    max_collections = max(
-        (len(d.collections) for d in existing_domains), default=0
-    )
+    if domain_override is not None:
+        # Lock the LLM to a single domain. See classify_paper.classify()
+        # for the rationale — same shape, same constraints. The override
+        # was already sanitized at the top of this function.
+        existing_domains = load_taxonomy(
+            conn,
+            domain=domain_override,
+            include_empty_collections=True,
+            include_empty_domains=True,
+            collections_per_domain_limit=None,
+        )
+        domain_row_exists = bool(existing_domains)
+        if not existing_domains:
+            existing_domains = [
+                DomainNode(
+                    name=domain_override,
+                    description=None,
+                    paper_count=0,
+                    collections=(),
+                    overflow=0,
+                    repo_count=0,
+                    post_count=0,
+                )
+            ]
+        existing_domain_names = (
+            {d.name for d in existing_domains} if domain_row_exists else set()
+        )
+        domain_enum = [0]
+        collection_enum = [-1, *range(len(existing_domains[0].collections))]
+    else:
+        existing_domains = load_taxonomy(
+            conn,
+            include_empty_collections=True,
+            include_empty_domains=True,
+            collections_per_domain_limit=_COLLECTIONS_PER_DOMAIN_LIMIT,
+        )
+        existing_domain_names = {d.name for d in existing_domains}
+        max_collections = max(
+            (len(d.collections) for d in existing_domains), default=0
+        )
+        domain_enum = [-1, *range(len(existing_domains))]
+        collection_enum = [-1, *range(max_collections)]
 
     metadata_block = _build_metadata_block(repo_slug=repo_slug, description=description)
 
@@ -219,8 +270,8 @@ def classify(
             "METADATA_BLOCK": metadata_block,
         },
         schema_replacements={
-            "DOMAIN_INDEX_ENUM": [-1, *range(len(existing_domains))],
-            "COLLECTION_INDEX_ENUM": [-1, *range(max_collections)],
+            "DOMAIN_INDEX_ENUM": domain_enum,
+            "COLLECTION_INDEX_ENUM": collection_enum,
         },
     )
 
@@ -583,10 +634,14 @@ def _choose_domain(
     existing_domains: set[str],
 ) -> _DomainDecision:
     if override is not None:
+        insert_new = override not in existing_domains
+        # See classify_paper._choose_domain for the rationale: a brand-new
+        # operator-created domain has no human-authored description and
+        # should be reviewed, same as LLM-proposed new domains.
         return _DomainDecision(
             name=override,
-            insert_new=override not in existing_domains,
-            repo_needs_review=False,
+            insert_new=insert_new,
+            repo_needs_review=insert_new,
         )
 
     treat_as_new = domain_is_new or proposed not in existing_domains
@@ -625,6 +680,14 @@ def _main(argv: Iterable[str] | None = None) -> None:
         help="override the LLM's domain choice with this exact name",
     )
     args = parser.parse_args(argv if argv is None else list(argv))
+
+    if args.domain is not None:
+        sanitized = sanitize_domain(args.domain)
+        if not sanitized:
+            parser.error(
+                f"--domain={args.domain!r} sanitizes to empty string"
+            )
+        args.domain = sanitized
 
     conn = get_conn(Path(args.db))
     try:

@@ -78,6 +78,7 @@ from _system.utils.slug import (
     existing_slugs,
     generate_book_slug,
     generate_chapter_slug,
+    sanitize_domain,
 )
 
 _LOG = get_logger("scripts.ingest")
@@ -1791,6 +1792,20 @@ def main(argv: list[str] | None = None) -> None:
             "--domain is not valid with --attach-repo "
             "(taxonomy is inherited from --to-paper)"
         )
+
+    if args.domain is not None:
+        # Canonicalize once at the CLI boundary. Fetch stages persist the
+        # value verbatim before classify runs, so the slug form has to be
+        # locked in before anything else sees it. Runs after the structural
+        # checks above so that the --attach-repo + --domain conflict
+        # surfaces with the helpful message even when the operator's
+        # --domain value also happens to be malformed.
+        sanitized = sanitize_domain(args.domain)
+        if not sanitized:
+            parser.error(
+                f"--domain={args.domain!r} sanitizes to empty string"
+            )
+        args.domain = sanitized
     manual_chapter = (
         args.book_slug is not None
         or args.chapter_index is not None

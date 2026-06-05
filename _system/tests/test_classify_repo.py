@@ -12,6 +12,7 @@ import pytest
 
 from _system.schemas.repo_metadata import RepoStatus
 from _system.scripts.classify_repo import (
+    ClassifyRepoDomainNameError,
     ClassifyRepoStateError,
     classify,
 )
@@ -374,3 +375,239 @@ def test_domain_override_skips_llm_domain_choice(db_with_domain):
         embedder=embedder,
     )
     assert result.domain == "biology"
+
+
+def test_repo_domain_override_filters_prompt_to_override_subtree(db_with_domain):
+    """Under override the rendered taxonomy must contain only the override
+    domain's subtree."""
+    db_with_domain.execute(
+        "INSERT OR IGNORE INTO domains (name) VALUES ('biology')"
+    )
+    _seed_repo(db_with_domain)
+    embedder = _OrthogonalEmbedder()
+
+    captured: dict[str, object] = {}
+
+    def _runner(system: str, user: str, schema: dict, response_model):
+        captured["user"] = user
+        captured["schema"] = schema
+        return response_model.model_validate(_payload(
+            domain_index=0,
+            collections=[{"index": -1, "new_name": "c", "new_desc": "A cluster."}],
+            topics=["t"],
+        ))
+
+    classify(
+        repo_slug="gh-owner-tool",
+        conn=db_with_domain,
+        domain_override="biology",
+        call_llm=_runner,
+        embedder=embedder,
+    )
+
+    rendered = captured["user"]
+    assert "0. biology" in rendered
+    # Sibling 'rag' domain seeded by the fixture must not leak in.
+    assert "0. rag" not in rendered
+
+
+def test_repo_domain_override_pins_schema_enums_no_truncation(db_with_domain):
+    db_with_domain.execute(
+        "INSERT OR IGNORE INTO domains (name) VALUES ('biology')"
+    )
+    for i in range(35):
+        db_with_domain.execute(
+            "INSERT INTO collection_definitions (domain, name, description) VALUES (?, ?, ?)",
+            ("biology", f"c{i:02d}", f"Cluster {i}."),
+        )
+    _seed_repo(db_with_domain)
+    embedder = _OrthogonalEmbedder()
+
+    captured: dict[str, object] = {}
+
+    def _runner(system: str, user: str, schema: dict, response_model):
+        captured["schema"] = schema
+        captured["user"] = user
+        return response_model.model_validate(_payload(
+            domain_index=0,
+            collections=[{"index": 0, "new_name": "", "new_desc": ""}],
+            topics=["t"],
+        ))
+
+    classify(
+        repo_slug="gh-owner-tool",
+        conn=db_with_domain,
+        domain_override="biology",
+        call_llm=_runner,
+        embedder=embedder,
+    )
+
+    schema = captured["schema"]
+    domain_enum = schema["schema"]["properties"]["domain_index"]["enum"]
+    coll_enum = (
+        schema["schema"]["properties"]["collections"]
+        ["items"]["properties"]["index"]["enum"]
+    )
+    assert domain_enum == [0]
+    assert coll_enum == [-1, *range(35)]
+    assert "more exist" not in captured["user"]
+
+
+def test_repo_domain_override_existing_collection_pick_preserves_curated_definition(db_with_domain):
+    """Core regression for repos: picking an existing curated collection
+    by index must not graft a NULL-description row over the curated row."""
+    db_with_domain.execute(
+        "INSERT OR IGNORE INTO domains (name) VALUES ('conversation_understanding')"
+    )
+    db_with_domain.execute(
+        "INSERT INTO collection_definitions (domain, name, description) VALUES (?, ?, ?)",
+        (
+            "conversation_understanding",
+            "conversational knowledge extraction",
+            "How agents extract durable knowledge from dialog.",
+        ),
+    )
+    _seed_repo(db_with_domain)
+    embedder = _OrthogonalEmbedder()
+
+    classify(
+        repo_slug="gh-owner-tool",
+        conn=db_with_domain,
+        domain_override="conversation_understanding",
+        call_llm=_runner_from_dict(_payload(
+            domain_index=0,
+            collections=[{"index": 0, "new_name": "", "new_desc": ""}],
+            topics=["t"],
+        )),
+        embedder=embedder,
+    )
+
+    coll_rows = db_with_domain.execute(
+        "SELECT name, description FROM collection_definitions "
+        " WHERE domain = ? ORDER BY name",
+        ("conversation_understanding",),
+    ).fetchall()
+    assert coll_rows == [(
+        "conversational knowledge extraction",
+        "How agents extract durable knowledge from dialog.",
+    )]
+
+
+def test_repo_domain_override_new_collection_pick_writes_definition_with_description(db_with_domain):
+    db_with_domain.execute(
+        "INSERT OR IGNORE INTO domains (name) VALUES ('biology')"
+    )
+    _seed_repo(db_with_domain)
+    embedder = _OrthogonalEmbedder()
+
+    classify(
+        repo_slug="gh-owner-tool",
+        conn=db_with_domain,
+        domain_override="biology",
+        call_llm=_runner_from_dict(_payload(
+            domain_index=0,
+            collections=[{
+                "index": -1,
+                "new_name": "evolution",
+                "new_desc": "Evolutionary biology pipelines.",
+            }],
+            topics=["phylogeny"],
+        )),
+        embedder=embedder,
+    )
+
+    row = db_with_domain.execute(
+        "SELECT description FROM collection_definitions "
+        " WHERE domain = ? AND name = ?",
+        ("biology", "evolution"),
+    ).fetchone()
+    assert row is not None
+    assert row[0] == "Evolutionary biology pipelines."
+
+
+def test_repo_domain_override_nonexistent_domain_creates_row_on_success(db_with_domain):
+    _seed_repo(db_with_domain)
+    embedder = _OrthogonalEmbedder()
+
+    captured: dict[str, object] = {}
+
+    def _runner(system: str, user: str, schema: dict, response_model):
+        captured["schema"] = schema
+        captured["user"] = user
+        return response_model.model_validate(_payload(
+            domain_index=0,
+            collections=[{
+                "index": -1,
+                "new_name": "fresh cluster",
+                "new_desc": "Fresh cluster description.",
+            }],
+            topics=["t"],
+        ))
+
+    pre = db_with_domain.execute(
+        "SELECT COUNT(*) FROM domains WHERE name = 'brand_new_domain'"
+    ).fetchone()[0]
+    assert pre == 0
+
+    classify(
+        repo_slug="gh-owner-tool",
+        conn=db_with_domain,
+        domain_override="brand_new_domain",
+        call_llm=_runner,
+        embedder=embedder,
+    )
+
+    assert "0. brand_new_domain" in captured["user"]
+    coll_enum = (
+        captured["schema"]["schema"]["properties"]["collections"]
+        ["items"]["properties"]["index"]["enum"]
+    )
+    assert coll_enum == [-1]
+
+    post = db_with_domain.execute(
+        "SELECT name, description FROM domains WHERE name = 'brand_new_domain'"
+    ).fetchone()
+    assert post is not None
+    assert post[1] is None
+
+
+def test_repo_domain_override_sanitizes_human_input(db_with_domain):
+    _seed_repo(db_with_domain)
+    embedder = _OrthogonalEmbedder()
+
+    classify(
+        repo_slug="gh-owner-tool",
+        conn=db_with_domain,
+        domain_override="Conversation Understanding",
+        call_llm=_runner_from_dict(_payload(
+            domain_index=0,
+            collections=[{
+                "index": -1,
+                "new_name": "ckl",
+                "new_desc": "Conversational knowledge layer.",
+            }],
+            topics=["t"],
+        )),
+        embedder=embedder,
+    )
+
+    row = db_with_domain.execute(
+        "SELECT domain FROM repos WHERE repo_slug = ?",
+        ("gh-owner-tool",),
+    ).fetchone()
+    assert row[0] == "conversation_understanding"
+
+
+def test_repo_domain_override_empty_sanitization_raises(db_with_domain):
+    _seed_repo(db_with_domain)
+
+    def _explode(*a, **k):
+        raise AssertionError("LLM must not be called when override is invalid")
+
+    with pytest.raises(ClassifyRepoDomainNameError):
+        classify(
+            repo_slug="gh-owner-tool",
+            conn=db_with_domain,
+            domain_override="!!!",
+            call_llm=_explode,
+        )
