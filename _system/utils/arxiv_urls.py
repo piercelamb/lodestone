@@ -80,6 +80,31 @@ def fix_figure_url(url: str) -> str:
     return _ARXIV_HTML_DUP_ID_RE.sub(r"\1\3", url)
 
 
+# arxiv.org's native HTML conversion sometimes references figure assets it
+# never materialized (e.g. srcs under a raw "latex/" source subdirectory) —
+# every such image 404s even though the page itself serves 200. ar5iv
+# renders the same e-print independently and hosts its copy of each asset
+# under /html/{id}/assets/{path}, keyed by the *unversioned* id, so the
+# version suffix is dropped from the mapped URL.
+_ARXIV_HTML_FIGURE_RE = re.compile(
+    r"^https://arxiv\.org/html/(\d{4}\.\d{4,5}|[a-z\-]+/\d{7})(?:v\d+)?/(.+)$"
+)
+_AR5IV_ASSET_URL = "https://ar5iv.labs.arxiv.org/html/{arxiv_id}/assets/{path}"
+
+
+def ar5iv_figure_fallback_url(url: str) -> Optional[str]:
+    """Map an arxiv.org/html figure URL onto its ar5iv-hosted equivalent.
+
+    Returns ``None`` for anything that isn't an arxiv-html asset URL
+    (ar5iv srcs, local-latex sentinels, external hosts) so callers can
+    gate the fallback retry on it.
+    """
+    m = _ARXIV_HTML_FIGURE_RE.match(url)
+    if m is None:
+        return None
+    return _AR5IV_ASSET_URL.format(arxiv_id=m.group(1), path=m.group(2))
+
+
 def base_url_for_source(source: HtmlSource, arxiv_id: str) -> str:
     if source is HtmlSource.ARXIV:
         return _ARXIV_HTML_BASE.format(arxiv_id=arxiv_id)

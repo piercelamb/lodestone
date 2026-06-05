@@ -49,7 +49,11 @@ from _system.latex import figures as latex_figures
 from _system.pdf import PDF_SENTINEL_PREFIX
 from _system.schemas.paper_metadata import HtmlSource, PaperMetadata, PaperStatus
 from _system.utils.arxiv_throttle import wait_for_arxiv_slot
-from _system.utils.arxiv_urls import base_url_for_source, parse_arxiv_id
+from _system.utils.arxiv_urls import (
+    ar5iv_figure_fallback_url,
+    base_url_for_source,
+    parse_arxiv_id,
+)
 from _system.utils.http import (
     USER_AGENT,
     is_transient as _is_transient,
@@ -395,11 +399,31 @@ def _resolve_figure_bytes(
             desc.figure_number, desc.figure_id,
         )
         return None
-    downloaded = _download_figure(client, desc.src_url)
-    if downloaded is None:
-        return None
-    raw, ct = downloaded
-    return _process_figure_image(raw, ct)
+    # arxiv's native HTML occasionally references assets it never
+    # materialized (the page serves 200 while every figure src 404s —
+    # observed on 2601.08682, whose srcs sit under a raw "latex/"
+    # subdirectory). ar5iv renders the same e-print independently, so a
+    # failed arxiv-hosted figure gets one retry against the ar5iv mirror
+    # before being skipped.
+    candidates = [desc.src_url]
+    ar5iv_url = ar5iv_figure_fallback_url(desc.src_url)
+    if ar5iv_url is not None:
+        candidates.append(ar5iv_url)
+    for url in candidates:
+        downloaded = _download_figure(client, url)
+        if downloaded is None:
+            continue
+        raw, ct = downloaded
+        processed = _process_figure_image(raw, ct)
+        if processed is None:
+            continue
+        if url != desc.src_url:
+            _LOG.info(
+                "figure %d (id=%s) recovered via ar5iv fallback %s",
+                desc.figure_number, desc.figure_id, url,
+            )
+        return processed
+    return None
 
 
 def _process_figures(

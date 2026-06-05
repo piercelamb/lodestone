@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-06-05
+
+### Fixed
+- Figure downloads now retry against the ar5iv mirror
+  (`/html/{id}/assets/{path}`) when arxiv.org's native HTML references
+  assets it never materialized (page serves 200, figure srcs 404) —
+  previously such papers hard-failed ingest at the convert stage with
+  `FigureCountMismatch` and could not be recovered with `--force`.
+
 ## [0.3.0] - 2026-06-05
 
 ### Added

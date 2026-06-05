@@ -25,7 +25,7 @@ from _system.scripts.fetch_paper import (
     _process_figure_image,
     fetch,
 )
-from _system.utils.arxiv_urls import parse_arxiv_id
+from _system.utils.arxiv_urls import ar5iv_figure_fallback_url, parse_arxiv_id
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +527,123 @@ def test_oversize_content_length_aborts_figure_and_continues():
         assert ok is not None
     finally:
         client.close()
+
+
+# ---------------------------------------------------------------------------
+# ar5iv figure fallback
+# ---------------------------------------------------------------------------
+
+
+def test_ar5iv_fallback_url_maps_arxiv_html_and_strips_version():
+    assert ar5iv_figure_fallback_url(
+        "https://arxiv.org/html/2601.08682v1/latex/fig.jpg"
+    ) == "https://ar5iv.labs.arxiv.org/html/2601.08682/assets/latex/fig.jpg"
+    assert ar5iv_figure_fallback_url(
+        "https://arxiv.org/html/2301.12345/x1.png"
+    ) == "https://ar5iv.labs.arxiv.org/html/2301.12345/assets/x1.png"
+    assert ar5iv_figure_fallback_url(
+        "https://arxiv.org/html/hep-th/9901001v2/fig/a.png"
+    ) == "https://ar5iv.labs.arxiv.org/html/hep-th/9901001/assets/fig/a.png"
+
+
+def test_ar5iv_fallback_url_rejects_non_arxiv_html_sources():
+    # Already-ar5iv srcs must not double-map.
+    assert ar5iv_figure_fallback_url(
+        "https://ar5iv.labs.arxiv.org/html/2301.12345/assets/x1.png"
+    ) is None
+    assert ar5iv_figure_fallback_url("https://example.com/x1.png") is None
+    assert ar5iv_figure_fallback_url("local-latex://2301.12345/x1.png") is None
+
+
+def _figure_desc(src_url: str) -> fp.FigureDescriptor:
+    return fp.FigureDescriptor(
+        figure_number=1,
+        display_number="1",
+        figure_id="S1.F1",
+        caption="Figure 1: overview.",
+        section_context="Intro",
+        src_url=src_url,
+        inline_data=None,
+        inline_mime=None,
+    )
+
+
+def test_resolve_figure_retries_ar5iv_when_arxiv_404s():
+    recorder = _Recorder(
+        lambda req: httpx.Response(
+            200, content=_png_bytes(10, 10), headers={"content-type": "image/png"}
+        )
+        if "ar5iv" in str(req.url)
+        else httpx.Response(404)
+    )
+    with _client_with(recorder.handler) as client:
+        resolved = fp._resolve_figure_bytes(
+            client, _figure_desc("https://arxiv.org/html/2601.08682v1/latex/fig.jpg")
+        )
+    assert resolved is not None
+    assert [str(r.url) for r in recorder.calls] == [
+        "https://arxiv.org/html/2601.08682v1/latex/fig.jpg",
+        "https://ar5iv.labs.arxiv.org/html/2601.08682/assets/latex/fig.jpg",
+    ]
+
+
+def test_resolve_figure_no_fallback_for_external_hosts():
+    recorder = _Recorder(lambda req: httpx.Response(404))
+    with _client_with(recorder.handler) as client:
+        resolved = fp._resolve_figure_bytes(
+            client, _figure_desc("https://example.com/fig.png")
+        )
+    assert resolved is None
+    assert len(recorder.calls) == 1
+
+
+def test_resolve_figure_skips_fallback_when_arxiv_succeeds():
+    recorder = _Recorder(
+        lambda req: httpx.Response(
+            200, content=_png_bytes(10, 10), headers={"content-type": "image/png"}
+        )
+    )
+    with _client_with(recorder.handler) as client:
+        resolved = fp._resolve_figure_bytes(
+            client, _figure_desc("https://arxiv.org/html/2301.12345/x1.png")
+        )
+    assert resolved is not None
+    assert len(recorder.calls) == 1
+
+
+def test_fetch_persists_figure_via_ar5iv_fallback(conn, fast_sleep):
+    """End-to-end mirror of the 2601.08682 failure: arxiv HTML serves 200
+    but its figure asset 404s; ar5iv hosts the asset. The figure row must
+    land so CONVERT's count check passes."""
+    arxiv_id = "2301.00011"
+    body = _minimal_html_with_one_figure("latex/fig.png")
+
+    def handler(req):
+        url = str(req.url)
+        if "ar5iv.labs.arxiv.org" in url and url.endswith("/assets/latex/fig.png"):
+            return httpx.Response(
+                200, content=_png_bytes(10, 10), headers={"content-type": "image/png"}
+            )
+        if "arxiv.org/html" in url and url.endswith("latex/fig.png"):
+            return httpx.Response(404)
+        if "arxiv.org/html" in url:
+            return _resp_html(body)
+        if "/pdf/" in url:
+            return httpx.Response(200, content=b"%PDF-1.4")
+        if "paperswithcode.com" in url:
+            return httpx.Response(404)
+        return httpx.Response(404)
+
+    with _client_with(handler) as client:
+        fetch(
+            conn=conn,
+            arxiv_id=arxiv_id,
+            client=client,
+            arxiv_lookup=lambda _id: _make_meta(),
+        )
+
+    count = conn.execute("SELECT COUNT(*) FROM figures").fetchone()[0]
+    assert count == 1
 
 
 # ---------------------------------------------------------------------------
