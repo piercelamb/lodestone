@@ -3,7 +3,7 @@ revision = 3
 requires-python = ">=3.11"
 
 [options]
-exclude-newer = "2026-05-29T20:06:24.379416Z"
+exclude-newer = "2026-05-29T21:35:02.77975Z"
 exclude-newer-span = "P7D"
 
 [[package]]
@@ -821,7 +821,7 @@ wheels = [
 
 [[package]]
 name = "lodestone"
-version = "0.3.0"
+version = "0.3.1"
 source = { editable = "." }
 dependencies = [
     { name = "anthropic" },
