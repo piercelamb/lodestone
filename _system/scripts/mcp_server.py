@@ -82,7 +82,7 @@ _LOG = get_logger("scripts.mcp_server")
 # as the result envelope is minimal — see _finalize_result for the gate.
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "lodestone"
-SERVER_VERSION = "0.3.1"
+SERVER_VERSION = "0.3.2"
 
 # Supported protocol versions we'll echo back if the client requests them.
 # Anything else falls back to PROTOCOL_VERSION.
