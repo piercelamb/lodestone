@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-06-17
+
+### Fixed
+- HTML fetch now detects arxiv/ar5iv pages that return HTTP 200 with a
+  LaTeXML "Fatal error" body (a failed render served as `text/html` on the
+  `/html/` path) and treats them as no-rendering, so ingest falls through
+  to the LaTeX e-print / PDF fallback ladder instead of indexing the error
+  banner as the paper. Previously such papers landed in the "Corrupted Or
+  Unavailable Paper Content" collection with a single error-stub section.
+
 ## [0.3.1] - 2026-06-05
 
 ### Fixed

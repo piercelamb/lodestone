@@ -99,6 +99,13 @@ _ARXIV_PDF_URL = "https://arxiv.org/pdf/{arxiv_id}"
 _PWC_PAPER_LOOKUP = "https://paperswithcode.com/api/v1/papers/?arxiv_id={arxiv_id}"
 _PWC_PAPER_REPOS = "https://paperswithcode.com/api/v1/papers/{slug}/repositories/"
 
+# LaTeXML emits this banner as the page body when an HTML render fails.
+# arxiv.org/html serves it as a 200 text/html on the /html/ path, so it slips
+# past the redirect check in _try_html and looks like real content. Markers are
+# matched case-insensitively against the body; add new 200-but-not-content
+# wordings here (one-line extension) as arxiv/ar5iv surface them.
+_HTML_ERROR_BODY_MARKERS = ("Conversion to HTML had a Fatal error",)
+
 _VERSION_RE = re.compile(r"v\d+$")
 
 
@@ -265,6 +272,14 @@ def _try_html(client: httpx.Client, url: str) -> str | None:
         _LOG.info(
             "html fetch %s redirected off /html/ to %s; treating as no-rendering",
             url, resp.url,
+        )
+        return None
+    body_lower = resp.text.lower()
+    if any(marker.lower() in body_lower for marker in _HTML_ERROR_BODY_MARKERS):
+        _LOG.info(
+            "html fetch %s returned 200 but body is an error stub; "
+            "treating as no-rendering",
+            url,
         )
         return None
     return resp.text
