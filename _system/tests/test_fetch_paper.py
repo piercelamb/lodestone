@@ -259,6 +259,81 @@ def test_ar5iv_redirect_to_abs_treated_as_no_rendering(conn, fast_sleep):
     assert papers == 0
 
 
+def test_html_200_with_error_body_treated_as_no_rendering():
+    """arxiv.org/html can return 200 text/html on the /html/ path whose body is
+    a LaTeXML 'Fatal error' stub rather than paper content. _try_html must treat
+    that as no-rendering (return None) so fetch() enters its fallback ladder —
+    exactly like the ar5iv redirect case. Scoped to detection only: makes no
+    claim about which fallback tier ultimately wins."""
+    url = fp._ARXIV_HTML_URL.format(arxiv_id="2605.00529")
+    stub = (
+        "<!doctype html><html><body>"
+        "<h1>Conversion to HTML had a Fatal error and exited abruptly.</h1>"
+        "<p>This document may be truncated or damaged.</p>"
+        "</body></html>"
+    )
+
+    with _client_with(lambda req: _resp_html(stub)) as client:
+        assert fp._try_html(client, url) is None
+
+
+def test_html_200_real_body_with_error_prose_not_flagged():
+    """The marker is the full LaTeXML banner, not a bare 'fatal error'. A real
+    paper that merely discusses errors must still be accepted as content."""
+    url = fp._ARXIV_HTML_URL.format(arxiv_id="2301.00001")
+    body = (
+        "<!doctype html><html><body>"
+        "<p>Our system gracefully recovers from a fatal error in the pipeline.</p>"
+        "</body></html>"
+    )
+
+    with _client_with(lambda req: _resp_html(body)) as client:
+        assert fp._try_html(client, url) == body
+
+
+def test_html_200_error_body_enters_fallback_and_keeps_real_id(conn, fast_sleep):
+    """End-to-end: a 200 LaTeXML error stub on /html/ (served by both arxiv.org
+    and ar5iv) must route fetch() into its fallback ladder and persist the row
+    under the REAL arxiv_id — not a synthetic pdf: id. Uses the PDF tier as the
+    catch; the point is 'entered the chain + kept real identity', not 'used the
+    PDF'."""
+    arxiv_id = "2605.00529"
+    stub = (
+        "<html><body>Conversion to HTML had a Fatal error and exited abruptly."
+        "</body></html>"
+    )
+    pdf_blob = (Path(__file__).parent / "fixtures" / "pdf" / "sample.pdf").read_bytes()
+    meta = _make_meta(pdf_url=f"https://arxiv.org/pdf/{arxiv_id}")
+
+    def handler(req):
+        url = str(req.url)
+        if "/html/" in url:
+            return _resp_html(stub)
+        if "arxiv.org/e-print/" in url:
+            return httpx.Response(404)
+        if "/pdf/" in url:
+            return httpx.Response(
+                200, content=pdf_blob,
+                headers={"content-type": "application/pdf"},
+            )
+        if "paperswithcode.com" in url:
+            return httpx.Response(404)
+        return httpx.Response(404)
+
+    with _client_with(handler) as client:
+        pm = fetch(
+            conn=conn, arxiv_id=arxiv_id, client=client,
+            arxiv_lookup=lambda _id: meta,
+        )
+
+    assert pm.html_source == "pdf_fallback"
+    row = conn.execute(
+        "SELECT arxiv_id, html_source FROM papers WHERE arxiv_id = ?", (arxiv_id,)
+    ).fetchone()
+    assert row is not None
+    assert row[0] == arxiv_id  # real id preserved, not a synthetic pdf:<sha>
+
+
 def test_all_extraction_paths_fail_raises(conn, fast_sleep):
     arxiv_id = "2301.99999"
     meta = _make_meta()
