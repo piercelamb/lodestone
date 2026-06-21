@@ -39,7 +39,7 @@ from _system.utils.logging import get_logger
 from _system.utils.repo_url import extract_repo_candidates
 from _system.utils.slug import existing_slugs, generate_post_name, sanitize_domain
 
-__all__ = ["fetch", "fetch_post"]
+__all__ = ["fetch", "fetch_post", "fetch_from_file"]
 
 _LOG = get_logger("scripts.fetch_post")
 
@@ -333,6 +333,92 @@ def _record_failed_fetch(
     return pm
 
 
+def _persist_extracted_post(
+    conn: sqlite3.Connection,
+    *,
+    meta: _ExtractedMetadata,
+    html_body: str,
+    source_url: str,
+    force: bool,
+    domain_override: str | None,
+    etag: str | None,
+    last_modified: str | None,
+) -> PostMetadata:
+    """Phase-2 tail shared by the HTTP and local-file fetch front-ends.
+
+    Resolves the canonical-keyed dedup/force decision, computes the
+    content hash, scans the body for a repo URL, picks the slug
+    (preserving an existing row's ``post_name`` / ``ingested_at`` on a
+    force-refetch), and writes one ``status='fetched'`` posts row.
+
+    ``etag`` / ``last_modified`` are caller-supplied: the HTTP response
+    headers for :func:`fetch`, ``None`` for :func:`fetch_from_file`
+    (a saved file carries no transport metadata). The "already present
+    and not force" short-circuit returns the existing row untouched.
+    """
+    existing = _load_post_by_url(
+        conn, column="canonical_url", value=meta.canonical_url,
+    )
+    if existing is not None and not force:
+        _, existing_pm = existing
+        _LOG.info(
+            "post %s already present (status=%s), skipping fetch",
+            meta.canonical_url, existing_pm.status,
+        )
+        return existing_pm
+
+    content_hash = hashlib.sha256(
+        (meta.canonical_url + html_body).encode("utf-8")
+    ).hexdigest()
+    _log_soft_dedup(conn, content_hash, meta.canonical_url)
+
+    # Repo discovery — feeds the orchestrator's standalone-repo branch.
+    # The discovered URL travels on the in-memory PostMetadata; it is
+    # never persisted to the posts row.
+    repo_hits = extract_repo_candidates(html_body)
+    code_repo = repo_hits[0] if repo_hits else None
+
+    if existing is not None:
+        existing_id = existing[0]
+        post_name = existing[1].post_name
+        ingested_at = existing[1].ingested_at or datetime.now(
+            timezone.utc
+        ).isoformat(timespec="seconds")
+    else:
+        existing_id = None
+        post_name = generate_post_name(
+            meta.title,
+            meta.date,
+            meta.canonical_url,
+            existing_slugs(conn),
+        )
+        ingested_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    pm = PostMetadata(
+        post_name=post_name,
+        source_url=source_url,
+        canonical_url=meta.canonical_url,
+        title=meta.title,
+        author=meta.author,
+        site_name=meta.site_name,
+        date=meta.date,
+        abstract=meta.description,
+        domain=domain_override,
+        collection=None,
+        status=PostStatus.FETCHED,
+        markdown=None,
+        raw_html=html_body,
+        content_hash=content_hash,
+        etag=etag,
+        last_modified=last_modified,
+        code_repo=code_repo,
+        needs_review=False,
+        ingested_at=ingested_at,
+    )
+    _persist_post(conn, pm, existing_id=existing_id)
+    return pm
+
+
 def fetch(
     *,
     conn: sqlite3.Connection,
@@ -382,70 +468,16 @@ def fetch(
         if meta is None:
             return _record_failed_fetch(conn, url)
 
-        existing = _load_post_by_url(
-            conn, column="canonical_url", value=meta.canonical_url,
-        )
-        if existing is not None and not force:
-            existing_id, existing_pm = existing
-            _LOG.info(
-                "post %s already present (status=%s), skipping fetch",
-                meta.canonical_url, existing_pm.status,
-            )
-            return existing_pm
-
-        content_hash = hashlib.sha256(
-            (meta.canonical_url + html_body).encode("utf-8")
-        ).hexdigest()
-        _log_soft_dedup(conn, content_hash, meta.canonical_url)
-
-        # Repo discovery — feeds the orchestrator's standalone-repo branch.
-        # The discovered URL travels on the in-memory PostMetadata; it is
-        # never persisted to the posts row.
-        repo_hits = extract_repo_candidates(html_body)
-        code_repo = repo_hits[0] if repo_hits else None
-
-        if existing is not None:
-            existing_id = existing[0]
-            post_name = existing[1].post_name
-            ingested_at = existing[1].ingested_at or datetime.now(
-                timezone.utc
-            ).isoformat(timespec="seconds")
-        else:
-            existing_id = None
-            post_name = generate_post_name(
-                meta.title,
-                meta.date,
-                meta.canonical_url,
-                existing_slugs(conn),
-            )
-            ingested_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-        etag = resp.headers.get("etag")
-        last_modified = resp.headers.get("last-modified")
-
-        pm = PostMetadata(
-            post_name=post_name,
+        return _persist_extracted_post(
+            conn,
+            meta=meta,
+            html_body=html_body,
             source_url=url,
-            canonical_url=meta.canonical_url,
-            title=meta.title,
-            author=meta.author,
-            site_name=meta.site_name,
-            date=meta.date,
-            abstract=meta.description,
-            domain=domain_override,
-            collection=None,
-            status=PostStatus.FETCHED,
-            markdown=None,
-            raw_html=html_body,
-            content_hash=content_hash,
-            etag=etag,
-            last_modified=last_modified,
-            code_repo=code_repo,
-            needs_review=False,
-            ingested_at=ingested_at,
+            force=force,
+            domain_override=domain_override,
+            etag=resp.headers.get("etag"),
+            last_modified=resp.headers.get("last-modified"),
         )
-        _persist_post(conn, pm, existing_id=existing_id)
-        return pm
     finally:
         if owns_client:
             client.close()
@@ -453,6 +485,54 @@ def fetch(
 
 # Public alias matching the convention used by other stages.
 fetch_post = fetch
+
+
+def fetch_from_file(
+    *,
+    conn: sqlite3.Connection,
+    html_path: Path,
+    force: bool = False,
+    domain_override: str | None = None,
+) -> PostMetadata:
+    """Ingest a locally-saved ``.html`` file through the post pipeline.
+
+    The file front-end to :func:`fetch`: no network, no HTTP headers.
+    Used for paywalled / JS-rendered pages a cookieless GET can't capture
+    but a browser "Save Page As → Complete" can. Identity comes from the
+    file's own ``<link rel=canonical>`` / ``og:url``; a ``file://<abspath>``
+    sentinel is the fallback (canonical_url == source_url, which is unique
+    and stable). Returns the populated :class:`PostMetadata` — status
+    FETCHED on success, FAILED_FETCH when the file didn't parse as an
+    article. Persistence reuses the exact phase-2 tail as the HTTP lane,
+    so ``--force`` cascades the matching canonical in place (slug
+    preserved).
+    """
+    if not html_path.exists():
+        raise FileNotFoundError(f"HTML file not found at {html_path}")
+    html_body = html_path.read_text(encoding="utf-8", errors="replace")
+    base_url = _resolve_canonical_url(html_body, html_path.resolve().as_uri())
+
+    meta = _extract_metadata(html_body, base_url)
+    if meta is None:
+        # There is no network in the file lane — _record_failed_fetch's
+        # "fetch" name is a pragmatic reuse. The file simply didn't parse
+        # as a readable article (no title / not an article DOM).
+        _LOG.warning(
+            "post file %s did not parse as an article, marking FAILED_FETCH",
+            html_path,
+        )
+        return _record_failed_fetch(conn, base_url)
+
+    return _persist_extracted_post(
+        conn,
+        meta=meta,
+        html_body=html_body,
+        source_url=meta.canonical_url,
+        force=force,
+        domain_override=domain_override,
+        etag=None,
+        last_modified=None,
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
