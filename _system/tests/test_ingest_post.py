@@ -7,6 +7,7 @@ modules.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -14,7 +15,7 @@ import pytest
 from _system.db.cascade import delete_post_cascade
 from _system.schemas.post_metadata import PostMetadata, PostStatus
 from _system.scripts import ingest as ingest_mod
-from _system.scripts.ingest import ingest_post
+from _system.scripts.ingest import ingest_post, ingest_post_html
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +33,46 @@ def _stub_fetch_post(*, conn, url, force=False, domain_override=None, **_):
         author="Tester",
         site_name="testsite",
         date="2024-02-01",
+        abstract="stub abstract",
+        domain=None,
+        collection=None,
+        status=PostStatus.FETCHED,
+        markdown=None,
+        raw_html="<p>stub raw html body</p>",
+        content_hash="0" * 64,
+        needs_review=False,
+        ingested_at="2026-05-07T00:00:00",
+    )
+    conn.execute(
+        """
+        INSERT INTO posts (
+            post_name, source_url, canonical_url, title, author, site_name,
+            date, abstract, raw_html, content_hash, ingested_at, status,
+            needs_review
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            pm.post_name, pm.source_url, pm.canonical_url, pm.title,
+            pm.author, pm.site_name, pm.date, pm.abstract, pm.raw_html,
+            pm.content_hash, pm.ingested_at, "fetched", 0,
+        ),
+    )
+    conn.commit()
+    return pm
+
+
+def _stub_fetch_from_file(*, conn, html_path, force=False, domain_override=None, **_):
+    # File-lane sibling of _stub_fetch_post: identity is the file:// URI
+    # (canonical == source), one row at status='fetched'.
+    canonical = f"file://{html_path}"
+    pm = PostMetadata(
+        post_name="stub_html_2026",
+        source_url=canonical,
+        canonical_url=canonical,
+        title="Stub HTML Post",
+        author="Tester",
+        site_name="testsite",
+        date="2026-02-01",
         abstract="stub abstract",
         domain=None,
         collection=None,
@@ -150,6 +191,47 @@ def patched_pipeline(monkeypatch):
     monkeypatch.setattr(ingest_mod, "index_stage", _stub_index)
 
 
+@pytest.fixture
+def patched_html_later_stages(monkeypatch):
+    """Stub only the post-fetch stages, leaving fetch_from_file REAL.
+
+    Used by the file-lane resume / force tests so the FETCHED→resume and
+    canonical-keyed force-cascade logic runs for real without LLMs/GLiNER.
+    """
+    monkeypatch.setattr(ingest_mod, "convert_post_stage", _stub_convert)
+    monkeypatch.setattr(ingest_mod, "classify_paper_stage", _stub_classify)
+    monkeypatch.setattr(ingest_mod, "extract_stage", _stub_extract)
+    monkeypatch.setattr(ingest_mod, "index_stage", _stub_index)
+
+
+@pytest.fixture
+def patched_html_pipeline(patched_html_later_stages, monkeypatch):
+    monkeypatch.setattr(
+        ingest_mod, "fetch_post_from_file_stage", _stub_fetch_from_file
+    )
+
+
+# Article-shaped saved page carrying an explicit canonical, so the real
+# fetch_from_file resolves a deterministic identity the seed can match.
+_HTML_WITH_CANONICAL = """<!doctype html>
+<html lang="en"><head>
+  <title>A Resumable Saved Post</title>
+  <link rel="canonical" href="https://example.com/resumed-post"/>
+</head><body><article>
+<h1>A Resumable Saved Post</h1>
+<p>Posted on <time datetime="2026-02-01">February 1, 2026</time>.</p>
+<h2>Body</h2>
+<p>Enough prose so trafilatura's favor_precision extractor recognizes a
+real article rather than a skeleton DOM, with a couple of sentences of
+genuine content across the paragraph to clear the minimum-length
+threshold the convert stage enforces and then some more for good
+measure.</p>
+</article></body></html>
+"""
+
+_RESUMED_CANONICAL = "https://example.com/resumed-post"
+
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -248,6 +330,166 @@ class TestIngestPost:
         # Convert / classify must NOT have run.
         row = conn.execute(
             "SELECT markdown, status FROM posts WHERE source_url = ?", (url,)
+        ).fetchone()
+        assert row[0] is None
+        assert row[1] == "failed_fetch"
+
+
+# ---------------------------------------------------------------------------
+# Local-HTML-file orchestrator
+# ---------------------------------------------------------------------------
+
+
+def _write_html(tmp_path: Path, html: str, name: str = "post.html") -> Path:
+    p = tmp_path / name
+    p.write_text(html, encoding="utf-8")
+    return p
+
+
+def _seed_post(conn, *, post_name, canonical, status, **cols):
+    base = {
+        "post_name": post_name,
+        "source_url": canonical,
+        "canonical_url": canonical,
+        "title": "seed",
+        "date": "2026-01-01",
+        "abstract": "seed",
+        "raw_html": "<p>seed body</p>",
+        "content_hash": "1" * 64,
+        "ingested_at": "2026-01-01T00:00:00",
+        "status": status,
+        "needs_review": 0,
+    }
+    base.update(cols)
+    keys = ", ".join(base)
+    placeholders = ", ".join("?" for _ in base)
+    conn.execute(
+        f"INSERT INTO posts ({keys}) VALUES ({placeholders})",
+        tuple(base.values()),
+    )
+    conn.commit()
+
+
+class TestIngestPostHtml:
+    def test_full_pipeline_runs(self, conn, tmp_path, patched_html_pipeline):
+        path = _write_html(tmp_path, _HTML_WITH_CANONICAL)
+        summary = ingest_post_html(conn=conn, html_path=path)
+        assert summary["kind"] == "post"
+        assert summary["status"] == "indexed"
+        assert summary["section_count"] == 5
+        assert summary["entity_count"] == 3
+        assert summary["domain"] == "retrieval"
+        assert summary["collection"] == "rag"
+
+    def test_progress_ticks_emitted(self, conn, tmp_path, patched_html_pipeline):
+        path = _write_html(tmp_path, _HTML_WITH_CANONICAL)
+        events: list[tuple[str, int, int]] = []
+        ingest_post_html(
+            conn=conn, html_path=path, progress=lambda *a: events.append(a)
+        )
+        # FETCH_POST is NOT scheduled here → 4 stages (convert/classify/
+        # extract/index) → 4 starting ticks + 1 complete tick.
+        assert any(e[0] == "complete" for e in events)
+        assert sum(1 for e in events if e[0].startswith("starting")) == 4
+
+    def test_resume_from_seeded_fetched(
+        self, conn, tmp_path, patched_html_later_stages
+    ):
+        # Real fetch_from_file resolves canonical → finds the seeded
+        # FETCHED row (no force) → resumes convert→…→index via stubs.
+        _seed_post(
+            conn, post_name="resume_2026", canonical=_RESUMED_CANONICAL,
+            status="fetched",
+        )
+        path = _write_html(tmp_path, _HTML_WITH_CANONICAL)
+        summary = ingest_post_html(conn=conn, html_path=path)
+        assert summary["post_name"] == "resume_2026"
+        assert summary["status"] == "indexed"
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM posts WHERE canonical_url = ?",
+            (_RESUMED_CANONICAL,),
+        ).fetchone()[0]
+        assert cnt == 1
+
+    def test_force_overwrite_preserves_slug(
+        self, conn, tmp_path, patched_html_later_stages
+    ):
+        # A paywall stub at the file's canonical; --force re-ingests in
+        # place, preserving post_name + ingested_at (the post_2026 case).
+        _seed_post(
+            conn, post_name="post_2026", canonical=_RESUMED_CANONICAL,
+            status="failed_fetch", needs_review=1,
+            source_url="https://levelup.gitconnected.com/x?sk=abc",
+        )
+        path = _write_html(tmp_path, _HTML_WITH_CANONICAL)
+        summary = ingest_post_html(conn=conn, html_path=path, force=True)
+        assert summary["post_name"] == "post_2026"
+        assert summary["status"] == "indexed"
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM posts WHERE canonical_url = ?",
+            (_RESUMED_CANONICAL,),
+        ).fetchone()[0]
+        assert cnt == 1
+        row = conn.execute(
+            "SELECT ingested_at FROM posts WHERE post_name = 'post_2026'"
+        ).fetchone()
+        assert row[0] == "2026-01-01T00:00:00"
+
+    def test_without_force_skips_when_indexed(self, conn, tmp_path):
+        # No stubs: fetch_from_file short-circuits on the INDEXED row and
+        # _remaining_post_stages returns [] → "already complete".
+        conn.execute("INSERT OR IGNORE INTO domains (name) VALUES ('retrieval')")
+        conn.execute(
+            "INSERT OR IGNORE INTO collection_definitions (domain, name) "
+            "VALUES ('retrieval', 'rag')"
+        )
+        _seed_post(
+            conn, post_name="done_2026", canonical=_RESUMED_CANONICAL,
+            status="indexed", domain="retrieval", collection="rag",
+        )
+        path = _write_html(tmp_path, _HTML_WITH_CANONICAL)
+        events: list[tuple] = []
+        summary = ingest_post_html(
+            conn=conn, html_path=path, progress=lambda *a: events.append(a)
+        )
+        assert events[0] == ("already complete", 0, 0)
+        assert summary["status"] == "indexed"
+
+    def test_missing_file_errors_cleanly(self, conn, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            ingest_post_html(conn=conn, html_path=tmp_path / "nope.html")
+
+    def test_failed_fetch_halts_pipeline(self, conn, tmp_path, monkeypatch):
+        def failing(*, conn, html_path, force=False, domain_override=None, **_):
+            canonical = f"file://{html_path}"
+            conn.execute(
+                """
+                INSERT INTO posts (
+                    post_name, source_url, canonical_url, title, date,
+                    abstract, ingested_at, status, needs_review
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "failhtml_2026", canonical, canonical, "fail",
+                    "2026-01-01", "fail", "2026-01-01T00:00:00",
+                    "failed_fetch", 1,
+                ),
+            )
+            conn.commit()
+            return PostMetadata(
+                post_name="failhtml_2026", source_url=canonical,
+                canonical_url=canonical, title="fail", date="2026-01-01",
+                abstract="fail", status=PostStatus.FAILED_FETCH,
+                ingested_at="2026-01-01T00:00:00", needs_review=True,
+            )
+
+        monkeypatch.setattr(ingest_mod, "fetch_post_from_file_stage", failing)
+        path = _write_html(tmp_path, "<html><body></body></html>", name="dead.html")
+        summary = ingest_post_html(conn=conn, html_path=path)
+        assert summary["status"] == "failed_fetch"
+        # Convert / classify must NOT have run (markdown stays NULL).
+        row = conn.execute(
+            "SELECT markdown, status FROM posts WHERE post_name = 'failhtml_2026'"
         ).fetchone()
         assert row[0] is None
         assert row[1] == "failed_fetch"

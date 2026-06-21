@@ -5,10 +5,12 @@ internet.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 import pytest
 
-from _system.scripts.fetch_post import fetch
+from _system.scripts.fetch_post import fetch, fetch_from_file
 from _system.utils.http import USER_AGENT
 
 
@@ -234,3 +236,130 @@ class TestSlugNamespace:
         pm = fetch(conn=conn, url=url, client=client)
         # Slug must NOT equal the existing paper's slug.
         assert pm.post_name != "a_survey_2023"
+
+
+# ---------------------------------------------------------------------------
+# Local-file front-end (fetch_from_file) — no network, no httpx
+# ---------------------------------------------------------------------------
+
+
+_LIL_CANONICAL = "https://lilianweng.github.io/posts/2023-06-23-agent/"
+
+# An article-shaped page with NO <link rel=canonical> and NO og:url, so
+# the file front-end has to fall back to the file:// sentinel. Enough
+# prose for trafilatura's favor_precision article extractor to keep it.
+_NO_CANONICAL_HTML = """<!doctype html>
+<html lang="en"><head>
+  <title>A Post Without Any Canonical Link</title>
+</head><body><article>
+<h1>A Post Without Any Canonical Link</h1>
+<p>Posted on <time datetime="2025-03-10">March 10, 2025</time>.</p>
+<h2>Intro</h2>
+<p>This post deliberately omits both link rel=canonical and og:url so the
+file front-end has to fall back to the file:// sentinel. The body needs
+enough prose for trafilatura's favor_precision article extractor to keep
+it — several sentences across a couple of paragraphs covering the topic
+at hand with concrete detail rather than a skeleton DOM that the
+precision pass would discard.</p>
+<h2>Body</h2>
+<p>We continue with more text to make sure the body is comfortably above
+the minimum-length threshold the convert stage enforces, discussing the
+subject with a worked example and a plain explanation a grade-schooler
+could follow.</p>
+</article></body></html>
+"""
+
+
+class TestFetchFromFile:
+    def _write(self, tmp_path: Path, html: str, name: str = "post.html") -> Path:
+        p = tmp_path / name
+        p.write_text(html, encoding="utf-8")
+        return p
+
+    def test_reads_and_persists_from_file(self, conn, tmp_path):
+        path = self._write(tmp_path, _LIL_HTML)
+        pm = fetch_from_file(conn=conn, html_path=path)
+
+        assert pm.status == "fetched"
+        # Canonical comes from the file's <link rel=canonical>, not the path.
+        assert pm.canonical_url == _LIL_CANONICAL
+        # File lane: source_url == canonical_url, no transport metadata.
+        assert pm.source_url == pm.canonical_url
+        assert pm.etag is None
+        assert pm.last_modified is None
+        assert pm.content_hash is not None and len(pm.content_hash) == 64
+        assert pm.code_repo == "https://github.com/owner/repo"
+
+        row = conn.execute(
+            "SELECT status, source_url, canonical_url, needs_review FROM posts"
+        ).fetchone()
+        assert row[0] == "fetched"
+        assert row[1] == row[2] == _LIL_CANONICAL
+        assert row[3] == 0
+
+    def test_no_canonical_falls_back_to_file_uri(self, conn, tmp_path):
+        path = self._write(tmp_path, _NO_CANONICAL_HTML)
+        pm = fetch_from_file(conn=conn, html_path=path)
+        assert pm.status == "fetched"
+        assert pm.canonical_url.startswith("file://")
+        assert pm.canonical_url.endswith("post.html")
+        assert pm.source_url == pm.canonical_url
+
+    def test_missing_file_raises(self, conn, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            fetch_from_file(conn=conn, html_path=tmp_path / "nope.html")
+
+    def test_unparseable_html_marks_failed_fetch(self, conn, tmp_path):
+        path = self._write(
+            tmp_path, "<html><body><script>alert(1)</script></body></html>"
+        )
+        pm = fetch_from_file(conn=conn, html_path=path)
+        assert pm.status == "failed_fetch"
+        row = conn.execute(
+            "SELECT status, needs_review FROM posts"
+        ).fetchone()
+        assert row[0] == "failed_fetch"
+        assert row[1] == 1
+
+    def test_idempotent_without_force(self, conn, tmp_path):
+        path = self._write(tmp_path, _LIL_HTML)
+        first = fetch_from_file(conn=conn, html_path=path)
+        second = fetch_from_file(conn=conn, html_path=path)
+        assert second.post_name == first.post_name
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM posts WHERE canonical_url = ?",
+            (first.canonical_url,),
+        ).fetchone()[0]
+        assert cnt == 1
+
+    def test_force_overwrites_stub_preserving_slug(self, conn, tmp_path):
+        # Seed a paywall stub at the SAME canonical the file resolves to.
+        conn.execute(
+            """
+            INSERT INTO posts (
+                post_name, source_url, canonical_url, title, date, abstract,
+                ingested_at, status, needs_review
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "post_2026", "https://levelup.gitconnected.com/x?sk=abc",
+                _LIL_CANONICAL, "(stub)", "2026-01-01", "(stub)",
+                "2026-01-01T00:00:00", "failed_fetch", 1,
+            ),
+        )
+        conn.commit()
+
+        path = self._write(tmp_path, _LIL_HTML)
+        pm = fetch_from_file(conn=conn, html_path=path, force=True)
+
+        assert pm.post_name == "post_2026"  # slug preserved across overwrite
+        assert pm.status == "fetched"
+        cnt = conn.execute(
+            "SELECT COUNT(*) FROM posts WHERE canonical_url = ?", (_LIL_CANONICAL,)
+        ).fetchone()[0]
+        assert cnt == 1
+        # ingested_at carried over from the stub row.
+        row = conn.execute(
+            "SELECT ingested_at FROM posts WHERE post_name = 'post_2026'"
+        ).fetchone()
+        assert row[0] == "2026-01-01T00:00:00"

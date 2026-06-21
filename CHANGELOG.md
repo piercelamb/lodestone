@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-21
+
+### Added
+- `ingest --post-html <path>` ingests a locally-saved `.html` file through the
+  blog-post pipeline (convert → classify → extract → index), bypassing the
+  cookieless HTTP fetch. Identity is taken from the file's own
+  `<link rel=canonical>` / `og:url` (with a `file://` fallback), so `--force`
+  overwrites a matching stub in place, preserving its slug. Use it for
+  paywalled or JS-rendered posts a headless GET only captures as a stub —
+  save the page from the browser as "Webpage, Complete". CLI-only, mirroring
+  the local-file `--pdf` precedent (no MCP surface).
+- `delete_post.py` CLI removes a single post (stub, orphan, or fully indexed)
+  and all its per-post rows via the post cascade, leaving the curated catalog
+  intact — a post-flavored sibling of `delete_repo.py`. Resolves by `--slug`
+  or `--url`.
+
 ## [0.3.2] - 2026-06-17
 
 ### Fixed

@@ -54,7 +54,10 @@ from _system.scripts.convert_post import convert as convert_post_stage
 from _system.scripts.extract_entities import extract as extract_stage
 from _system.scripts.fetch_acl import fetch as fetch_acl_stage
 from _system.scripts.fetch_paper import fetch as fetch_stage
-from _system.scripts.fetch_post import fetch as fetch_post_stage
+from _system.scripts.fetch_post import (
+    fetch as fetch_post_stage,
+    fetch_from_file as fetch_post_from_file_stage,
+)
 from _system.scripts.fetch_repo import fetch_repo as fetch_repo_stage
 from _system.scripts.index_paper import index_one as index_stage
 from _system.scripts.load_pdf import (
@@ -1231,6 +1234,100 @@ def ingest_post(
     return _summary_post(conn, url)
 
 
+def ingest_post_html(
+    *,
+    conn: sqlite3.Connection,
+    html_path: Path,
+    force: bool = False,
+    domain: str | None = None,
+    progress: ProgressFn | None = None,
+) -> dict:
+    """Ingest a locally-saved ``.html`` file through the blog-post pipeline.
+
+    The file-input sibling of :func:`ingest_post`, mirroring the local-PDF
+    precedent (``--pdf``): the HTTP FETCH_POST stage is replaced by
+    :func:`fetch_post_from_file_stage`, which reads the file and writes the
+    FETCHED row. Force-cascade is delegated to that stage (we can't know
+    the canonical until the file is read, so there's no up-front
+    ``_force_delete_post`` — same end state: one fresh row, taxonomy
+    preserved, slug + ingested_at preserved when the canonical already
+    exists). The remaining convert → classify → extract → index stages are
+    identical to the URL lane. Like :func:`ingest_post`, github links in
+    the post body are NOT auto-ingested.
+    """
+    def _tick(msg: str, done: int, total: int) -> None:
+        if progress is not None:
+            progress(msg, done, total)
+
+    pm = fetch_post_from_file_stage(
+        conn=conn,
+        html_path=html_path,
+        force=force,
+        domain_override=domain,
+    )
+    post_name = pm.post_name
+    canonical_url = pm.canonical_url
+    current = PostStatus(pm.status) if pm.status else None
+
+    if current in (PostStatus.FAILED_FETCH, PostStatus.FAILED_PARSE):
+        _LOG.warning(
+            "fetch_from_file produced %s for %s; halting pipeline",
+            current.value, html_path,
+        )
+        _tick("complete", 0, 0)
+        return _summary_post(conn, canonical_url)
+
+    # FETCH_POST is never scheduled here — the file front-end already ran
+    # it. The remaining set resumes convert→…→index from the row's status.
+    stages_to_run = _remaining_post_stages(current)
+    _LOG.info(
+        "ingest_post_html path=%s current_status=%s stages_to_run=%s",
+        html_path, current, stages_to_run,
+    )
+
+    total = len(stages_to_run)
+    done = 0
+
+    if total == 0:
+        _tick("already complete", 0, 0)
+        return _summary_post(conn, canonical_url)
+
+    if Stage.CONVERT_POST in stages_to_run:
+        _tick(f"starting {Stage.CONVERT_POST.value}", done, total)
+        result = convert_post_stage(post_name=post_name, conn=conn, force=force)
+        # convert_post may downgrade to FAILED_PARSE when trafilatura
+        # returned an empty body. Halt the pipeline before classify.
+        if result.status == PostStatus.FAILED_PARSE.value:
+            _LOG.warning(
+                "convert_post produced FAILED_PARSE for %s; halting", html_path,
+            )
+            done += 1
+            _tick("complete", done, total)
+            return _summary_post(conn, canonical_url)
+        done += 1
+    if Stage.CLASSIFY_POST in stages_to_run:
+        _tick(f"starting {Stage.CLASSIFY_POST.value}", done, total)
+        classify_paper_stage(
+            conn=conn,
+            paper_name=post_name,
+            force=force,
+            domain_override=domain,
+        )
+        done += 1
+    if Stage.EXTRACT_POST in stages_to_run:
+        _tick(f"starting {Stage.EXTRACT_POST.value}", done, total)
+        extract_stage(conn=conn, paper_name=post_name, force=force)
+        done += 1
+    if Stage.INDEX_POST in stages_to_run:
+        _tick(f"starting {Stage.INDEX_POST.value}", done, total)
+        index_stage(conn=conn, paper_name=post_name, force=force)
+        done += 1
+
+    _tick("complete", done, total)
+
+    return _summary_post(conn, canonical_url)
+
+
 # ---------------------------------------------------------------------------
 # Local-PDF orchestrator
 # ---------------------------------------------------------------------------
@@ -1747,6 +1844,11 @@ def main(argv: list[str] | None = None) -> None:
                              "paper (requires --to-paper); use when a paper's code repo "
                              "was released after the paper was ingested")
     target.add_argument("--post", default=None, help="blog post URL")
+    target.add_argument("--post-html", default=None,
+                        help="local saved .html file; ingests through the blog-post "
+                             "pipeline (identity from <link rel=canonical>/og:url). "
+                             "Use for paywalled/JS pages saved from the browser. "
+                             "Save as 'Webpage, Complete' or reader view.")
     target.add_argument("--pdf", default=None,
                         help="local PDF path; outline-split into per-chapter rows by default")
     target.add_argument("--acl", default=None,
@@ -1908,6 +2010,19 @@ def main(argv: list[str] | None = None) -> None:
             summary = ingest_acl(
                 conn=conn,
                 acl_id=acl_id,
+                force=args.force,
+                domain=args.domain,
+            )
+        finally:
+            conn.close()
+    elif args.post_html:
+        check_models()
+        conn = get_conn(Path(args.db))
+        try:
+            init_db(conn)
+            summary = ingest_post_html(
+                conn=conn,
+                html_path=Path(args.post_html),
                 force=args.force,
                 domain=args.domain,
             )
